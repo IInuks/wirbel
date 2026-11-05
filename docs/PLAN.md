@@ -14,10 +14,15 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
 - `wirbel move X Y` setzt die Maus absolut, `wirbel move --rel DX DY` relativ. Wird an den
   sichtbaren Bereich geklemmt, funktioniert über Ausgänge hinweg und schickt den Clients normale
   Enter/Motion-Events (Hover/Fokus stimmen danach).
-- Config: `~/.config/wirbel/config`, einfaches Textformat, Neuladen per Keybind ohne Neustart.
-  Standard-Belegung an `~/.config/mango/config.conf` angelehnt (Super+Return kitty, Super+W
-  schließen, Super+1..9 Workspaces, Alt+Pfeile Fokus, Super+Shift+Pfeile tauschen).
-- Fehlt die Config, gelten eingebaute Defaults, inklusive Beenden-Keybind (nie aussperren).
+- Config: `~/.config/wirbel/config` (oder `wirbel --config DATEI`), einfaches Textformat, Neuladen
+  per Keybind ohne Neustart. Standard-Belegung an `~/.config/mango/config.conf` angelehnt
+  (Super+Return kitty, Super+W schließen, Super+1..9 Workspaces, Alt+Pfeile Fokus,
+  Super+Shift+Pfeile tauschen). Referenz aller Optionen und Aktionen: `src/default.conf`, die
+  zugleich die eingebauten Defaults sind.
+- Fehlt die Config, gelten eingebaute Defaults, inklusive Beenden-Keybind (nie aussperren). Das
+  gilt auch für eine Config mit eigenen Binds, aber ohne `quit`: Super+M kommt dann dazu.
+- Fehlerhafte Zeilen: beim Start übersprungen und geloggt. Beim Neuladen verwirft ein einziger
+  Fehler die ganze Datei, die laufende Config bleibt.
 
 ## Stil
 Minimal heißt: keine Animationen, kein Blur, keine Fensterdeko außer Rahmen und Lücke, keine
@@ -26,16 +31,29 @@ Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser 
 ## Aufbau
 - `src/layout/`: Dwindle-Baum und Geometrie, frei von Compositor-Typen. Die Split-Achse wird nicht
   gespeichert, sondern folgt aus der Form der Fläche.
-- `src/state.rs`: `Wirbel`, zentraler Zustand; `retile()` bringt Fenster, Rahmen und Pointer-Fokus
-  in Einklang mit dem Layout.
-- `src/handlers/`: Wayland-Protokolle. Lebenslauf eines Toplevels: erster Commit kachelt, erster
-  Buffer fokussiert, Commit ohne Buffer entfernt es wieder (`toplevel_commit`).
-- `src/input.rs`: Backends rufen `on_key`, `on_pointer_motion`, `on_pointer_button`; dort speisen
-  auch Tests Eingaben ein.
+- `src/workspace.rs`: `Monitor` (ein Ausgang mit 9 Workspaces) und `Workspace` (Dwindle-Baum,
+  Floating-Stapel, Fullscreen/Maximize, gemerkter Fokus). `Workspace::frames` berechnet, was wo
+  sichtbar ist. Fenster haben keinen eigenen Status außerhalb dieser Struktur.
+- `src/state.rs`: `Wirbel`, zentraler Zustand. `monitors` hält alle Fenster, `space` nur die
+  sichtbaren. `retile()` leitet den ganzen Bildschirm aus `monitors` ab: blendet ein und aus, setzt
+  die Stapelreihenfolge, schickt Configures. Nach jeder Änderung an Workspaces aufrufen.
+- `src/config.rs`, `src/default.conf`: Config-Parser und Defaults.
+- `src/actions.rs`: was Binds tun (`run_action`).
+- `src/grabs.rs`: Fenster ziehen. Der Pointer-Grab hält nur Clients fern, die Logik läuft danach in
+  `on_pointer_motion`/`on_pointer_button`, denn Code im Grab darf den Pointer nicht anfassen und
+  `retile` tut das.
+- `src/handlers/`: Wayland-Protokolle. Lebenslauf eines Toplevels: erster Commit platziert es,
+  erster Buffer fokussiert, Commit ohne Buffer entfernt es wieder (`toplevel_commit`). Dialoge
+  (Parent gesetzt) und Fenster fester Größe floaten von selbst.
+- `src/input.rs`: Backends rufen `on_key`, `on_pointer_motion`, `on_pointer_button`,
+  `on_pointer_axis`; dort speisen auch Tests Eingaben ein. Keybinds greifen im Filter von
+  `keyboard.input`, gebundene Tasten erreichen Clients weder beim Drücken noch beim Loslassen.
 - `src/render.rs`: Szene unabhängig vom Backend (`scene_elements`), von vorn nach hinten: Cursor,
-  Fenster, Rahmen. Backends setzen `state.redraw` und zeichnen nur auf Anforderung.
-- `src/backend/`: bisher nur `winit` (nested). `wirbel -c BEFEHL` startet Clients, bis es Keybinds
-  gibt; beendet wird durch Schließen des Host-Fensters.
+  dann je Fenster es selbst und sein Rahmen. Backends setzen `state.redraw` und zeichnen nur auf
+  Anforderung.
+- `src/backend/`: bisher nur `winit` (nested), mit einem Ausgang. `add_output`, `remove_output` und
+  `output_resized` sind die Schnittstelle für weitere Backends; ein Ausgang liegt dort, wo
+  `current_location` sagt. `wirbel -c BEFEHL` startet Clients beim Start.
 - `tests/headless.rs`: Compositor ohne Backend, echter Wayland-Client über den Socket, Eingaben
   injiziert, Pixel per Pixman geprüft. Hier gehören neue Verhaltenstests hin.
 - Smithay ist auf einen Git-Commit gepinnt (513 Commits nach 0.7.0), winit also 0.31-beta.
@@ -46,7 +64,10 @@ Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser 
 - Mango fängt Super-Kombinationen ab, Super+M beendet die Sitzung des Nutzers: im Nested-Test nie
   senden. Fürs saubere Beenden `mmsg dispatch killclient client,ID`; SIGTERM lässt den Socket liegen.
 - `wtype` lädt eine eigene Keymap, die wirbel nicht auswertet: Tasten kommen an, aber als Evdev-Code
-  1, 2, 3, ... (ESC, 1, 2, ...).
+  1, 2, 3, ... (ESC, 1, 2, ...), N verschiedene Zeichen drücken die Codes 1 bis N. Modifier sendet es
+  nicht als Tasten. Binds testet man so: `bind = NONE, 1, reload` und `bind = NONE, 2, AKTION`, die
+  Aktion in der Datei ändern, dann `wtype abc`. Vorher per `mmsg get focusing-client` prüfen, dass
+  das Nested-Fenster den Host-Fokus hat.
 
 ## Etappen
 1. Grundgerüst: Crate, Smithay, verschachteltes Winit-Backend, xdg-shell, Rendering, Tastatur/Maus,
