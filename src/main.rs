@@ -2,10 +2,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     process,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::AtomicBool},
     thread,
     time::Duration,
 };
@@ -24,7 +21,7 @@ use wirbel::{
 };
 
 const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]... [--timeout SECONDS] [--log FILE]
-       wirbel check
+       wirbel check [CONFIG]
        wirbel pos [--once] [--json]
        wirbel move [--rel] X Y
 
@@ -122,7 +119,7 @@ fn load_config(path: Option<&Path>) -> Config {
 /// Starts the deliberate failures of `--panic-after` and `--hang-after`.
 fn arm_failures(event_loop: &EventLoop<'static, Wirbel>, options: &Options) {
     let handle = event_loop.handle();
-    let mut insert = |delay, failure: fn()| {
+    let insert = |delay, failure: fn()| {
         let timer = handle.insert_source(Timer::from_duration(delay), move |_, _, _| {
             failure();
             TimeoutAction::Drop
@@ -179,11 +176,8 @@ fn run(options: Options, kind: backend::Kind) -> Result<(), Box<dyn std::error::
 
     match kind {
         backend::Kind::Nested => backend::winit::init(&mut event_loop, &mut state)?,
-        backend::Kind::Drm => {
-            return Err("the DRM backend is not there yet".into());
-        }
+        backend::Kind::Drm => backend::drm::init(&mut event_loop, &mut state, active)?,
     }
-    active.store(true, Ordering::Relaxed);
 
     tracing::info!(socket = ?state.socket_name, "compositor ready");
     for command in &options.commands {
@@ -207,6 +201,19 @@ fn main() {
         };
         if let Err(err) = result {
             eprintln!("wirbel {command}: {err}");
+            process::exit(1);
+        }
+        return;
+    }
+
+    if args.peek().is_some_and(|arg| arg == "check") {
+        args.next();
+        let config = args.next().map(PathBuf::from).or_else(Config::default_path);
+        let filter = "wirbel=info,error";
+        // SAFETY: nothing else runs yet.
+        unsafe { env::set_var("RUST_LOG", env::var("RUST_LOG").unwrap_or(filter.into())) };
+        let logged = safety::install_log(None);
+        if logged.is_err() || !wirbel::check::run(config.as_deref()) {
             process::exit(1);
         }
         return;

@@ -180,7 +180,7 @@ impl Wirbel {
 
     /// Notes that `output` presented a frame. Only one drawn after the lock began counts, which
     /// holds for all of them: nothing else is drawn from that moment on.
-    pub(crate) fn lock_frame_presented(&mut self, output: &Output) {
+    pub fn lock_frame_presented(&mut self, output: &Output) {
         if let Phase::Locking { waiting, .. } = &mut self.lock.phase {
             waiting.retain(|other| other != output);
         }

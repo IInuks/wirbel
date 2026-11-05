@@ -8,7 +8,10 @@ mod xdg_shell;
 
 use smithay::{
     backend::{allocator::Format, allocator::dmabuf::Dmabuf},
-    input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus, tablet::TabletSeatHandler},
+    input::{
+        Seat, SeatHandler, SeatState, keyboard::LedState, pointer::CursorImageStatus,
+        tablet::TabletSeatHandler,
+    },
     reexports::{
         wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
         wayland_server::{Resource, protocol::wl_surface::WlSurface},
@@ -44,6 +47,10 @@ impl SeatHandler for Wirbel {
         let client = focused.and_then(Resource::client);
         set_data_device_focus(&self.display_handle, seat, client.clone());
         set_primary_focus(&self.display_handle, seat, client);
+    }
+
+    fn led_state_changed(&mut self, _seat: &Seat<Self>, leds: LedState) {
+        (self.led_update)(leds);
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {

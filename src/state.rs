@@ -19,7 +19,7 @@ use smithay::{
     },
     input::{
         Seat, SeatState,
-        keyboard::Keycode,
+        keyboard::{Keycode, LedState},
         pointer::{CursorImageStatus, MotionEvent},
     },
     output::Output,
@@ -63,6 +63,7 @@ use smithay::{
 
 use crate::{
     config::Config,
+    cursor::Cursors,
     grabs::Drag,
     handlers::SessionLock,
     ipc::{Ipc, Position},
@@ -169,6 +170,8 @@ pub struct Wirbel {
     /// The window drag in progress.
     pub drag: Option<Drag>,
     pub cursor_status: CursorImageStatus,
+    /// The theme for named cursors. Stays empty where the host draws them.
+    pub cursors: Option<Cursors>,
     /// What the client shows at the pointer during drag and drop.
     pub dnd_icon: Option<WlSurface>,
     pub ipc: Ipc,
@@ -180,6 +183,10 @@ pub struct Wirbel {
     pub redraw: Box<dyn Fn()>,
     /// Switches to a virtual terminal. Set by a backend that owns one.
     pub change_vt: Option<Box<dyn FnMut(i32)>>,
+    /// Tells the GPUs about a newly committed buffer. Set by a backend with more than one.
+    pub early_import: Box<dyn FnMut(&WlSurface)>,
+    /// Sets the keyboard LEDs. Set by a backend that has real keyboards.
+    pub led_update: Box<dyn FnMut(LedState)>,
     /// Sees the same keys as the watcher thread, which is not running in every setup.
     pub chord: Chord,
     /// What the emergency chord does. The binary ends the process here.
@@ -250,6 +257,7 @@ impl Wirbel {
             swallowed_keys: Vec::new(),
             drag: None,
             cursor_status: CursorImageStatus::default_named(),
+            cursors: None,
             dnd_icon: None,
             ipc,
             import_dmabuf: Box::new(|_| false),
@@ -257,6 +265,8 @@ impl Wirbel {
             needs_redraw: true,
             redraw: Box::new(|| {}),
             change_vt: None,
+            early_import: Box::new(|_| {}),
+            led_update: Box::new(|_| {}),
             chord: Chord::default(),
             emergency: Box::new(|| tracing::error!("emergency chord pressed")),
             display_handle: dh,

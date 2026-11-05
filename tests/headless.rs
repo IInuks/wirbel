@@ -9,6 +9,7 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
+        Arc, Mutex,
         atomic::{AtomicU32, Ordering},
         mpsc,
     },
@@ -1663,6 +1664,8 @@ fn disconnecting_removes_all_windows_of_the_client() {
         thread::sleep(std::time::Duration::from_millis(10));
         survivor.sync();
     }
+    // The loop may end right after the state changed, before the configure got here.
+    survivor.sync();
     assert_eq!(survivor.size(a), FULL);
     assert!(survivor.activated(a));
 }
@@ -5412,4 +5415,130 @@ fn refuses_the_drm_backend_without_a_virtual_terminal() {
     assert_eq!(output.status.code(), Some(1));
     let message = String::from_utf8_lossy(&output.stderr);
     assert!(message.contains("not a virtual terminal"), "{message}");
+}
+
+const KEY_BACKSPACE: u32 = 14;
+const KEY_F3: u32 = 61;
+
+/// Lets the compositor note every VT switch, and every emergency stop, in a list of its own.
+fn record_vt_switches(compositor: &Compositor) -> Arc<Mutex<Vec<i32>>> {
+    let switches = Arc::new(Mutex::new(Vec::new()));
+    let recorded = switches.clone();
+    compositor.with(move |state| {
+        state.change_vt = Some(Box::new(move |vt| recorded.lock().unwrap().push(vt)));
+    });
+    switches
+}
+
+fn record_emergency(compositor: &Compositor) -> Arc<Mutex<u32>> {
+    let count = Arc::new(Mutex::new(0));
+    let recorded = count.clone();
+    compositor.with(move |state| {
+        state.emergency = Box::new(move || *recorded.lock().unwrap() += 1);
+    });
+    count
+}
+
+#[test]
+fn ctrl_alt_f_switches_the_vt_and_no_client_sees_it() {
+    let compositor = Compositor::start();
+    let switches = record_vt_switches(&compositor);
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.take_input();
+
+    compositor.chord(&[KEY_LEFTCTRL, KEY_LEFTALT], KEY_F3);
+    assert_eq!(*switches.lock().unwrap(), [3]);
+    let input = client.take_input();
+    let f_key = |event: &Input| matches!(event, Input::Key(KEY_F3, _));
+    assert!(!input.iter().any(f_key), "{input:?}");
+}
+
+#[test]
+fn a_locked_session_can_leave_for_another_vt_and_stays_locked() {
+    let (compositor, _windows, mut locker, _lock, _surface) = locked_session();
+    let switches = record_vt_switches(&compositor);
+    locker.take_input();
+
+    compositor.chord(&[KEY_LEFTCTRL, KEY_LEFTALT], KEY_F3);
+    assert_eq!(*switches.lock().unwrap(), [3]);
+    let input = locker.take_input();
+    let f_key = |event: &Input| matches!(event, Input::Key(KEY_F3, _));
+    assert!(!input.iter().any(f_key), "{input:?}");
+    assert!(compositor.with(|state| state.lock.is_active()));
+    assert_eq!(compositor.screenshot().at(500, 300), LOCK);
+}
+
+#[test]
+fn nested_there_is_no_vt_and_the_key_stays_with_the_client() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.take_input();
+
+    compositor.chord(&[KEY_LEFTCTRL, KEY_LEFTALT], KEY_F3);
+    let input = client.take_input();
+    let press = Input::Key(KEY_F3, wl_keyboard::KeyState::Pressed);
+    assert!(input.contains(&press), "{input:?}");
+}
+
+#[test]
+fn the_emergency_chord_works_with_no_bind_for_it_and_while_locked() {
+    let compositor = Compositor::start();
+    let count = record_emergency(&compositor);
+    let chord = [KEY_LEFTCTRL, KEY_LEFTALT, KEY_LEFTSHIFT];
+    compositor.chord(&chord[..2], KEY_BACKSPACE);
+    assert_eq!(*count.lock().unwrap(), 0);
+    compositor.chord(&chord, KEY_BACKSPACE);
+    assert_eq!(*count.lock().unwrap(), 1);
+
+    let (compositor, _windows, _locker, _lock, _surface) = locked_session();
+    let count = record_emergency(&compositor);
+    compositor.chord(&chord, KEY_BACKSPACE);
+    assert_eq!(*count.lock().unwrap(), 1);
+}
+
+#[test]
+fn a_frame_from_before_the_lock_does_not_confirm_it() {
+    let compositor = Compositor::start();
+    let mut locker = Client::connect(&compositor);
+    locker.lock();
+    // What the DRM backend does when the vblank of an older frame arrives.
+    compositor.with(|state| {
+        let output = state.monitors[0].output.clone();
+        state.send_frames(&output);
+    });
+    locker.sync();
+    assert_eq!(locker.state.lock_events, []);
+    compositor.present();
+    locker.sync();
+    assert_eq!(locker.state.lock_events, [LockEvent::Locked]);
+}
+
+/// The dark pixels and the light ones around (x, y), which only a drawn cursor gives.
+fn differs_from_background(shot: &Screenshot, background: u32, x: i32, y: i32) -> bool {
+    (0..24).any(|offset| shot.at(x + offset / 2, y + offset) != background)
+}
+
+#[test]
+fn named_cursors_are_drawn_when_nobody_else_does_it_also_while_locked() {
+    let compositor = Compositor::start();
+    let background = rgb(default_config().background_color);
+    compositor.pointer_at(300.0, 200.0);
+    let shot = compositor.screenshot();
+    assert!(!differs_from_background(&shot, background, 300, 200));
+
+    compositor.with(|state| {
+        state.cursors = Some(wirbel::cursor::Cursors::load(
+            Some("no-such-theme"),
+            Some(24),
+        ));
+    });
+    let shot = compositor.screenshot();
+    assert!(differs_from_background(&shot, background, 300, 200));
+
+    let mut locker = Client::connect(&compositor);
+    locker.lock();
+    let shot = compositor.screenshot();
+    assert!(differs_from_background(&shot, background, 300, 200));
 }

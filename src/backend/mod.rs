@@ -1,5 +1,7 @@
 //! Backends connect the compositor to a display and input devices.
 
+pub mod drm;
+pub mod pacing;
 pub mod winit;
 
 /// Which backend a compositor runs on.

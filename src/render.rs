@@ -5,6 +5,7 @@ use smithay::{
         ImportAll, ImportMem, Renderer, Texture,
         element::{
             AsRenderElements, Kind,
+            memory::MemoryRenderBufferRenderElement,
             solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
@@ -24,6 +25,7 @@ smithay::backend::renderer::element::render_elements! {
     pub SceneElement<R> where R: ImportAll + ImportMem;
     Surface=WaylandSurfaceRenderElement<R>,
     Solid=SolidColorRenderElement,
+    Cursor=MemoryRenderBufferRenderElement<R>,
 }
 
 /// Which part of a layer surface a place in the stacking order is about.
@@ -144,7 +146,7 @@ impl Wirbel {
     pub fn scene_elements<R>(&self, renderer: &mut R, output: &Output) -> Vec<SceneElement<R>>
     where
         R: Renderer + ImportAll + ImportMem,
-        R::TextureId: Clone + Texture + 'static,
+        R::TextureId: Clone + Texture + Send + 'static,
     {
         let scale = Scale::from(output.current_scale().fractional_scale());
         let origin = self
@@ -199,7 +201,7 @@ impl Wirbel {
         elements
     }
 
-    /// The client's cursor image and a dragged icon. Named cursors are the backend's job.
+    /// The cursor and a dragged icon. Named cursors come from `cursors`, nested the host has them.
     fn cursor_elements<R>(
         &self,
         renderer: &mut R,
@@ -208,13 +210,32 @@ impl Wirbel {
     ) -> Vec<SceneElement<R>>
     where
         R: Renderer + ImportAll + ImportMem,
-        R::TextureId: Clone + Texture + 'static,
+        R::TextureId: Clone + Texture + Send + 'static,
     {
         let mut elements = Vec::new();
         let Some(pointer) = self.seat.get_pointer() else {
             return elements;
         };
         let at = pointer.current_location() - origin.to_f64();
+        if let CursorImageStatus::Named(icon) = &self.cursor_status
+            && let Some(cursors) = &self.cursors
+        {
+            let image = cursors.image(icon.name(), icon.alt_names(), scale.x);
+            let location = at.to_physical(scale).to_i32_round() - image.hotspot;
+            let element = MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                location.to_f64(),
+                &image.buffer,
+                None,
+                None,
+                None,
+                Kind::Cursor,
+            );
+            match element {
+                Ok(element) => elements.push(SceneElement::Cursor(element)),
+                Err(err) => tracing::warn!(?err, "failed to import the cursor"),
+            }
+        }
         if let CursorImageStatus::Surface(surface) = &self.cursor_status
             && surface.is_alive()
         {
@@ -251,9 +272,16 @@ impl Wirbel {
         elements
     }
 
-    /// Tells clients that a frame went out, so that they may draw the next one.
+    /// Tells clients that a frame went out, so that they may draw the next one, and counts that
+    /// frame for the lock. A backend with frames in flight has to tell those apart: it calls
+    /// `lock_frame_presented` only for frames drawn after the lock began, and `send_frames`.
     pub fn send_frame_callbacks(&mut self, output: &Output) {
         self.lock_frame_presented(output);
+        self.send_frames(output);
+    }
+
+    /// The frame callbacks of `send_frame_callbacks` alone.
+    pub fn send_frames(&mut self, output: &Output) {
         let time = self.time();
         let throttle = Some(Duration::ZERO);
         let scanout = |_: &_, _: &_| Some(output.clone());

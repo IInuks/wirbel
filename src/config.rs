@@ -91,6 +91,17 @@ pub struct MouseBind {
     pub action: MouseAction,
 }
 
+/// `monitorrule = name:DP-4,width:2560,height:1440,refresh:165,scale:1,x:0,y:0`, with all but the
+/// name optional. Lines of a Mango configuration work as they are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MonitorRule {
+    pub name: String,
+    pub size: Option<(i32, i32)>,
+    pub refresh: Option<f64>,
+    pub scale: Option<f64>,
+    pub position: Option<(i32, i32)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub gaps: Gaps,
@@ -105,6 +116,11 @@ pub struct Config {
     pub repeat_rate: i32,
     pub sloppy_focus: bool,
     pub warp_cursor: bool,
+    pub cursor_theme: Option<String>,
+    pub cursor_size: Option<u32>,
+    /// The card that renders, by name like `card1`. `None` means the boot GPU.
+    pub render_gpu: Option<String>,
+    pub monitor_rules: Vec<MonitorRule>,
     pub binds: Vec<Bind>,
     pub mouse_binds: Vec<MouseBind>,
 }
@@ -135,6 +151,11 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The first rule for an output of this name.
+    pub fn monitor_rule(&self, name: &str) -> Option<&MonitorRule> {
+        self.monitor_rules.iter().find(|rule| rule.name == name)
+    }
+
     fn empty() -> Self {
         Self {
             gaps: Gaps { outer: 0, inner: 0 },
@@ -149,6 +170,10 @@ impl Config {
             repeat_rate: 0,
             sloppy_focus: false,
             warp_cursor: false,
+            cursor_theme: None,
+            cursor_size: None,
+            render_gpu: None,
+            monitor_rules: Vec::new(),
             binds: Vec::new(),
             mouse_binds: Vec::new(),
         }
@@ -235,6 +260,12 @@ impl Config {
             "repeat_rate" => self.repeat_rate = parse_size(value)?,
             "sloppy_focus" => self.sloppy_focus = parse_bool(value)?,
             "warp_cursor" => self.warp_cursor = parse_bool(value)?,
+            "cursor_theme" => {
+                self.cursor_theme = Some(value).filter(|v| !v.is_empty()).map(Into::into)
+            }
+            "cursor_size" => self.cursor_size = Some(parse_size(value)? as u32),
+            "render_gpu" => self.render_gpu = Some(value).filter(|v| !v.is_empty()).map(Into::into),
+            "monitorrule" => self.monitor_rules.push(parse_monitor_rule(value)?),
             "bind" => self.binds.push(parse_bind(value)?),
             "mousebind" => self.mouse_binds.push(parse_mouse_bind(value)?),
             other => return Err(format!("unknown option `{other}`")),
@@ -428,6 +459,58 @@ fn parse_bind(value: &str) -> Result<Bind, String> {
         key: parse_key(key)?,
         action: parse_action(action, fields.next().unwrap_or(""))?,
     })
+}
+
+fn parse_monitor_rule(value: &str) -> Result<MonitorRule, String> {
+    let mut rule = MonitorRule {
+        name: String::new(),
+        size: None,
+        refresh: None,
+        scale: None,
+        position: None,
+    };
+    let (mut width, mut height, mut x, mut y) = (None, None, None, None);
+    for field in value.split(',').map(str::trim) {
+        let (key, value) = field
+            .split_once(':')
+            .ok_or(format!("expected `key:value`, got `{field}`"))?;
+        let (key, value) = (key.trim(), value.trim());
+        let int = || {
+            let error = || format!("expected a number, got `{value}`");
+            value.parse::<i32>().map_err(|_| error())
+        };
+        let positive = || {
+            let error = || format!("expected a positive number, got `{value}`");
+            let number = value.parse::<f64>().map_err(|_| error())?;
+            (number.is_finite() && number > 0.0)
+                .then_some(number)
+                .ok_or_else(error)
+        };
+        match key {
+            "name" => rule.name = value.to_string(),
+            "width" => width = Some(int()?),
+            "height" => height = Some(int()?),
+            "refresh" => rule.refresh = Some(positive()?),
+            "scale" => rule.scale = Some(positive()?),
+            "x" => x = Some(int()?),
+            "y" => y = Some(int()?),
+            other => return Err(format!("unknown monitorrule field `{other}`")),
+        }
+    }
+    if rule.name.is_empty() {
+        return Err("monitorrule needs `name:`".into());
+    }
+    rule.size = match (width, height) {
+        (Some(width), Some(height)) => Some((width, height)),
+        (None, None) => None,
+        _ => return Err("monitorrule needs both width and height".into()),
+    };
+    rule.position = match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (None, None) => None,
+        _ => return Err("monitorrule needs both x and y".into()),
+    };
+    Ok(rule)
 }
 
 fn parse_mouse_bind(value: &str) -> Result<MouseBind, String> {
@@ -691,5 +774,49 @@ mod tests {
     #[test]
     fn load_reports_an_unreadable_path() {
         assert!(Config::load(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn monitor_rules_take_mango_lines_as_they_are() {
+        let (config, errors) = Config::parse(
+            "monitorrule=name:DP-4,width:2560,height:1440,refresh:165\n\
+             monitorrule = name:DP-3, width:1920, height:1080, scale:1.5, x:-1920, y:40\n",
+        );
+        assert_eq!(errors, []);
+        let rule = config.monitor_rule("DP-4").unwrap();
+        assert_eq!(rule.size, Some((2560, 1440)));
+        assert_eq!(rule.refresh, Some(165.0));
+        let rule = config.monitor_rule("DP-3").unwrap();
+        assert_eq!(rule.scale, Some(1.5));
+        assert_eq!(rule.position, Some((-1920, 40)));
+        assert_eq!(config.monitor_rule("HDMI-A-1"), None);
+    }
+
+    #[test]
+    fn broken_monitor_rules_are_reported() {
+        for line in [
+            "monitorrule = width:1920,height:1080",
+            "monitorrule = name:DP-1,width:1920",
+            "monitorrule = name:DP-1,x:0",
+            "monitorrule = name:DP-1,refresh:fast",
+            "monitorrule = name:DP-1,refresh:0",
+            "monitorrule = name:DP-1,scale:-1",
+            "monitorrule = name:DP-1,colour:red",
+            "monitorrule = DP-1",
+        ] {
+            let (config, errors) = Config::parse(line);
+            assert_eq!(errors.len(), 1, "{line}");
+            assert!(config.monitor_rules.is_empty());
+        }
+    }
+
+    #[test]
+    fn cursor_and_gpu_options() {
+        let (config, errors) =
+            Config::parse("cursor_theme = Adwaita\ncursor_size = 32\nrender_gpu = card1\n");
+        assert_eq!(errors, []);
+        assert_eq!(config.cursor_theme.as_deref(), Some("Adwaita"));
+        assert_eq!(config.cursor_size, Some(32));
+        assert_eq!(config.render_gpu.as_deref(), Some("card1"));
     }
 }
