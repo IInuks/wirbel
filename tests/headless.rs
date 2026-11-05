@@ -58,6 +58,8 @@ use wayland_client::{
         wl_seat::WlSeat,
         wl_shm::{Format, WlShm},
         wl_shm_pool::WlShmPool,
+        wl_subcompositor::WlSubcompositor,
+        wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
     },
 };
@@ -1512,6 +1514,8 @@ impl Dispatch<XdgPopup, ()> for ClientState {
 delegate_noop!(ClientState: ignore XdgPositioner);
 delegate_noop!(ClientState: ignore WlCompositor);
 delegate_noop!(ClientState: ignore WlSurface);
+delegate_noop!(ClientState: ignore WlSubcompositor);
+delegate_noop!(ClientState: ignore WlSubsurface);
 delegate_noop!(ClientState: ignore WlShm);
 delegate_noop!(ClientState: ignore WlShmPool);
 delegate_noop!(ClientState: ignore WlBuffer);
@@ -7156,4 +7160,50 @@ fn a_clipboard_manager_is_cancelled_when_a_window_copies() {
     client.sync();
     manager.client.sync();
     assert!(manager.client.state.control_cancelled);
+}
+
+/// The way Chromium moves a bubble when its window gets another size: `set_position` and a commit
+/// of the parent alone. The bubble must be seen and clicked in the new place.
+#[test]
+fn a_subsurface_moves_with_the_commit_of_its_parent() {
+    for desync in [true, false] {
+        let compositor = Compositor::start();
+        let mut client = Client::connect(&compositor);
+        let window = client.open_window(BLUE);
+        let parent = client.state.windows[window].surface.clone();
+        let subcompositor: WlSubcompositor = client.bind(1..=1);
+        let child = client.compositor.create_surface(&client.handle, ());
+        let subsurface = subcompositor.get_subsurface(&child, &parent, &client.handle, ());
+        if desync {
+            subsurface.set_desync();
+        }
+        let id = client.track(&child);
+        subsurface.set_position(50, 50);
+        let _buffer = client.fill(&child, 100, 100, RED);
+        parent.commit();
+        client.sync();
+        let frame = compositor.focused_rect().unwrap();
+        let (old, new) = ((frame.x + 60, frame.y + 60), (frame.x + 310, frame.y + 60));
+        let shot = compositor.screenshot();
+        assert_eq!(shot.at(old.0, old.1), RED);
+        assert_eq!(shot.at(new.0, new.1), BLUE);
+
+        subsurface.set_position(300, 50);
+        client.sync();
+        assert_eq!(compositor.screenshot().at(old.0, old.1), RED, "too early");
+
+        parent.commit();
+        client.sync();
+        let shot = compositor.screenshot();
+        assert_eq!(shot.at(old.0, old.1), BLUE, "desync: {desync}");
+        assert_eq!(shot.at(new.0, new.1), RED, "desync: {desync}");
+
+        compositor.pointer_at(f64::from(new.0), f64::from(new.1));
+        client.sync();
+        let entered = client
+            .take_input()
+            .into_iter()
+            .any(|input| matches!(input, Input::PointerEnter(index, ..) if index == id));
+        assert!(entered, "desync: {desync}");
+    }
 }

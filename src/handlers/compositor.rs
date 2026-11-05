@@ -11,8 +11,8 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SurfaceAttributes, add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface,
-            with_states,
+            SubsurfaceCachedState, SurfaceAttributes, add_blocker, add_pre_commit_hook,
+            get_children, get_parent, is_sync_subsurface, with_states,
         },
         dmabuf::get_dmabuf,
         drm_syncobj::DrmSyncobjCachedState,
@@ -97,6 +97,9 @@ impl CompositorHandler for Wirbel {
             .and_then(|pointer| pointer.current_focus())
             .is_some_and(|focus| focus.client() == surface.client());
         self.stats.commit(under_pointer);
+        if !is_sync_subsurface(surface) {
+            apply_subsurface_positions(surface);
+        }
         on_commit_buffer_handler::<Self>(surface);
         (self.early_import)(surface);
 
@@ -117,6 +120,22 @@ impl CompositorHandler for Wirbel {
         // longer do so.
         self.update_pointer_focus();
         self.needs_redraw = true;
+    }
+}
+
+/// `wl_subsurface.set_position` takes effect with the commit of the parent. Smithay keeps it in the
+/// pending state of the subsurface, which only moves on when the subsurface commits itself. Chromium
+/// moves its bubbles without that, they would stay where they were when the window changes its size.
+/// The children of a synchronized child take effect here, too.
+fn apply_subsurface_positions(parent: &WlSurface) {
+    for child in get_children(parent) {
+        with_states(&child, |states| {
+            let mut state = states.cached_state.get::<SubsurfaceCachedState>();
+            state.current().location = state.pending().location;
+        });
+        if is_sync_subsurface(&child) {
+            apply_subsurface_positions(&child);
+        }
     }
 }
 
