@@ -9,11 +9,19 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
 - `wirbel` startet den Compositor (Backend automatisch: im Wayland/X11-Fenster nested, sonst DRM).
 - `wirbel pos` zeigt die Mausposition in EINER Zeile, die sich bei jeder Bewegung sofort
   aktualisiert (`\r`, kein Scrollen), bis Ctrl+C. Push über IPC-Abo, kein Polling. Globale
-  Layout-Koordinaten mit Nachkommastellen (exakt), dazu Ausgang.
-  `--once` einmal ausgeben; ohne TTY (Pipe) eine Zeile pro Änderung; `--json`.
+  Layout-Koordinaten mit Nachkommastellen (exakt), dazu Ausgang (`-`, wenn es keinen gibt).
+  `--once` einmal ausgeben; ohne TTY (Pipe) eine Zeile pro Änderung; `--json` eine Zeile JSON pro
+  Änderung. Wer nicht mitliest, verpasst Zwischenstände, bekommt aber zuletzt die aktuelle Position.
 - `wirbel move X Y` setzt die Maus absolut, `wirbel move --rel DX DY` relativ. Wird an den
-  sichtbaren Bereich geklemmt, funktioniert über Ausgänge hinweg und schickt den Clients normale
+  sichtbaren Bereich geklemmt (nächster Punkt auf einem Ausgang, jenseits einer Kante deren letztes
+  ganzes Pixel), funktioniert über Ausgänge hinweg und schickt den Clients normale
   Enter/Motion-Events (Hover/Fokus stimmen danach).
+- `wirbel move` wirkt wie Bewegen der Maus, auch während eines Grabs: Ein gezogenes Fenster folgt
+  und landet beim Loslassen dort, ein Teiler oder eine Fenstergröße ändert sich mit. Bei gehaltener
+  Taste über einem Client bleibt der Zeiger bei diesem Client, bis die Taste losgelassen wird. Der
+  Befehl wird nie abgelehnt, solange ein Ausgang existiert; nur `warp_cursor` wartet einen Grab ab.
+- `wirbel pos` und `wirbel move` sprechen den Compositor von `WAYLAND_DISPLAY` an, aus Programmen
+  in wirbel also von selbst den richtigen. Ohne Compositor: Exit 1 und Meldung auf stderr.
 - Config: `~/.config/wirbel/config` (oder `wirbel --config DATEI`), einfaches Textformat, Neuladen
   per Keybind ohne Neustart. Standard-Belegung an `~/.config/mango/config.conf` angelehnt
   (Super+Return kitty, Super+W schließen, Super+1..9 Workspaces, Alt+Pfeile Fokus,
@@ -39,12 +47,21 @@ Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser 
   die Stapelreihenfolge, schickt Configures. Nach jeder Änderung an Workspaces aufrufen.
 - `src/config.rs`, `src/default.conf`: Config-Parser und Defaults.
 - `src/actions.rs`: was Binds tun (`run_action`).
+- `src/ipc.rs`: Steuer-Socket `$XDG_RUNTIME_DIR/wirbel-<WAYLAND_DISPLAY>.sock`, Zeilenprotokoll
+  (oben in der Datei beschrieben), läuft nicht blockierend in der Event-Loop. `src/cli.rs`: die
+  Befehle `wirbel pos` und `wirbel move`.
 - `src/grabs.rs`: Fenster ziehen. Der Pointer-Grab hält nur Clients fern, die Logik läuft danach in
   `on_pointer_motion`/`on_pointer_button`, denn Code im Grab darf den Pointer nicht anfassen und
   `retile` tut das.
 - `src/handlers/`: Wayland-Protokolle. Lebenslauf eines Toplevels: erster Commit platziert es,
   erster Buffer fokussiert, Commit ohne Buffer entfernt es wieder (`toplevel_commit`). Dialoge
   (Parent gesetzt) und Fenster fester Größe floaten von selbst.
+- `Wirbel::move_pointer` (`src/state.rs`) ist der einzige Aufrufer von `pointer.motion`: klemmt an
+  die Ausgänge und meldet die Position an `wirbel pos`. Wer den Zeiger bewegt, geht hier durch, auch
+  künftige Protokolle. Die Abo-Zeile entsteht beim Vergleich mit der zuletzt gemeldeten Position,
+  daher sind Aufrufe ohne Änderung still und ein neuer Ausgang unter dem Zeiger fällt trotzdem auf.
+  `on_pointer_motion` ist die ganze Mausbewegung samt Drag und sloppy focus, `wirbel move` nimmt
+  diesen Weg; `warp_pointer` ist die Bewegung des Compositors selbst und tut im Grab nichts.
 - `src/input.rs`: Backends rufen `on_key`, `on_pointer_motion`, `on_pointer_button`,
   `on_pointer_axis`; dort speisen auch Tests Eingaben ein. Keybinds greifen im Filter von
   `keyboard.input`, gebundene Tasten erreichen Clients weder beim Drücken noch beim Loslassen.
@@ -55,7 +72,9 @@ Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser 
   `output_resized` sind die Schnittstelle für weitere Backends; ein Ausgang liegt dort, wo
   `current_location` sagt. `wirbel -c BEFEHL` startet Clients beim Start.
 - `tests/headless.rs`: Compositor ohne Backend, echter Wayland-Client über den Socket, Eingaben
-  injiziert, Pixel per Pixman geprüft. Hier gehören neue Verhaltenstests hin.
+  injiziert, Pixel per Pixman geprüft, `wirbel pos`/`move` als echtes Binary. Hier gehören neue
+  Verhaltenstests hin. Socket-Nummern werden im parallelen Lauf wiederverwendet: Ein Test darf nicht
+  annehmen, dass eine Nummer nach dem Beenden frei bleibt.
 - Smithay ist auf einen Git-Commit gepinnt (513 Commits nach 0.7.0), winit also 0.31-beta.
 
 ## Hinweise für Tests im laufenden Mango
@@ -68,6 +87,8 @@ Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser 
   nicht als Tasten. Binds testet man so: `bind = NONE, 1, reload` und `bind = NONE, 2, AKTION`, die
   Aktion in der Datei ändern, dann `wtype abc`. Vorher per `mmsg get focusing-client` prüfen, dass
   das Nested-Fenster den Host-Fokus hat.
+- Mit `WAYLAND_DISPLAY=wayland-N ./target/debug/wirbel pos` bzw. `move` lässt sich die Nested-Instanz
+  von außen steuern, ohne die Maus des Nutzers zu bewegen. Der Socket steht im Log.
 
 ## Etappen
 1. Grundgerüst: Crate, Smithay, verschachteltes Winit-Backend, xdg-shell, Rendering, Tastatur/Maus,
