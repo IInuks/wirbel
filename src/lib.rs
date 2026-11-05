@@ -16,6 +16,7 @@ pub mod monitor;
 pub mod render;
 pub mod safety;
 pub mod state;
+pub mod stats;
 pub mod workspace;
 pub mod xwayland;
 

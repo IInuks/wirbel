@@ -13,6 +13,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     path::{Path, PathBuf},
     ptr,
+    time::Instant,
 };
 
 use smithay::{
@@ -35,7 +36,7 @@ use smithay::{
         Device as BasicDevice,
         control::{Device as ControlDevice, connector},
     },
-    utils::{DeviceFd, Rectangle, Transform},
+    utils::{DeviceFd, Physical, Rectangle, Transform},
 };
 
 use crate::{
@@ -44,6 +45,7 @@ use crate::{
     cursor::Cursors,
     monitor::{self, ModeInfo},
     safety,
+    stats::Summary,
 };
 
 const SEAT: &str = "seat0";
@@ -51,6 +53,10 @@ const DRM_IOCTL_AUTH_MAGIC: libc::c_ulong = 0x4004_6411;
 /// What the render test draws, in RGBA bytes.
 const COLOUR: [u8; 3] = [255, 128, 0];
 const SIZE: i32 = 64;
+/// The speed test: the size of the monitor, and enough frames for a tail.
+const SPEED_SIZE: (i32, i32) = (2560, 1440);
+const SPEED_FRAMES: usize = 300;
+const SPEED_SKIPPED: usize = 10;
 
 /// Counts what stands in the way of starting.
 #[derive(Debug, Default)]
@@ -568,6 +574,53 @@ fn render_test(
     Ok([pixels[middle], pixels[middle + 1], pixels[middle + 2]])
 }
 
+/// A frame as big as the monitor: how long it holds up the main loop. The first frames set up the
+/// copy and do not count.
+fn speed_test(
+    gpus: &mut Gpus,
+    render: DrmNode,
+    target: DrmNode,
+    gbm: &GbmDevice<DrmDeviceFd>,
+    damage: Rectangle<i32, Physical>,
+) -> Result<Summary, Box<dyn Error>> {
+    let modifiers: Vec<Modifier> = gpus
+        .single_renderer(&target)?
+        .as_ref()
+        .egl_context()
+        .dmabuf_render_formats()
+        .iter()
+        .filter(|format| format.code == Fourcc::Xrgb8888)
+        .map(|format| format.modifier)
+        .collect();
+    let mut allocator = GbmAllocator::new(gbm.clone(), GbmBufferFlags::RENDERING);
+    let (width, height) = SPEED_SIZE;
+    let buffer =
+        allocator.create_buffer(width as u32, height as u32, Fourcc::Xrgb8888, &modifiers)?;
+    let mut dmabuf = buffer.export()?;
+    let mut renderer = if render == target {
+        gpus.single_renderer(&render)?
+    } else {
+        gpus.renderer(&render, &target, Fourcc::Xrgb8888)?
+    };
+    let mut times = Vec::new();
+    for round in 0..SPEED_FRAMES + SPEED_SKIPPED {
+        let start = Instant::now();
+        let mut framebuffer = renderer.bind(&mut dmabuf)?;
+        let shade = (round % 2) as f32;
+        let size = (width, height).into();
+        let mut frame = renderer.render(&mut framebuffer, size, Transform::Normal)?;
+        frame.clear([shade, 0.2, 0.4, 1.0].into(), &[damage])?;
+        let sync = frame.finish()?;
+        drop(framebuffer);
+        let held = start.elapsed();
+        renderer.wait(&sync)?;
+        if round >= SPEED_SKIPPED {
+            times.push(held);
+        }
+    }
+    Summary::of(&mut times).ok_or_else(|| "no frames".into())
+}
+
 fn dmabuf_size() -> smithay::utils::Size<i32, smithay::utils::Physical> {
     (SIZE, SIZE).into()
 }
@@ -646,6 +699,17 @@ fn check_render(report: &mut Report, config: &Config, cards: &[CardInfo]) {
             Ok(pixel) if matches_colour(pixel) => report.fine(format!("{name}: picture correct")),
             Ok(pixel) => report.fail(format!("{name}: wrong picture, {pixel:?}")),
             Err(err) => report.fail(format!("{name}: {err}")),
+        }
+        let (width, height) = SPEED_SIZE;
+        let all = Rectangle::from_size((width, height).into());
+        let strip = Rectangle::from_size((width, 200).into());
+        for (what, damage) in [("whole frame", all), ("strip of 200 lines", strip)] {
+            match speed_test(&mut gpus, render, *target, gbm, damage) {
+                Ok(time) => report.note(format!(
+                    "{render} to {target}, {width}x{height}, {what}, ms on the main loop: {time}"
+                )),
+                Err(err) => report.note(format!("{render} to {target}, {what}: {err}")),
+            }
         }
     }
 }

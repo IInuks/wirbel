@@ -83,6 +83,7 @@ use crate::{
     layout::Rect,
     render::{LayerEntry, LayerPart, LayerTiers},
     safety::Chord,
+    stats::Stats,
     workspace::{Frame, FullKind, Monitor, Placement, Workspace},
 };
 
@@ -228,6 +229,7 @@ pub struct Wirbel {
     pub import_dmabuf: Box<dyn FnMut(&Dmabuf) -> bool>,
 
     pub needs_redraw: bool,
+    pub stats: Stats,
     /// Asks the backend for a new frame. Set by the backend.
     pub redraw: Box<dyn Fn()>,
     /// Switches to a virtual terminal. Set by a backend that owns one.
@@ -331,6 +333,7 @@ impl Wirbel {
             import_dmabuf: Box::new(|_| false),
 
             needs_redraw: true,
+            stats: Stats::default(),
             redraw: Box::new(|| {}),
             change_vt: None,
             early_import: Box::new(|_| {}),
@@ -372,6 +375,7 @@ impl Wirbel {
 
     /// Housekeeping after every event loop iteration.
     pub fn after_dispatch(&mut self) {
+        let start = self.stats.start();
         self.space.refresh();
         self.popups.cleanup();
         self.reap_popup_grab();
@@ -385,6 +389,7 @@ impl Wirbel {
         if let Err(err) = self.display_handle.flush_clients() {
             tracing::warn!(%err, "failed to flush clients");
         }
+        self.stats.tidied(start);
     }
 
     /// Runs a shell command as a client of this compositor.

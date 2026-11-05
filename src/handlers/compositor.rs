@@ -91,6 +91,12 @@ impl CompositorHandler for Wirbel {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        let under_pointer = self
+            .seat
+            .get_pointer()
+            .and_then(|pointer| pointer.current_focus())
+            .is_some_and(|focus| focus.client() == surface.client());
+        self.stats.commit(under_pointer);
         on_commit_buffer_handler::<Self>(surface);
         (self.early_import)(surface);
 

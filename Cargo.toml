@@ -42,6 +42,20 @@ git = "https://github.com/Smithay/smithay"
 rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca"
 default-features = false
 
+# Everyday build is release. The debug build stays usable on a real screen: GL and the damage
+# tracking in Smithay are far too slow without optimisation.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+debug = "line-tables-only"
+
 [dev-dependencies]
 rustix = { version = "1", features = ["pipe"] }
 wayland-client = "0.31"

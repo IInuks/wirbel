@@ -30,6 +30,7 @@ const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]... [--timeout SE
       --timeout SECONDS  stop cleanly after this time, or by force if that does not work
       --log FILE         log to this file instead of stderr. On a VT that is the default, with
                          ~/.local/state/wirbel/wirbel.log
+      --stats            log every few seconds where the time goes, see src/stats.rs
       --panic-after SECONDS  panic on purpose, to try out the safety net
       --hang-after SECONDS   block the main loop on purpose, to try out the safety net
   -h, --help             show this help
@@ -59,6 +60,7 @@ struct Options {
     timeout: Option<Duration>,
     panic_after: Option<Duration>,
     hang_after: Option<Duration>,
+    stats: bool,
 }
 
 fn seconds(value: Option<String>) -> Result<Duration, String> {
@@ -74,6 +76,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Option<Option
             "--config" => options.config_path = Some(args.next().ok_or(USAGE)?.into()),
             "--log" => options.log = Some(args.next().ok_or(USAGE)?.into()),
             "--timeout" => options.timeout = Some(seconds(args.next())?),
+            "--stats" => options.stats = true,
             "--panic-after" => options.panic_after = Some(seconds(args.next())?),
             "--hang-after" => options.hang_after = Some(seconds(args.next())?),
             "-h" | "--help" => return Ok(None),
@@ -151,6 +154,9 @@ fn run(options: Options, kind: backend::Kind) -> Result<(), Box<dyn std::error::
         load_config(config_path.as_deref()),
     )?;
     state.config_path = config_path;
+    if options.stats {
+        state.stats.enable();
+    }
     state.emergency = Box::new(|| {
         safety::hard_exit(EXIT_EMERGENCY, &format!("emergency stop, {CHORD_NAME}"));
     });

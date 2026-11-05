@@ -163,6 +163,7 @@ fn offer_syncobj(node: DrmNode, state: &mut Wirbel) {
 
 impl Nested {
     fn render(&mut self, state: &mut Wirbel) {
+        let start = state.stats.start();
         match &state.cursor_status {
             CursorImageStatus::Named(icon) => {
                 self.backend.window().set_cursor(Cursor::Icon(*icon));
@@ -218,5 +219,11 @@ impl Nested {
         state.send_frame_callbacks(&self.output);
         self.capturer
             .run(state, self.backend.renderer(), &self.output);
+        state.stats.rendered(start);
+        state.stats.queued();
+        state.stats.vblank(
+            Duration::from_secs_f64(1_000.0 / f64::from(REFRESH_MHZ)),
+            true,
+        );
     }
 }

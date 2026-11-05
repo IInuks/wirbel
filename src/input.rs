@@ -317,6 +317,7 @@ impl Wirbel {
         };
         pointer.axis(self, frame);
         pointer.frame(self);
+        self.stats.wheel();
     }
 }
 

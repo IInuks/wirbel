@@ -33,7 +33,7 @@ use smithay::{
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
         },
         egl::{EGLDevice, EGLDisplay, context::ContextPriority},
-        input::InputEvent,
+        input::{Event, InputEvent},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             ImportDma, ImportMemWl,
@@ -713,7 +713,15 @@ fn on_vblank(
             surface.presented = true;
             tracing::info!(name = surface.output.name(), "first frame is on the screen");
         }
-        (surface.output.clone(), surface.pacing.vblank())
+        let presented = surface.pacing.vblank();
+        let refresh = surface
+            .output
+            .current_mode()
+            .map_or(60_000, |mode| mode.refresh);
+        state
+            .stats
+            .vblank(frame_duration(refresh), presented.render);
+        (surface.output.clone(), presented)
     };
     frame_done(drm, state, node, crtc, &output, presented);
 }
@@ -776,6 +784,7 @@ fn classify(err: SwapBuffersError) -> Rendered {
 }
 
 fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc::Handle) {
+    let start = state.stats.start();
     let (output, outcome) = {
         let mut guard = drm.borrow_mut();
         let this = &mut *guard;
@@ -851,7 +860,10 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
             }
         };
         match outcome {
-            Rendered::Queued => surface.pacing.queued(locked),
+            Rendered::Queued => {
+                surface.pacing.queued(locked);
+                state.stats.queued();
+            }
             Rendered::Unchanged => surface.pacing.unchanged(locked),
             Rendered::Retry => surface.pacing.unchanged(false),
             Rendered::Reset | Rendered::Fatal => surface.pacing.reset(),
@@ -863,6 +875,7 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
         }
         (output, outcome)
     };
+    state.stats.rendered(start);
 
     match outcome {
         Rendered::Queued => {}
@@ -981,6 +994,19 @@ fn insert_input_sources(
     let events = drm.clone();
     handle
         .insert_source(backend, move |mut event, _, state| {
+            fn time(event: &impl Event<LibinputInputBackend>) -> Option<Duration> {
+                Some(Duration::from_micros(Event::time(event).micros()))
+            }
+            let sent = match &event {
+                InputEvent::Keyboard { event } => time(event),
+                InputEvent::PointerMotion { event } => time(event),
+                InputEvent::PointerButton { event } => time(event),
+                InputEvent::PointerAxis { event } => time(event),
+                _ => None,
+            };
+            if let Some(sent) = sent {
+                state.stats.input(sent);
+            }
             match &mut event {
                 InputEvent::DeviceAdded { device } => {
                     if device.has_capability(DeviceCapability::Keyboard) {
