@@ -18,6 +18,28 @@ impl Rect {
         Self { x, y, w, h }
     }
 
+    pub fn center(self) -> (i32, i32) {
+        (self.x + self.w / 2, self.y + self.h / 2)
+    }
+
+    pub fn contains(self, x: f64, y: f64) -> bool {
+        x >= f64::from(self.x)
+            && y >= f64::from(self.y)
+            && x < f64::from(self.x + self.w)
+            && y < f64::from(self.y + self.h)
+    }
+
+    pub fn expand(self, by: i32) -> Self {
+        Self::new(self.x - by, self.y - by, self.w + 2 * by, self.h + 2 * by)
+    }
+
+    /// Moves the rectangle into `area`. If it does not fit, its top left corner stays visible.
+    pub fn clamped_into(self, area: Self) -> Self {
+        let x = self.x.min(area.x + area.w - self.w).max(area.x);
+        let y = self.y.min(area.y + area.h - self.h).max(area.y);
+        Self::new(x, y, self.w, self.h)
+    }
+
     /// Shrinks the rectangle on all sides. Width and height never drop below 1, because a
     /// configure with size 0 would tell the client to pick its own size.
     pub fn shrink(self, by: i32) -> Self {
@@ -51,6 +73,10 @@ impl Rect {
         }
     }
 }
+
+/// Limits of a split ratio, so that no side can vanish.
+const MIN_RATIO: f32 = 0.1;
+const MAX_RATIO: f32 = 0.9;
 
 /// Free space around the tiled area (`outer`) and between windows (`inner`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +116,16 @@ impl<T> Node<T> {
             Node::Split { first, second, .. } => {
                 first.push_leaves(out);
                 second.push_leaves(out);
+            }
+        }
+    }
+
+    fn push_leaves_mut<'a>(&'a mut self, out: &mut Vec<&'a mut T>) {
+        match self {
+            Node::Leaf(item) => out.push(item),
+            Node::Split { first, second, .. } => {
+                first.push_leaves_mut(out);
+                second.push_leaves_mut(out);
             }
         }
     }
@@ -179,6 +215,66 @@ impl<T: PartialEq> Node<T> {
         }
     }
 
+    fn contains(&self, item: &T) -> bool {
+        match self {
+            Node::Leaf(leaf) => leaf == item,
+            Node::Split { first, second, .. } => first.contains(item) || second.contains(item),
+        }
+    }
+
+    /// Grows `item` by `delta` of the split that created its leaf. Returns whether it was found.
+    fn grow(&mut self, item: &T, delta: f32) -> bool {
+        let Node::Split {
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return false;
+        };
+        let change = match (&**first, &**second) {
+            (Node::Leaf(leaf), _) if leaf == item => delta,
+            (_, Node::Leaf(leaf)) if leaf == item => -delta,
+            _ => return first.grow(item, delta) || second.grow(item, delta),
+        };
+        *ratio = (*ratio + change).clamp(MIN_RATIO, MAX_RATIO);
+        true
+    }
+
+    /// Moves the dividers nearest to `item` by `dx` and `dy` pixels: on each axis the deepest
+    /// split on the way to its leaf. Returns which axes are already taken care of.
+    fn drag(&mut self, item: &T, area: Rect, gap: i32, dx: f64, dy: f64) -> (bool, bool) {
+        let Node::Split {
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return (false, false);
+        };
+        let (a, b) = area.split(*ratio, gap);
+        let (mut horizontal, mut vertical) = if first.contains(item) {
+            first.drag(item, a, gap, dx, dy)
+        } else if second.contains(item) {
+            second.drag(item, b, gap, dx, dy)
+        } else {
+            return (false, false);
+        };
+
+        let side_by_side = area.w >= area.h;
+        let (done, length, delta) = if side_by_side {
+            (&mut horizontal, area.w, dx)
+        } else {
+            (&mut vertical, area.h, dy)
+        };
+        if !*done && length > gap {
+            let change = delta as f32 / (length - gap) as f32;
+            *ratio = (*ratio + change).clamp(MIN_RATIO, MAX_RATIO);
+            *done = true;
+        }
+        (horizontal, vertical)
+    }
+
     fn neighbour(&self, item: &T) -> Option<&T> {
         let Node::Split { first, second, .. } = self else {
             return None;
@@ -252,6 +348,41 @@ impl<T: PartialEq> Dwindle<T> {
                 self.root = Some(root);
                 false
             }
+        }
+    }
+
+    /// Exchanges the leaves of `a` and `b`. Returns whether both were present.
+    pub fn swap(&mut self, a: &T, b: &T) -> bool {
+        let Some(root) = &mut self.root else {
+            return false;
+        };
+        let mut leaves = Vec::new();
+        root.push_leaves_mut(&mut leaves);
+        let first = leaves.iter().position(|leaf| **leaf == *a);
+        let second = leaves.iter().position(|leaf| **leaf == *b);
+        let (Some(first), Some(second)) = (first, second) else {
+            return false;
+        };
+        let (low, high) = (first.min(second), first.max(second));
+        if low != high {
+            let (head, tail) = leaves.split_at_mut(high);
+            std::mem::swap(&mut *head[low], &mut *tail[0]);
+        }
+        true
+    }
+
+    /// Grows `item` by `delta` of the area it shares with its sibling, or shrinks it if `delta`
+    /// is negative. Returns whether a split changed.
+    pub fn grow(&mut self, item: &T, delta: f32) -> bool {
+        self.root
+            .as_mut()
+            .is_some_and(|root| root.grow(item, delta))
+    }
+
+    /// Moves the dividers next to `item` by the given number of pixels, as a mouse drag does.
+    pub fn drag(&mut self, item: &T, area: Rect, gaps: Gaps, dx: f64, dy: f64) {
+        if let Some(root) = &mut self.root {
+            root.drag(item, area.shrink(gaps.outer), gaps.inner, dx, dy);
         }
     }
 
@@ -499,6 +630,105 @@ mod tests {
         assert_eq!((tiny.x, tiny.y), (11, 21));
     }
 
+    #[test]
+    fn swap_exchanges_places_and_keeps_the_shape() {
+        let mut tree = tree_of(&[1, 2, 3]);
+        tree.grow(&1, 0.2);
+        let before: Vec<Rect> = rects(&tree, AREA, NO_GAPS).iter().map(|t| t.1).collect();
+        assert!(tree.swap(&1, &3));
+        assert_eq!(tree.items(), [&3, &2, &1]);
+        let after: Vec<Rect> = rects(&tree, AREA, NO_GAPS).iter().map(|t| t.1).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn swap_ignores_unknown_items_and_itself() {
+        let mut tree = tree_of(&[1, 2]);
+        assert!(!tree.swap(&1, &9));
+        assert!(tree.swap(&1, &1));
+        assert_eq!(tree.items(), [&1, &2]);
+        assert!(!Dwindle::<u32>::new().swap(&1, &2));
+    }
+
+    #[test]
+    fn grow_favours_the_item_on_either_side_of_the_split() {
+        let mut tree = tree_of(&[1, 2]);
+        assert!(tree.grow(&1, 0.1));
+        assert_eq!(rects(&tree, AREA, NO_GAPS)[0].1.w, 600);
+        assert!(tree.grow(&2, 0.2));
+        assert_eq!(rects(&tree, AREA, NO_GAPS)[0].1.w, 400);
+    }
+
+    #[test]
+    fn grow_only_touches_the_parent_split() {
+        let mut tree = tree_of(&[1, 2, 3]);
+        assert!(tree.grow(&3, 0.1));
+        let tiles = rects(&tree, AREA, NO_GAPS);
+        assert_eq!(tiles[0].1.w, 500, "root split moved");
+        assert_eq!(tiles[1].1.h, 240);
+        assert_eq!(tiles[2].1.h, 360);
+    }
+
+    #[test]
+    fn ratios_stop_at_the_limits() {
+        let mut tree = tree_of(&[1, 2]);
+        tree.grow(&1, 5.0);
+        assert_eq!(rects(&tree, AREA, NO_GAPS)[0].1.w, 900);
+        tree.grow(&1, -5.0);
+        assert_eq!(rects(&tree, AREA, NO_GAPS)[0].1.w, 100);
+        assert!(!tree.grow(&9, 0.1));
+        assert!(!tree_of(&[1]).grow(&1, 0.1));
+    }
+
+    #[test]
+    fn dragging_moves_the_divider_with_the_pointer() {
+        let mut tree = tree_of(&[1, 2]);
+        tree.drag(&1, AREA, NO_GAPS, 100.0, 0.0);
+        assert_eq!(rects(&tree, AREA, NO_GAPS)[0].1.w, 600);
+        // The divider follows the pointer no matter on which side the dragged window lies.
+        tree.drag(&2, AREA, NO_GAPS, -200.0, 0.0);
+        assert_eq!(rects(&tree, AREA, NO_GAPS)[0].1.w, 400);
+    }
+
+    #[test]
+    fn dragging_acts_on_both_axes_independently() {
+        let mut tree = tree_of(&[1, 2, 3]);
+        tree.drag(&2, AREA, NO_GAPS, 100.0, 60.0);
+        let tiles = rects(&tree, AREA, NO_GAPS);
+        assert_eq!(tiles[0].1.w, 600);
+        assert_eq!(tiles[1].1.h, 360);
+    }
+
+    #[test]
+    fn dragging_prefers_the_deepest_split_of_an_axis() {
+        // 1 | (2 | (3 over 4)): two side-by-side splits on the way to 3.
+        let mut tree = tree_of(&[1, 2, 3, 4]);
+        let area = Rect::new(0, 0, 1600, 800);
+        let before = rects(&tree, area, NO_GAPS);
+        tree.drag(&3, area, NO_GAPS, 80.0, 0.0);
+        let after = rects(&tree, area, NO_GAPS);
+        assert_eq!(after[0].1, before[0].1, "root split moved");
+        assert_eq!(after[1].1.w, before[1].1.w + 80);
+        assert_eq!(after[2].1.w, before[2].1.w - 80);
+    }
+
+    #[test]
+    fn clamped_into_keeps_the_size_and_prefers_the_top_left_corner() {
+        let area = Rect::new(100, 100, 500, 400);
+        assert_eq!(
+            Rect::new(550, 450, 100, 100).clamped_into(area),
+            Rect::new(500, 400, 100, 100)
+        );
+        assert_eq!(
+            Rect::new(0, 0, 100, 100).clamped_into(area),
+            Rect::new(100, 100, 100, 100)
+        );
+        assert_eq!(
+            Rect::new(0, 0, 900, 900).clamped_into(area),
+            Rect::new(100, 100, 900, 900)
+        );
+    }
+
     /// Random inserts and removals, checked against the layout invariants.
     #[test]
     fn random_operations_keep_the_layout_valid() {
@@ -532,6 +762,13 @@ mod tests {
                 assert_eq!(neighbour.is_some(), !members.is_empty());
                 assert!(tree.remove(&item));
                 assert!(neighbour.is_none_or(|n| tree.contains(&n)));
+            }
+            if members.len() >= 2 {
+                let a = members[next(members.len() as u32) as usize];
+                let b = members[next(members.len() as u32) as usize];
+                tree.swap(&a, &b);
+                tree.grow(&a, next(40) as f32 / 100.0 - 0.2);
+                tree.drag(&b, area, gaps, f64::from(next(200)) - 100.0, 0.0);
             }
 
             let tiles = rects(&tree, area, gaps);
