@@ -28,7 +28,9 @@ strat -r arch env PATH=$HOME/.cargo/bin:$PATH cargo build
 strat void ./target/debug/wirbel check
 ```
 
-Am Ende muss `No problems found.` stehen. Dann **Strg+Alt+F3** und einloggen. Auf dem TTY:
+Am Ende muss `No problems found.` stehen. Dann **Strg+Alt+F3** und einloggen. Passiert nichts, in
+einem Terminal `sudo chvt 3` nutzen: Deine Mango-Config belegt die Tasten nicht selbst. Zurück zu Mango
+geht vom TTY mit Strg+Alt+F7 oder `sudo chvt 7`. Auf dem TTY:
 
 ```sh
 cd ~/WM
