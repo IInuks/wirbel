@@ -16,7 +16,7 @@ use smithay::{
     utils::Transform,
 };
 
-use crate::{Wirbel, state::BACKGROUND_COLOR};
+use crate::Wirbel;
 
 const REFRESH_MHZ: i32 = 60_000;
 
@@ -87,8 +87,9 @@ pub fn init(
                     .output
                     .change_current_state(Some(mode), None, None, None);
                 nested.damage_tracker = OutputDamageTracker::from_output(&nested.output);
+                let output = nested.output.clone();
                 drop(nested);
-                state.retile();
+                state.output_resized(&output);
             }
             WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => nested.borrow_mut().render(state),
@@ -129,7 +130,7 @@ impl Nested {
             &mut framebuffer,
             age,
             &elements,
-            BACKGROUND_COLOR,
+            state.config.background_color,
         ) {
             Ok(result) => result.damage.cloned(),
             Err(err) => {

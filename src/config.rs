@@ -586,11 +586,17 @@ mod tests {
             ("fullscreen", Action::Fullscreen),
             ("maximize", Action::Maximize),
             ("workspace, 9", Action::Workspace(WorkspaceTarget::Index(8))),
-            ("workspace, prev", Action::Workspace(WorkspaceTarget::Previous)),
+            (
+                "workspace, prev",
+                Action::Workspace(WorkspaceTarget::Previous),
+            ),
             ("workspace, next", Action::Workspace(WorkspaceTarget::Next)),
             ("move_to_workspace, 1", Action::MoveToWorkspace(0)),
             ("focus_output, up", Action::FocusOutput(Direction::Up)),
-            ("move_to_output, right", Action::MoveToOutput(Direction::Right)),
+            (
+                "move_to_output, right",
+                Action::MoveToOutput(Direction::Right),
+            ),
         ];
         for (text, action) in cases {
             let bind = parse_bind(&format!("SUPER, a, {text}")).unwrap();
@@ -604,7 +610,10 @@ mod tests {
         assert_eq!(bind.action, Action::Spawn("sh -c 'a=1, b=2'".into()));
         assert_eq!(bind.modifiers, Modifiers::default());
         let config = parse_clean("bind = NONE, F1, spawn, env A=1 foo, bar\n");
-        assert_eq!(config.binds[1].action, Action::Spawn("env A=1 foo, bar".into()));
+        assert_eq!(
+            config.binds[1].action,
+            Action::Spawn("env A=1 foo, bar".into())
+        );
     }
 
     #[test]
@@ -627,8 +636,14 @@ mod tests {
         assert_eq!(parse_key("ß").unwrap().raw(), keysyms::KEY_ssharp);
         assert_eq!(parse_key("Ä").unwrap().raw(), keysyms::KEY_adiaeresis);
         assert_eq!(parse_key("ssharp").unwrap().raw(), keysyms::KEY_ssharp);
-        assert_eq!(parse_key("BackSpace").unwrap().raw(), keysyms::KEY_BackSpace);
-        assert_eq!(parse_key("backspace").unwrap().raw(), keysyms::KEY_BackSpace);
+        assert_eq!(
+            parse_key("BackSpace").unwrap().raw(),
+            keysyms::KEY_BackSpace
+        );
+        assert_eq!(
+            parse_key("backspace").unwrap().raw(),
+            keysyms::KEY_BackSpace
+        );
         assert_eq!(parse_key("1").unwrap().raw(), keysyms::KEY_1);
     }
 

@@ -36,12 +36,7 @@ impl CompositorHandler for Wirbel {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            let window = self.space.elements().find(|window| {
-                window
-                    .toplevel()
-                    .is_some_and(|toplevel| toplevel.wl_surface() == &root)
-            });
-            if let Some(window) = window {
+            if let Some(window) = self.find_window(&root) {
                 window.on_commit();
             }
         }

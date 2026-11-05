@@ -1,14 +1,18 @@
 use smithay::{
     backend::renderer::utils::with_renderer_surface_state,
     desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords},
-    reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface},
+    input::Seat,
+    reexports::{
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_server::protocol::{wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
+    },
     utils::Serial,
     wayland::shell::xdg::{
         PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     },
 };
 
-use crate::Wirbel;
+use crate::{Wirbel, grabs::DragKind, workspace::FullKind};
 
 fn is_window_of(window: &Window, surface: &WlSurface) -> bool {
     window
@@ -29,14 +33,44 @@ impl XdgShellHandler for Wirbel {
         let surface = surface.wl_surface();
         self.unconfigured
             .retain(|window| !is_window_of(window, surface));
-        let window = self
-            .space
-            .elements()
-            .find(|window| is_window_of(window, surface))
-            .cloned();
-        if let Some(window) = window {
+        if let Some(window) = self.find_window(surface) {
             self.remove_window(&window);
         }
+    }
+
+    fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        if let Some(seat) = Seat::from_resource(&seat) {
+            self.start_client_drag(surface.wl_surface(), &seat, serial, DragKind::Move);
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        seat: wl_seat::WlSeat,
+        serial: Serial,
+        edges: xdg_toplevel::ResizeEdge,
+    ) {
+        if let Some(seat) = Seat::from_resource(&seat) {
+            let kind = DragKind::Resize(edges.into());
+            self.start_client_drag(surface.wl_surface(), &seat, serial, kind);
+        }
+    }
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+        self.full_request(&surface, Some(FullKind::Fullscreen));
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        self.full_request(&surface, None);
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        self.full_request(&surface, Some(FullKind::Maximized));
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        self.full_request(&surface, None);
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -77,22 +111,16 @@ impl Wirbel {
                 return;
             };
 
-            self.layout.insert(self.focused.as_ref(), window.clone());
-            self.awaiting_buffer.push(window.clone());
-            self.space.map_element(window, (0, 0), false);
-            self.retile();
+            if !self.place_new_window(window.clone()) {
+                self.unconfigured.push(window);
+            }
             // `retile` only sends changes. A window returning from an unmap may have none, but
             // every initial commit is owed a configure.
             toplevel.send_configure();
             return;
         }
 
-        let Some(window) = self
-            .space
-            .elements()
-            .find(|window| is_window_of(window, surface))
-            .cloned()
-        else {
+        let Some(window) = self.find_window(surface) else {
             return;
         };
         let has_buffer =
@@ -104,13 +132,40 @@ impl Wirbel {
         match (index, has_buffer) {
             (Some(index), true) => {
                 self.awaiting_buffer.remove(index);
-                self.set_focus(Some(window));
+                self.set_focus(Some(window.clone()));
             }
             (None, false) => {
                 self.remove_window(&window);
                 self.unconfigured.push(window);
+                return;
             }
             _ => {}
+        }
+        self.floating_commit(&window);
+    }
+
+    /// Clients change between normal, fullscreen and maximized. Before the initial commit the
+    /// wish is only noted, `place_new_window` picks it up.
+    fn full_request(&mut self, surface: &ToplevelSurface, kind: Option<FullKind>) {
+        let window = self.find_window(surface.wl_surface());
+        match window {
+            Some(window) => self.set_full(&window, kind),
+            None => surface.with_pending_state(|state| {
+                for (wanted, flag) in [
+                    (FullKind::Fullscreen, xdg_toplevel::State::Fullscreen),
+                    (FullKind::Maximized, xdg_toplevel::State::Maximized),
+                ] {
+                    if kind == Some(wanted) {
+                        state.states.set(flag);
+                    } else {
+                        state.states.unset(flag);
+                    }
+                }
+            }),
+        }
+        // The protocol wants an answer even if nothing changed.
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
         }
     }
 
@@ -130,20 +185,14 @@ impl Wirbel {
         let Ok(root) = find_popup_root_surface(&kind) else {
             return;
         };
-        let Some(window) = self
-            .space
-            .elements()
-            .find(|window| is_window_of(window, &root))
-        else {
+        let Some(window) = self.find_window(&root) else {
             return;
         };
         let output_geometry = self
-            .space
-            .outputs()
-            .next()
-            .and_then(|output| self.space.output_geometry(output));
+            .locate(&window)
+            .and_then(|(monitor, _)| self.space.output_geometry(&self.monitors[monitor].output));
         let (Some(mut target), Some(window_location)) =
-            (output_geometry, self.space.element_location(window))
+            (output_geometry, self.space.element_location(&window))
         else {
             return;
         };

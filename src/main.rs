@@ -1,12 +1,35 @@
-use std::env;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
-use wirbel::{Wirbel, backend};
+use wirbel::{Wirbel, backend, config::Config};
 
-const USAGE: &str = "usage: wirbel [-c COMMAND]...
+const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]...
 
+      --config FILE      read this file instead of ~/.config/wirbel/config
   -c, --command COMMAND  run a shell command inside the compositor (repeatable)
   -h, --help             show this help";
+
+/// Whatever is wrong with the file, the compositor has to come up.
+fn load_config(path: Option<&Path>) -> Config {
+    let Some(path) = path else {
+        return Config::default();
+    };
+    match Config::load(path) {
+        Ok((config, errors)) => {
+            for error in errors {
+                tracing::error!(path = %path.display(), %error, "skipping configuration line");
+            }
+            config
+        }
+        Err(err) => {
+            tracing::error!(path = %path.display(), %err, "using the default configuration");
+            Config::default()
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -14,10 +37,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let mut commands = Vec::new();
+    let mut config_path = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-c" | "--command" => commands.push(args.next().ok_or(USAGE)?),
+            "--config" => config_path = Some(PathBuf::from(args.next().ok_or(USAGE)?)),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -34,7 +59,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut event_loop = EventLoop::try_new()?;
     let display = Display::new()?;
-    let mut state = Wirbel::new(&mut event_loop, display)?;
+    let config_path = config_path.or_else(Config::default_path);
+    let mut state = Wirbel::new(
+        &mut event_loop,
+        display,
+        load_config(config_path.as_deref()),
+    )?;
+    state.config_path = config_path;
     backend::winit::init(&mut event_loop, &mut state)?;
 
     tracing::info!(socket = ?state.socket_name, "compositor ready");

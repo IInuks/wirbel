@@ -4,15 +4,12 @@ use smithay::{
     backend::renderer::{
         ImportAll, ImportMem, Renderer, Texture,
         element::{
-            Kind,
+            AsRenderElements, Kind,
             solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
     },
-    desktop::{
-        space::{SpaceRenderElements, space_render_elements},
-        utils::send_frames_surface_tree,
-    },
+    desktop::utils::send_frames_surface_tree,
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     output::Output,
     utils::{Logical, Point, Scale},
@@ -23,16 +20,14 @@ use std::{sync::Mutex, time::Duration};
 use crate::Wirbel;
 
 smithay::backend::renderer::element::render_elements! {
-    pub GenericSceneElement<R, E> where R: ImportAll + ImportMem;
-    Cursor=WaylandSurfaceRenderElement<R>,
-    Space=SpaceRenderElements<R, E>,
+    pub SceneElement<R> where R: ImportAll + ImportMem;
+    Surface=WaylandSurfaceRenderElement<R>,
     Solid=SolidColorRenderElement,
 }
 
-pub type SceneElement<R> = GenericSceneElement<R, WaylandSurfaceRenderElement<R>>;
-
 impl Wirbel {
-    /// Everything visible on `output`, front to back: cursor, windows, borders.
+    /// Everything visible on `output`, front to back: the cursor, then each window on top of its
+    /// own border, so that a floating window also covers the borders of the tiles below.
     pub fn scene_elements<R>(&self, renderer: &mut R, output: &Output) -> Vec<SceneElement<R>>
     where
         R: Renderer + ImportAll + ImportMem,
@@ -47,21 +42,27 @@ impl Wirbel {
 
         let mut elements = self.cursor_elements(renderer, origin, scale);
 
-        match space_render_elements(renderer, [&self.space], output, 1.0) {
-            Ok(space) => elements.extend(space.into_iter().map(GenericSceneElement::Space)),
-            Err(err) => tracing::warn!(?err, "failed to collect window elements"),
-        }
+        for window in self.space.elements_for_output(output).rev() {
+            let Some(location) = self.space.element_location(window) else {
+                continue;
+            };
+            let location =
+                (location - window.geometry().loc - origin).to_physical_precise_round(scale);
+            elements.extend(window.render_elements(renderer, location, scale, 1.0));
 
-        elements.extend(self.borders.iter().map(|edge| {
-            let location = (edge.location - origin).to_physical_precise_round(scale);
-            GenericSceneElement::Solid(SolidColorRenderElement::from_buffer(
-                &edge.buffer,
-                location,
-                scale,
-                1.0,
-                Kind::Unspecified,
-            ))
-        }));
+            let border = self.borders.iter().find(|(owner, _)| owner == window);
+            let edges = border.into_iter().flat_map(|(_, edges)| edges);
+            elements.extend(edges.map(|edge| {
+                let location = (edge.location - origin).to_physical_precise_round(scale);
+                SceneElement::Solid(SolidColorRenderElement::from_buffer(
+                    &edge.buffer,
+                    location,
+                    scale,
+                    1.0,
+                    Kind::Unspecified,
+                ))
+            }));
+        }
         elements
     }
 
@@ -99,7 +100,7 @@ impl Wirbel {
     pub fn send_frame_callbacks(&self, output: &Output) {
         let time = self.time();
         let throttle = Some(Duration::ZERO);
-        for window in self.space.elements() {
+        for window in self.space.elements_for_output(output) {
             window.send_frame(output, time, throttle, |_, _| Some(output.clone()));
         }
         if let CursorImageStatus::Surface(surface) = &self.cursor_status {
