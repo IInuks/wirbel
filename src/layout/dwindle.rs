@@ -97,7 +97,11 @@ impl<T> Node<T> {
     fn arrange<'a>(&'a self, area: Rect, gap: i32, out: &mut Vec<(&'a T, Rect)>) {
         match self {
             Node::Leaf(item) => out.push((item, area)),
-            Node::Split { ratio, first, second } => {
+            Node::Split {
+                ratio,
+                first,
+                second,
+            } => {
                 let (a, b) = area.split(*ratio, gap);
                 first.arrange(a, gap, out);
                 second.arrange(b, gap, out);
@@ -123,10 +127,18 @@ impl<T> Node<T> {
                     None => Node::Leaf(old),
                 }
             }
-            Node::Split { ratio, first, second } => {
+            Node::Split {
+                ratio,
+                first,
+                second,
+            } => {
                 let first = Box::new(first.insert_at(index, item));
                 let second = Box::new(second.insert_at(index, item));
-                Node::Split { ratio, first, second }
+                Node::Split {
+                    ratio,
+                    first,
+                    second,
+                }
             }
         }
     }
@@ -139,7 +151,11 @@ impl<T: PartialEq> Node<T> {
         match self {
             Node::Leaf(old) if old == *item => Ok(None),
             leaf @ Node::Leaf(_) => Err(leaf),
-            Node::Split { ratio, first, second } => match first.remove(item) {
+            Node::Split {
+                ratio,
+                first,
+                second,
+            } => match first.remove(item) {
                 Ok(None) => Ok(Some(*second)),
                 Ok(Some(first)) => Ok(Some(Node::Split {
                     ratio,
@@ -264,7 +280,10 @@ mod tests {
     const NO_GAPS: Gaps = Gaps { outer: 0, inner: 0 };
 
     fn rects(tree: &Dwindle<u32>, area: Rect, gaps: Gaps) -> Vec<(u32, Rect)> {
-        tree.arrange(area, gaps).into_iter().map(|(item, rect)| (*item, rect)).collect()
+        tree.arrange(area, gaps)
+            .into_iter()
+            .map(|(item, rect)| (*item, rect))
+            .collect()
     }
 
     fn tree_of(items: &[u32]) -> Dwindle<u32> {
@@ -290,7 +309,10 @@ mod tests {
     #[test]
     fn single_window_fills_the_area_inside_the_outer_gap() {
         let tree = tree_of(&[1]);
-        let gaps = Gaps { outer: 10, inner: 5 };
+        let gaps = Gaps {
+            outer: 10,
+            inner: 5,
+        };
         assert_eq!(rects(&tree, AREA, gaps), [(1, Rect::new(10, 10, 980, 580))]);
     }
 
@@ -299,7 +321,10 @@ mod tests {
         let tree = tree_of(&[1, 2]);
         assert_eq!(
             rects(&tree, AREA, NO_GAPS),
-            [(1, Rect::new(0, 0, 500, 600)), (2, Rect::new(500, 0, 500, 600))]
+            [
+                (1, Rect::new(0, 0, 500, 600)),
+                (2, Rect::new(500, 0, 500, 600))
+            ]
         );
     }
 
@@ -308,7 +333,10 @@ mod tests {
         let tree = tree_of(&[1, 2]);
         assert_eq!(
             rects(&tree, Rect::new(0, 0, 600, 1000), NO_GAPS),
-            [(1, Rect::new(0, 0, 600, 500)), (2, Rect::new(0, 500, 600, 500))]
+            [
+                (1, Rect::new(0, 0, 600, 500)),
+                (2, Rect::new(0, 500, 600, 500))
+            ]
         );
     }
 
@@ -358,10 +386,16 @@ mod tests {
     #[test]
     fn inner_gap_separates_and_nothing_is_lost() {
         let tree = tree_of(&[1, 2]);
-        let gaps = Gaps { outer: 10, inner: 6 };
+        let gaps = Gaps {
+            outer: 10,
+            inner: 6,
+        };
         assert_eq!(
             rects(&tree, AREA, gaps),
-            [(1, Rect::new(10, 10, 487, 580)), (2, Rect::new(503, 10, 487, 580))]
+            [
+                (1, Rect::new(10, 10, 487, 580)),
+                (2, Rect::new(503, 10, 487, 580))
+            ]
         );
     }
 
@@ -380,7 +414,10 @@ mod tests {
         assert!(!tree.contains(&2));
         assert_eq!(
             rects(&tree, AREA, NO_GAPS),
-            [(1, Rect::new(0, 0, 500, 600)), (3, Rect::new(500, 0, 500, 600))]
+            [
+                (1, Rect::new(0, 0, 500, 600)),
+                (3, Rect::new(500, 0, 500, 600))
+            ]
         );
     }
 
@@ -390,7 +427,10 @@ mod tests {
         assert!(tree.remove(&1));
         assert_eq!(
             rects(&tree, AREA, NO_GAPS),
-            [(2, Rect::new(0, 0, 500, 600)), (3, Rect::new(500, 0, 500, 600))]
+            [
+                (2, Rect::new(0, 0, 500, 600)),
+                (3, Rect::new(500, 0, 500, 600))
+            ]
         );
     }
 
@@ -435,7 +475,14 @@ mod tests {
     fn tiny_areas_keep_every_size_positive() {
         for (w, h) in [(0, 0), (1, 1), (2, 1), (3, 3), (5, 40)] {
             let tree = tree_of(&[1, 2, 3, 4, 5, 6]);
-            for (_, rect) in rects(&tree, Rect::new(0, 0, w, h), Gaps { outer: 10, inner: 5 }) {
+            for (_, rect) in rects(
+                &tree,
+                Rect::new(0, 0, w, h),
+                Gaps {
+                    outer: 10,
+                    inner: 5,
+                },
+            ) {
                 assert!(rect.w >= 1 && rect.h >= 1, "{rect:?} in {w}x{h}");
             }
         }
@@ -443,7 +490,10 @@ mod tests {
 
     #[test]
     fn shrink_stays_centred_and_positive() {
-        assert_eq!(Rect::new(10, 20, 100, 50).shrink(4), Rect::new(14, 24, 92, 42));
+        assert_eq!(
+            Rect::new(10, 20, 100, 50).shrink(4),
+            Rect::new(14, 24, 92, 42)
+        );
         let tiny = Rect::new(10, 20, 3, 3).shrink(4);
         assert_eq!((tiny.w, tiny.h), (1, 1));
         assert_eq!((tiny.x, tiny.y), (11, 21));
@@ -460,15 +510,18 @@ mod tests {
             seed % limit
         };
         let area = Rect::new(7, 13, 3840, 2160);
-        let gaps = Gaps { outer: 10, inner: 5 };
+        let gaps = Gaps {
+            outer: 10,
+            inner: 5,
+        };
         let mut tree = Dwindle::new();
         let mut members: Vec<u32> = Vec::new();
         let mut id = 0;
 
         for _ in 0..5000 {
             if members.is_empty() || (members.len() < 24 && next(3) != 0) {
-                let target = (!members.is_empty())
-                    .then(|| members[next(members.len() as u32) as usize]);
+                let target =
+                    (!members.is_empty()).then(|| members[next(members.len() as u32) as usize]);
                 id += 1;
                 tree.insert(target.as_ref(), id);
                 members.push(id);

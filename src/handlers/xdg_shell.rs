@@ -3,13 +3,17 @@ use smithay::{
     desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords},
     reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface},
     utils::Serial,
-    wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
+    wayland::shell::xdg::{
+        PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+    },
 };
 
 use crate::Wirbel;
 
 fn is_window_of(window: &Window, surface: &WlSurface) -> bool {
-    window.toplevel().is_some_and(|toplevel| toplevel.wl_surface() == surface)
+    window
+        .toplevel()
+        .is_some_and(|toplevel| toplevel.wl_surface() == surface)
 }
 
 impl XdgShellHandler for Wirbel {
@@ -23,8 +27,13 @@ impl XdgShellHandler for Wirbel {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let surface = surface.wl_surface();
-        self.unconfigured.retain(|window| !is_window_of(window, surface));
-        let window = self.space.elements().find(|window| is_window_of(window, surface)).cloned();
+        self.unconfigured
+            .retain(|window| !is_window_of(window, surface));
+        let window = self
+            .space
+            .elements()
+            .find(|window| is_window_of(window, surface))
+            .cloned();
         if let Some(window) = window {
             self.remove_window(&window);
         }
@@ -37,7 +46,12 @@ impl XdgShellHandler for Wirbel {
         }
     }
 
-    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
         surface.with_pending_state(|state| {
             state.geometry = positioner.get_geometry();
             state.positioner = positioner;
@@ -53,24 +67,40 @@ impl Wirbel {
     /// Drives a toplevel through its lifecycle. The first commit tiles it, the first buffer
     /// focuses it, and a commit that drops the buffer unmaps it until it starts over.
     pub(super) fn toplevel_commit(&mut self, surface: &WlSurface) {
-        if let Some(index) = self.unconfigured.iter().position(|window| is_window_of(window, surface)) {
+        if let Some(index) = self
+            .unconfigured
+            .iter()
+            .position(|window| is_window_of(window, surface))
+        {
             let window = self.unconfigured.remove(index);
-            let Some(toplevel) = window.toplevel().cloned() else { return };
+            let Some(toplevel) = window.toplevel().cloned() else {
+                return;
+            };
 
             self.layout.insert(self.focused.as_ref(), window.clone());
             self.awaiting_buffer.push(window.clone());
             self.space.map_element(window, (0, 0), false);
             self.retile();
+            // `retile` only sends changes. A window returning from an unmap may have none, but
+            // every initial commit is owed a configure.
             toplevel.send_configure();
             return;
         }
 
-        let Some(window) = self.space.elements().find(|window| is_window_of(window, surface)).cloned()
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|window| is_window_of(window, surface))
+            .cloned()
         else {
             return;
         };
-        let has_buffer = with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
-        let index = self.awaiting_buffer.iter().position(|other| *other == window);
+        let has_buffer =
+            with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
+        let index = self
+            .awaiting_buffer
+            .iter()
+            .position(|other| *other == window);
         match (index, has_buffer) {
             (Some(index), true) => {
                 self.awaiting_buffer.remove(index);
@@ -97,12 +127,23 @@ impl Wirbel {
     /// Keeps a popup inside the output.
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let kind = PopupKind::Xdg(popup.clone());
-        let Ok(root) = find_popup_root_surface(&kind) else { return };
-        let Some(window) = self.space.elements().find(|window| is_window_of(window, &root)) else {
+        let Ok(root) = find_popup_root_surface(&kind) else {
             return;
         };
-        let output_geometry = self.space.outputs().next().and_then(|output| self.space.output_geometry(output));
-        let (Some(mut target), Some(window_location)) = (output_geometry, self.space.element_location(window))
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|window| is_window_of(window, &root))
+        else {
+            return;
+        };
+        let output_geometry = self
+            .space
+            .outputs()
+            .next()
+            .and_then(|output| self.space.output_geometry(output));
+        let (Some(mut target), Some(window_location)) =
+            (output_geometry, self.space.element_location(window))
         else {
             return;
         };

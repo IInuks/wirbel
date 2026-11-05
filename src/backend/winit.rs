@@ -9,7 +9,10 @@ use smithay::{
     },
     input::pointer::CursorImageStatus,
     output::{Mode, Output, PhysicalProperties, Subpixel},
-    reexports::{calloop::EventLoop, winit::cursor::Cursor},
+    reexports::{
+        calloop::EventLoop,
+        winit::{cursor::Cursor, dpi::LogicalSize, window::WindowAttributes},
+    },
     utils::Transform,
 };
 
@@ -29,7 +32,10 @@ pub fn init(
     event_loop: &mut EventLoop<'static, Wirbel>,
     state: &mut Wirbel,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (backend, winit) = winit::init::<GlesRenderer>()?;
+    let attributes = WindowAttributes::default()
+        .with_title("wirbel")
+        .with_surface_size(LogicalSize::new(1280.0, 800.0));
+    let (backend, winit) = winit::init_from_attributes::<GlesRenderer>(attributes)?;
 
     let mode = Mode {
         size: backend.window_size(),
@@ -47,7 +53,12 @@ pub fn init(
     );
     let _global = output.create_global::<Wirbel>(&state.display_handle);
     // GLES framebuffers are upside down relative to the window.
-    output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Flipped180),
+        None,
+        Some((0, 0).into()),
+    );
     output.set_preferred(mode);
     state.add_output(&output);
 
@@ -63,23 +74,27 @@ pub fn init(
         Box::new(move || nested.borrow().backend.window().request_redraw())
     };
 
-    event_loop.handle().insert_source(winit, move |event, _, state| match event {
-        WinitEvent::Resized { size, .. } => {
-            let mut nested = nested.borrow_mut();
-            let mode = Mode {
-                size,
-                refresh: REFRESH_MHZ,
-            };
-            nested.output.change_current_state(Some(mode), None, None, None);
-            nested.damage_tracker = OutputDamageTracker::from_output(&nested.output);
-            drop(nested);
-            state.retile();
-        }
-        WinitEvent::Input(event) => state.process_input_event(event),
-        WinitEvent::Redraw => nested.borrow_mut().render(state),
-        WinitEvent::CloseRequested => state.loop_signal.stop(),
-        _ => {}
-    })?;
+    event_loop
+        .handle()
+        .insert_source(winit, move |event, _, state| match event {
+            WinitEvent::Resized { size, .. } => {
+                let mut nested = nested.borrow_mut();
+                let mode = Mode {
+                    size,
+                    refresh: REFRESH_MHZ,
+                };
+                nested
+                    .output
+                    .change_current_state(Some(mode), None, None, None);
+                nested.damage_tracker = OutputDamageTracker::from_output(&nested.output);
+                drop(nested);
+                state.retile();
+            }
+            WinitEvent::Input(event) => state.process_input_event(event),
+            WinitEvent::Redraw => nested.borrow_mut().render(state),
+            WinitEvent::CloseRequested => state.loop_signal.stop(),
+            _ => {}
+        })?;
 
     Ok(())
 }

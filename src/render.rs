@@ -39,7 +39,11 @@ impl Wirbel {
         R::TextureId: Clone + Texture + 'static,
     {
         let scale = Scale::from(output.current_scale().fractional_scale());
-        let origin = self.space.output_geometry(output).map(|geometry| geometry.loc).unwrap_or_default();
+        let origin = self
+            .space
+            .output_geometry(output)
+            .map(|geometry| geometry.loc)
+            .unwrap_or_default();
 
         let mut elements = self.cursor_elements(renderer, origin, scale);
 

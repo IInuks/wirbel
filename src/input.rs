@@ -3,8 +3,8 @@
 
 use smithay::{
     backend::input::{
-        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent, InputTime, KeyState,
-        KeyboardKeyEvent, Keycode, PointerAxisEvent, PointerButtonEvent,
+        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
+        InputTime, KeyState, KeyboardKeyEvent, Keycode, PointerAxisEvent, PointerButtonEvent,
     },
     input::{
         keyboard::FilterResult,
@@ -22,8 +22,12 @@ impl Wirbel {
                 self.on_key(event.key_code(), event.state(), event.time());
             }
             InputEvent::PointerMotionAbsolute { event } => {
-                let Some(output) = self.space.outputs().next() else { return };
-                let Some(geometry) = self.space.output_geometry(output) else { return };
+                let Some(output) = self.space.outputs().next() else {
+                    return;
+                };
+                let Some(geometry) = self.space.output_geometry(output) else {
+                    return;
+                };
                 let position = event.position_transformed(geometry.size) + geometry.loc.to_f64();
                 self.on_pointer_motion(position, event.time());
             }
@@ -36,22 +40,38 @@ impl Wirbel {
     }
 
     pub fn on_key(&mut self, key: Keycode, state: KeyState, time: InputTime) {
-        let Some(keyboard) = self.seat.get_keyboard() else { return };
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
         let serial = SERIAL_COUNTER.next_serial();
-        keyboard.input::<(), _>(self, key, state, serial, time, |_, _, _| FilterResult::Forward);
+        keyboard.input::<(), _>(self, key, state, serial, time, |_, _, _| {
+            FilterResult::Forward
+        });
     }
 
     pub fn on_pointer_motion(&mut self, location: Point<f64, Logical>, time: InputTime) {
-        let Some(pointer) = self.seat.get_pointer() else { return };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
         let under = self.surface_under(location);
         let serial = SERIAL_COUNTER.next_serial();
-        pointer.motion(self, under, &MotionEvent { location, serial, time });
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location,
+                serial,
+                time,
+            },
+        );
         pointer.frame(self);
         self.needs_redraw = true;
     }
 
     pub fn on_pointer_button(&mut self, button: u32, state: ButtonState, time: InputTime) {
-        let Some(pointer) = self.seat.get_pointer() else { return };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
         if state == ButtonState::Pressed
             && !pointer.is_grabbed()
             && let Some(window) = self.window_at(pointer.current_location())
@@ -60,7 +80,15 @@ impl Wirbel {
             self.set_focus(Some(window));
         }
         let serial = SERIAL_COUNTER.next_serial();
-        pointer.button(self, &ButtonEvent { button, state, serial, time });
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button,
+                state,
+                serial,
+                time,
+            },
+        );
         pointer.frame(self);
     }
 
@@ -69,7 +97,10 @@ impl Wirbel {
         let mut frame = AxisFrame::new(event.time()).source(source);
         for axis in [Axis::Horizontal, Axis::Vertical] {
             let discrete = event.amount_v120(axis);
-            let amount = event.amount(axis).or(discrete.map(|v120| v120 * 15.0 / 120.0)).unwrap_or(0.0);
+            let amount = event
+                .amount(axis)
+                .or(discrete.map(|v120| v120 * 15.0 / 120.0))
+                .unwrap_or(0.0);
             if amount != 0.0 {
                 frame = frame.value(axis, amount);
                 if let Some(discrete) = discrete {
@@ -80,7 +111,9 @@ impl Wirbel {
                 frame = frame.stop(axis);
             }
         }
-        let Some(pointer) = self.seat.get_pointer() else { return };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
         pointer.axis(self, frame);
         pointer.frame(self);
     }

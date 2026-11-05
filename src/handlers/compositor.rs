@@ -6,7 +6,10 @@ use smithay::{
     },
     wayland::{
         buffer::BufferHandler,
-        compositor::{CompositorClientState, CompositorHandler, CompositorState, get_parent, is_sync_subsurface},
+        compositor::{
+            CompositorClientState, CompositorHandler, CompositorState, get_parent,
+            is_sync_subsurface,
+        },
         shm::{ShmHandler, ShmState},
     },
 };
@@ -19,7 +22,10 @@ impl CompositorHandler for Wirbel {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().expect("client without ClientState").compositor_state
+        &client
+            .get_data::<ClientState>()
+            .expect("client without ClientState")
+            .compositor_state
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -31,7 +37,9 @@ impl CompositorHandler for Wirbel {
                 root = parent;
             }
             let window = self.space.elements().find(|window| {
-                window.toplevel().is_some_and(|toplevel| toplevel.wl_surface() == &root)
+                window
+                    .toplevel()
+                    .is_some_and(|toplevel| toplevel.wl_surface() == &root)
             });
             if let Some(window) = window {
                 window.on_commit();
@@ -40,6 +48,9 @@ impl CompositorHandler for Wirbel {
 
         self.toplevel_commit(surface);
         self.popup_commit(surface);
+        // A window that got its first buffer or a new size may now cover the pointer, or no
+        // longer do so.
+        self.update_pointer_focus();
         self.needs_redraw = true;
     }
 }

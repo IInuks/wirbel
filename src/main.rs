@@ -27,7 +27,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if env::var_os("WAYLAND_DISPLAY").is_none() && env::var_os("DISPLAY").is_none() {
-        return Err("no Wayland or X11 session found, and the DRM backend does not exist yet".into());
+        return Err(
+            "no Wayland or X11 session found, and the DRM backend does not exist yet".into(),
+        );
     }
 
     let mut event_loop = EventLoop::try_new()?;

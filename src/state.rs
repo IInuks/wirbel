@@ -31,11 +31,14 @@ use smithay::{
 use crate::layout::{Dwindle, Gaps, Rect};
 
 // Values taken from the user's mango config. The config file arrives in stage 2.
-pub const GAPS: Gaps = Gaps { outer: 10, inner: 5 };
+pub const GAPS: Gaps = Gaps {
+    outer: 10,
+    inner: 5,
+};
 pub const BORDER_WIDTH: i32 = 4;
 pub const BORDER_COLOR: [f32; 4] = rgba(0x44, 0x44, 0x44);
 pub const FOCUS_COLOR: [f32; 4] = rgba(0xc9, 0xb8, 0x90);
-pub const BACKGROUND_COLOR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
+pub const BACKGROUND_COLOR: [f32; 4] = rgba(0x1a, 0x1a, 0x1a);
 
 const fn rgba(r: u8, g: u8, b: u8) -> [f32; 4] {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
@@ -70,6 +73,8 @@ pub struct Wirbel {
     /// Tiled windows waiting for their first buffer. They get focus when it arrives.
     pub awaiting_buffer: Vec<Window>,
     pub focused: Option<Window>,
+    /// The tile of every window, as of the last `retile`.
+    pub tiles: Vec<(Window, Rect)>,
     pub borders: Vec<BorderEdge>,
     pub cursor_status: CursorImageStatus,
 
@@ -108,6 +113,7 @@ impl Wirbel {
             unconfigured: Vec::new(),
             awaiting_buffer: Vec::new(),
             focused: None,
+            tiles: Vec::new(),
             borders: Vec::new(),
             cursor_status: CursorImageStatus::default_named(),
 
@@ -183,7 +189,11 @@ impl Wirbel {
 
     /// Moves windows to the tiles the layout assigns them and redraws their borders.
     pub fn retile(&mut self) {
-        let area = self.space.outputs().next().and_then(|output| self.space.output_geometry(output));
+        let area = self
+            .space
+            .outputs()
+            .next()
+            .and_then(|output| self.space.output_geometry(output));
         let Some(area) = area else { return };
         let area = Rect::new(area.loc.x, area.loc.y, area.size.w, area.size.h);
 
@@ -202,11 +212,18 @@ impl Wirbel {
                 });
                 toplevel.send_pending_configure();
             }
-            self.space.map_element(window.clone(), (inner.x, inner.y), false);
+            self.space
+                .map_element(window.clone(), (inner.x, inner.y), false);
         }
 
+        self.tiles = tiles;
+        self.update_borders();
+        self.refresh_pointer_focus();
+    }
+
+    fn update_borders(&mut self) {
         self.borders.clear();
-        for (window, tile) in &tiles {
+        for (window, tile) in &self.tiles {
             let color = if self.focused.as_ref() == Some(window) {
                 FOCUS_COLOR
             } else {
@@ -214,9 +231,7 @@ impl Wirbel {
             };
             self.borders.extend(border_edges(*tile, color));
         }
-
         self.needs_redraw = true;
-        self.refresh_pointer_focus();
     }
 
     /// Gives `window` the keyboard. `None` clears the focus.
@@ -243,7 +258,7 @@ impl Wirbel {
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
         }
-        self.retile();
+        self.update_borders();
     }
 
     /// Forgets a window that is gone, or unmapped itself, and moves focus to its neighbour.
@@ -253,18 +268,21 @@ impl Wirbel {
         self.awaiting_buffer.retain(|other| other != window);
         self.space.unmap_elem(window);
         if self.focused.as_ref() == Some(window) {
-            self.focused = None;
             self.set_focus(neighbour);
-        } else {
-            self.retile();
         }
+        self.retile();
     }
 
     pub fn window_at(&self, position: Point<f64, Logical>) -> Option<Window> {
-        self.space.element_under(position).map(|(window, _)| window.clone())
+        self.space
+            .element_under(position)
+            .map(|(window, _)| window.clone())
     }
 
-    pub fn surface_under(&self, position: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+    pub fn surface_under(
+        &self,
+        position: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
         let (window, location) = self.space.element_under(position)?;
         window
             .surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
@@ -273,7 +291,9 @@ impl Wirbel {
 
     /// Re-evaluates what is under the pointer, for when windows moved instead of the pointer.
     pub fn refresh_pointer_focus(&mut self) {
-        let Some(pointer) = self.seat.get_pointer() else { return };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
         let location = pointer.current_location();
         let under = self.surface_under(location);
         pointer.motion(
@@ -286,6 +306,17 @@ impl Wirbel {
             },
         );
         pointer.frame(self);
+    }
+
+    /// Like `refresh_pointer_focus`, but stays silent if the pointer is still on the same surface.
+    pub fn update_pointer_focus(&mut self) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let under = self.surface_under(pointer.current_location());
+        if under.map(|(surface, _)| surface) != pointer.current_focus() {
+            self.refresh_pointer_focus();
+        }
     }
 
     pub fn time(&self) -> Duration {

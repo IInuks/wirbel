@@ -23,6 +23,31 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
 Minimal heißt: keine Animationen, kein Blur, keine Fensterdeko außer Rahmen und Lücke, keine
 Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser Datei.
 
+## Aufbau
+- `src/layout/`: Dwindle-Baum und Geometrie, frei von Compositor-Typen. Die Split-Achse wird nicht
+  gespeichert, sondern folgt aus der Form der Fläche.
+- `src/state.rs`: `Wirbel`, zentraler Zustand; `retile()` bringt Fenster, Rahmen und Pointer-Fokus
+  in Einklang mit dem Layout.
+- `src/handlers/`: Wayland-Protokolle. Lebenslauf eines Toplevels: erster Commit kachelt, erster
+  Buffer fokussiert, Commit ohne Buffer entfernt es wieder (`toplevel_commit`).
+- `src/input.rs`: Backends rufen `on_key`, `on_pointer_motion`, `on_pointer_button`; dort speisen
+  auch Tests Eingaben ein.
+- `src/render.rs`: Szene unabhängig vom Backend (`scene_elements`), von vorn nach hinten: Cursor,
+  Fenster, Rahmen. Backends setzen `state.redraw` und zeichnen nur auf Anforderung.
+- `src/backend/`: bisher nur `winit` (nested). `wirbel -c BEFEHL` startet Clients, bis es Keybinds
+  gibt; beendet wird durch Schließen des Host-Fensters.
+- `tests/headless.rs`: Compositor ohne Backend, echter Wayland-Client über den Socket, Eingaben
+  injiziert, Pixel per Pixman geprüft. Hier gehören neue Verhaltenstests hin.
+- Smithay ist auf einen Git-Commit gepinnt (513 Commits nach 0.7.0), winit also 0.31-beta.
+
+## Hinweise für Tests im laufenden Mango
+- Fenster laufen als `strat -r arch ./target/debug/wirbel`; Host-Fenster finden über
+  `mmsg get all-clients` (Titel `wirbel`), Screenshot per `grim -g` nur auf dieses Rechteck.
+- Mango fängt Super-Kombinationen ab, Super+M beendet die Sitzung des Nutzers: im Nested-Test nie
+  senden. Fürs saubere Beenden `mmsg dispatch killclient client,ID`; SIGTERM lässt den Socket liegen.
+- `wtype` lädt eine eigene Keymap, die wirbel nicht auswertet: Tasten kommen an, aber als Evdev-Code
+  1, 2, 3, ... (ESC, 1, 2, ...).
+
 ## Etappen
 1. Grundgerüst: Crate, Smithay, verschachteltes Winit-Backend, xdg-shell, Rendering, Tastatur/Maus,
    Dwindle-Baum mit Unit-Tests, kitty läuft nested.
