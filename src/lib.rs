@@ -1,6 +1,7 @@
 //! wirbel: a minimal Wayland compositor with a dwindle layout.
 
 pub mod backend;
+pub mod config;
 mod handlers;
 pub mod input;
 pub mod layout;
