@@ -4,7 +4,8 @@ use std::{cell::RefCell, rc::Rc};
 
 use smithay::{
     backend::{
-        renderer::{damage::OutputDamageTracker, gles::GlesRenderer},
+        egl::EGLDevice,
+        renderer::{ImportDma, damage::OutputDamageTracker, gles::GlesRenderer},
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     input::pointer::CursorImageStatus,
@@ -35,7 +36,8 @@ pub fn init(
     let attributes = WindowAttributes::default()
         .with_title("wirbel")
         .with_surface_size(LogicalSize::new(1280.0, 800.0));
-    let (backend, winit) = winit::init_from_attributes::<GlesRenderer>(attributes)?;
+    let (mut backend, winit) = winit::init_from_attributes::<GlesRenderer>(attributes)?;
+    offer_dmabufs(&mut backend, state);
 
     let mode = Mode {
         size: backend.window_size(),
@@ -73,6 +75,17 @@ pub fn init(
         let nested = nested.clone();
         Box::new(move || nested.borrow().backend.window().request_redraw())
     };
+    state.import_dmabuf = {
+        let nested = nested.clone();
+        Box::new(move |dmabuf| {
+            let mut nested = nested.borrow_mut();
+            let result = nested.backend.renderer().import_dmabuf(dmabuf, None);
+            if let Err(err) = &result {
+                tracing::warn!(%err, "failed to import a dmabuf");
+            }
+            result.is_ok()
+        })
+    };
 
     event_loop
         .handle()
@@ -98,6 +111,26 @@ pub fn init(
         })?;
 
     Ok(())
+}
+
+/// Lets clients render on the GPU of the host window, if we can tell which one it is.
+fn offer_dmabufs(backend: &mut WinitGraphicsBackend<GlesRenderer>, state: &mut Wirbel) {
+    let device = EGLDevice::device_for_display(backend.renderer().egl_context().display())
+        .and_then(|device| device.try_get_render_node());
+    let node = match device {
+        Ok(Some(node)) => node,
+        Ok(None) => {
+            tracing::warn!("the EGL device has no DRM node, not offering dmabufs");
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(%err, "failed to find the EGL device, not offering dmabufs");
+            return;
+        }
+    };
+    tracing::info!(%node, "offering dmabufs");
+    let formats = backend.renderer().dmabuf_formats();
+    state.offer_dmabufs(node.dev_id(), formats);
 }
 
 impl Nested {

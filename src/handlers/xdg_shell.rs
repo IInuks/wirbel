@@ -1,12 +1,15 @@
 use smithay::{
     backend::renderer::utils::with_renderer_surface_state,
-    desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords},
-    input::Seat,
+    desktop::{
+        PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
+        find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
+    },
+    input::{Seat, pointer::Focus},
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::protocol::{wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
-    utils::Serial,
+    utils::{Logical, Point, Rectangle, Serial},
     wayland::shell::xdg::{
         PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     },
@@ -94,7 +97,12 @@ impl XdgShellHandler for Wirbel {
         surface.send_repositioned(token);
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        let Some(seat) = Seat::from_resource(&seat) else {
+            return;
+        };
+        self.start_popup_grab(&surface, &seat, serial);
+    }
 }
 
 impl Wirbel {
@@ -173,34 +181,100 @@ impl Wirbel {
         self.popups.commit(surface);
         if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
             && !popup.is_initial_configure_sent()
-            && let Err(err) = popup.send_configure()
         {
-            tracing::warn!(?err, "failed to configure popup");
+            // Windows get this from the space, layer surfaces only when arranged.
+            if let Some(output) = self.output_of_surface(surface) {
+                output.enter(surface);
+            }
+            if let Err(err) = popup.send_configure() {
+                tracing::warn!(?err, "failed to configure popup");
+            }
         }
     }
 
-    /// Keeps a popup inside the output.
-    fn unconstrain_popup(&self, popup: &PopupSurface) {
+    /// Grabs the keyboard and the pointer for a popup. The popup is withdrawn if that is not
+    /// possible: its parent is out of sight, the session is locked, or the seat is busy.
+    fn start_popup_grab(&mut self, surface: &PopupSurface, seat: &Seat<Self>, serial: Serial) {
+        let kind = PopupKind::Xdg(surface.clone());
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            surface.send_popup_done();
+            return;
+        };
+        let shown = self.find_layer(&root).is_some()
+            || self
+                .find_window(&root)
+                .is_some_and(|window| self.space.element_location(&window).is_some());
+        if self.lock.is_active() || !shown {
+            surface.send_popup_done();
+            return;
+        }
+        let Ok(mut grab) = self.popups.grab_popup(root.clone(), kind, seat, serial) else {
+            surface.send_popup_done();
+            return;
+        };
+
+        let previous = grab.previous_serial().unwrap_or_else(|| grab.serial());
+        let keyboard = seat.get_keyboard();
+        let pointer = seat.get_pointer();
+        let busy = keyboard.as_ref().is_some_and(|keyboard| {
+            keyboard.is_grabbed() && !keyboard.has_grab(serial) && !keyboard.has_grab(previous)
+        }) || pointer.as_ref().is_some_and(|pointer| {
+            pointer.is_grabbed() && !pointer.has_grab(serial) && !pointer.has_grab(previous)
+        });
+        if busy {
+            grab.ungrab(PopupUngrabStrategy::All);
+            return;
+        }
+        if let Some(keyboard) = keyboard {
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = pointer {
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
+        self.popup_grab = Some((grab, root));
+    }
+
+    /// Keeps a popup inside the area it may use: what panels leave free for a window that does not
+    /// cover them, the whole output for a panel.
+    pub(super) fn unconstrain_popup(&self, popup: &PopupSurface) {
         let kind = PopupKind::Xdg(popup.clone());
         let Ok(root) = find_popup_root_surface(&kind) else {
             return;
         };
-        let Some(window) = self.find_window(&root) else {
-            return;
+        let target = if let Some(window) = self.find_window(&root) {
+            self.window_popup_area(&window)
+        } else if let Some((layer, output)) = self.find_layer(&root) {
+            let map = layer_map_for_output(&output);
+            let area = self.space.output_geometry(&output);
+            area.zip(map.layer_geometry(&layer))
+                .map(|(area, geometry)| (area, area.loc + geometry.loc))
+        } else {
+            None
         };
-        let output_geometry = self
-            .locate(&window)
-            .and_then(|(monitor, _)| self.space.output_geometry(&self.monitors[monitor].output));
-        let (Some(mut target), Some(window_location)) =
-            (output_geometry, self.space.element_location(&window))
-        else {
+        let Some((mut target, parent_location)) = target else {
             return;
         };
 
         target.loc -= get_popup_toplevel_coords(&kind);
-        target.loc -= window_location;
+        target.loc -= parent_location;
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
+    }
+
+    /// The area popups of `window` may use, and where the window is.
+    fn window_popup_area(
+        &self,
+        window: &Window,
+    ) -> Option<(Rectangle<i32, Logical>, Point<i32, Logical>)> {
+        let (monitor, _) = self.locate(window)?;
+        let area = if self.full_kind(window) == Some(FullKind::Fullscreen) {
+            self.monitor_area(monitor)?
+        } else {
+            self.work_area(monitor)?
+        };
+        let area = Rectangle::new((area.x, area.y).into(), (area.w, area.h).into());
+        Some((area, self.space.element_location(window)?))
     }
 }

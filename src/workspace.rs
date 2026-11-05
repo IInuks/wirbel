@@ -184,13 +184,14 @@ impl Workspace {
         }
     }
 
-    /// The visible windows in `area`, bottom to top.
-    pub fn frames(&self, area: Rect, config: &Config) -> Vec<Frame> {
+    /// The visible windows on an output of the size `area`, bottom to top. Fullscreen covers all
+    /// of it, everything else stays inside `work`, what panels leave free.
+    pub fn frames(&self, area: Rect, work: Rect, config: &Config) -> Vec<Frame> {
         let border = config.border_width;
         if let Some((window, kind)) = &self.full {
             let outer = match kind {
                 FullKind::Fullscreen => area,
-                FullKind::Maximized => area.shrink(config.gaps.outer),
+                FullKind::Maximized => work.shrink(config.gaps.outer),
             };
             let has_border = *kind == FullKind::Maximized;
             let inner = if has_border {
@@ -211,7 +212,7 @@ impl Workspace {
             }];
         }
 
-        let tiles = self.tiled.arrange(area, config.gaps);
+        let tiles = self.tiled.arrange(work, config.gaps);
         let tiles = tiles.into_iter().map(|(window, outer)| {
             let inner = outer.shrink(border);
             Frame {
@@ -251,6 +252,8 @@ pub struct Monitor {
     pub workspaces: Vec<Workspace>,
     /// Index into `workspaces`.
     pub active: usize,
+    /// What `work_area` said at the last `retile`.
+    pub work_area: Option<Rect>,
 }
 
 impl Monitor {
@@ -260,6 +263,7 @@ impl Monitor {
             connected: true,
             workspaces: (0..WORKSPACES).map(|_| Workspace::default()).collect(),
             active: 0,
+            work_area: None,
         }
     }
 

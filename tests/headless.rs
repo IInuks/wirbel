@@ -35,11 +35,17 @@ use smithay::{
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop,
+    event_created_child,
     globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
         wl_buffer::WlBuffer,
         wl_compositor::WlCompositor,
+        wl_data_device::{self, WlDataDevice},
+        wl_data_device_manager::WlDataDeviceManager,
+        wl_data_offer::WlDataOffer,
+        wl_data_source::{self, WlDataSource},
         wl_keyboard::{self, WlKeyboard},
+        wl_output::{self, WlOutput},
         wl_pointer::{self, WlPointer},
         wl_registry::WlRegistry,
         wl_seat::WlSeat,
@@ -48,12 +54,57 @@ use wayland_client::{
         wl_surface::WlSurface,
     },
 };
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1::{self, ExtIdleNotificationV1},
+    ext_idle_notifier_v1::ExtIdleNotifierV1,
+};
+use wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_manager_v1::ExtSessionLockManagerV1,
+    ext_session_lock_surface_v1::{self, ExtSessionLockSurfaceV1},
+    ext_session_lock_v1::{self, ExtSessionLockV1},
+};
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
+    wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+};
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+    zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+};
+use wayland_protocols::wp::primary_selection::zv1::client::{
+    zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+    zwp_primary_selection_device_v1::{self, ZwpPrimarySelectionDeviceV1},
+    zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
+    zwp_primary_selection_source_v1::{self, ZwpPrimarySelectionSourceV1},
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+    zxdg_toplevel_decoration_v1::{self, ZxdgToplevelDecorationV1},
+};
 use wayland_protocols::xdg::shell::client::{
     xdg_popup::{self, XdgPopup},
     xdg_positioner::{self, XdgPositioner},
     xdg_surface::{self, XdgSurface},
     xdg_toplevel::{self, XdgToplevel},
     xdg_wm_base::{self, XdgWmBase},
+};
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1,
+    zxdg_output_v1::{self, ZxdgOutputV1},
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
+    zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
 };
 use wirbel::{
     Wirbel, config::Config, input::Scroll, ipc::Position, layout::Rect, workspace::Placement,
@@ -218,6 +269,16 @@ impl Compositor {
         self.screenshot_of(0)
     }
 
+    /// What the backend does after it presented a frame on every output.
+    fn present(&self) {
+        self.with(|state| {
+            let outputs = state.monitors.iter().map(|monitor| monitor.output.clone());
+            for output in outputs.collect::<Vec<_>>() {
+                state.send_frame_callbacks(&output);
+            }
+        });
+    }
+
     /// Renders an output with pixman into XRGB pixels.
     fn screenshot_of(&self, monitor: usize) -> Screenshot {
         let pixels = self.with(move |state| {
@@ -329,6 +390,62 @@ struct ClientState {
     closed: Vec<usize>,
     /// Rate and delay of the keyboard.
     repeat: Option<(i32, i32)>,
+    /// Surfaces that are no windows. In input events they count from `OTHER_SURFACES` on.
+    others: Vec<WlSurface>,
+    layers: Vec<LayerState>,
+    popups_done: u32,
+    lock_events: Vec<LockEvent>,
+    /// Size of the latest configure of a lock surface.
+    lock_size: Option<(u32, u32)>,
+    decoration_modes: Vec<zxdg_toplevel_decoration_v1::Mode>,
+    offers: Vec<WlDataOffer>,
+    selection: Option<WlDataOffer>,
+    primary_offers: Vec<ZwpPrimarySelectionOfferV1>,
+    primary: Option<ZwpPrimarySelectionOfferV1>,
+    dnd: Vec<DndEvent>,
+    source_events: Vec<SourceEvent>,
+    preferred_scale: Option<u32>,
+    idle: Vec<bool>,
+    dmabuf: Option<Result<(), ()>>,
+    logical_size: Option<(i32, i32)>,
+    /// Serial of the latest key event, for the clipboard.
+    key_serial: u32,
+    /// Serial of the latest pointer enter, for setting the cursor.
+    enter_serial: u32,
+}
+
+/// First index of surfaces in `Input` events that are no windows.
+const OTHER_SURFACES: usize = 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LockEvent {
+    Locked,
+    Finished,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum DndEvent {
+    Enter(f64, f64),
+    Motion(f64, f64),
+    Leave,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SourceEvent {
+    Target,
+    Dropped,
+    Finished,
+    Cancelled,
+}
+
+struct LayerState {
+    surface: WlSurface,
+    layer: ZwlrLayerSurfaceV1,
+    size: (u32, u32),
+    configures: u32,
+    closed: bool,
+    buffer: Option<WlBuffer>,
 }
 
 struct WindowState {
@@ -348,12 +465,19 @@ impl ClientState {
         self.find_window(surface).unwrap()
     }
 
+    fn other_index(&self, surface: &WlSurface) -> Option<usize> {
+        let others = self.others.iter();
+        let index = others.into_iter().position(|other| other == surface)?;
+        Some(OTHER_SURFACES + index)
+    }
+
     /// `None` if the client already destroyed the surface. A leave for such a surface crosses
     /// paths with the destroy request and is not an error.
     fn find_window(&self, surface: &WlSurface) -> Option<usize> {
         self.windows
             .iter()
             .position(|window| window.surface == *surface)
+            .or_else(|| self.other_index(surface))
     }
 }
 
@@ -522,6 +646,196 @@ impl Client {
         (surface, popup)
     }
 
+    /// Remembers `surface` for input events and returns its index there.
+    fn track(&mut self, surface: &WlSurface) -> usize {
+        self.state.others.push(surface.clone());
+        OTHER_SURFACES + self.state.others.len() - 1
+    }
+
+    fn bind<I: Proxy + 'static>(&self, versions: std::ops::RangeInclusive<u32>) -> I
+    where
+        ClientState: Dispatch<I, ()>,
+    {
+        self.globals.bind(&self.handle, versions, ()).unwrap()
+    }
+
+    /// Creates a layer surface and walks it through the initial configure. `setup` runs before
+    /// the first commit.
+    fn open_unmapped_layer(
+        &mut self,
+        level: zwlr_layer_shell_v1::Layer,
+        setup: impl FnOnce(&ZwlrLayerSurfaceV1),
+    ) -> usize {
+        let shell: ZwlrLayerShellV1 = self.bind(1..=5);
+        let surface = self.compositor.create_surface(&self.handle, ());
+        let layer = shell.get_layer_surface(&surface, None, level, "test".into(), &self.handle, ());
+        setup(&layer);
+        surface.commit();
+        self.state.others.push(surface.clone());
+        self.state.layers.push(LayerState {
+            surface,
+            layer,
+            size: (0, 0),
+            configures: 0,
+            closed: false,
+            buffer: None,
+        });
+        self.sync();
+        let index = self.state.layers.len() - 1;
+        assert_eq!(
+            self.state.layers[index].configures, 1,
+            "no initial configure"
+        );
+        index
+    }
+
+    fn open_layer(
+        &mut self,
+        level: zwlr_layer_shell_v1::Layer,
+        color: u32,
+        setup: impl FnOnce(&ZwlrLayerSurfaceV1),
+    ) -> usize {
+        let index = self.open_unmapped_layer(level, setup);
+        self.draw_layer(index, color);
+        index
+    }
+
+    /// A bar of the given height along the top of the output.
+    fn open_bar(&mut self, height: u32, color: u32) -> usize {
+        self.open_layer(zwlr_layer_shell_v1::Layer::Top, color, |layer| {
+            layer.set_size(0, height);
+            layer.set_anchor(top_bar_anchor());
+            layer.set_exclusive_zone(height as i32);
+        })
+    }
+
+    fn draw_layer(&mut self, index: usize, color: u32) {
+        let layer = &self.state.layers[index];
+        let surface = layer.surface.clone();
+        let (w, h) = (layer.size.0 as i32, layer.size.1 as i32);
+        let buffer = self.fill(&surface, w, h, color);
+        self.state.layers[index].buffer = Some(buffer);
+    }
+
+    fn close_layer(&mut self, index: usize) {
+        let layer = &self.state.layers[index];
+        layer.layer.destroy();
+        layer.surface.destroy();
+        self.sync();
+    }
+
+    /// Input index of the surface of a layer surface.
+    fn layer_input(&self, index: usize) -> usize {
+        self.state
+            .other_index(&self.state.layers[index].surface)
+            .unwrap()
+    }
+
+    /// A positioner for a popup of the given size at `(x, y)` of its parent.
+    fn positioner(&self, (x, y): (i32, i32), (w, h): (i32, i32)) -> XdgPositioner {
+        let positioner = self.wm_base.create_positioner(&self.handle, ());
+        positioner.set_size(w, h);
+        positioner.set_anchor_rect(x, y, 1, 1);
+        positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
+        positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+        positioner
+    }
+
+    /// Opens and draws a popup of `parent`, grabbing with `grab` if given.
+    fn open_popup(
+        &mut self,
+        parent: &XdgSurface,
+        at: (i32, i32),
+        size: (i32, i32),
+        color: u32,
+        grab: Option<u32>,
+    ) -> TestPopup {
+        let positioner = self.positioner(at, size);
+        let surface = self.compositor.create_surface(&self.handle, ());
+        let xdg_surface = self.wm_base.get_xdg_surface(&surface, &self.handle, ());
+        let popup = xdg_surface.get_popup(Some(parent), &positioner, &self.handle, ());
+        self.finish_popup(surface, xdg_surface, popup, size, color, grab)
+    }
+
+    fn finish_popup(
+        &mut self,
+        surface: WlSurface,
+        xdg_surface: XdgSurface,
+        popup: XdgPopup,
+        size: (i32, i32),
+        color: u32,
+        grab: Option<u32>,
+    ) -> TestPopup {
+        if let Some(serial) = grab {
+            popup.grab(&self.seat(), serial);
+        }
+        let input = self.track(&surface);
+        surface.commit();
+        self.sync();
+        let buffer = self.fill(&surface, size.0, size.1, color);
+        TestPopup {
+            surface,
+            xdg_surface,
+            popup,
+            input,
+            _buffer: buffer,
+        }
+    }
+
+    /// Opens and draws a popup of a layer surface.
+    fn open_layer_popup(
+        &mut self,
+        index: usize,
+        at: (i32, i32),
+        size: (i32, i32),
+        color: u32,
+        grab: Option<u32>,
+    ) -> TestPopup {
+        let positioner = self.positioner(at, size);
+        let surface = self.compositor.create_surface(&self.handle, ());
+        let xdg_surface = self.wm_base.get_xdg_surface(&surface, &self.handle, ());
+        let popup = xdg_surface.get_popup(None, &positioner, &self.handle, ());
+        self.state.layers[index].layer.get_popup(&popup);
+        self.finish_popup(surface, xdg_surface, popup, size, color, grab)
+    }
+
+    fn xdg_surface(&self, index: usize) -> XdgSurface {
+        self.state.windows[index].xdg_surface.clone()
+    }
+
+    /// Asks for the session lock and returns the lock object.
+    fn lock(&mut self) -> ExtSessionLockV1 {
+        let manager: ExtSessionLockManagerV1 = self.bind(1..=1);
+        let lock = manager.lock(&self.handle, ());
+        self.sync();
+        lock
+    }
+
+    /// Creates a lock surface on the first output of this client and draws it. Returns its
+    /// index in input events.
+    fn lock_surface(
+        &mut self,
+        lock: &ExtSessionLockV1,
+        output: &WlOutput,
+        color: u32,
+    ) -> LockedSurface {
+        let surface = self.compositor.create_surface(&self.handle, ());
+        let input = self.track(&surface);
+        let lock_surface = lock.get_lock_surface(&surface, output, &self.handle, ());
+        self.sync();
+        let (w, h) = self
+            .state
+            .lock_size
+            .expect("no configure for the lock surface");
+        let buffer = self.fill(&surface, w as i32, h as i32, color);
+        LockedSurface {
+            surface,
+            lock_surface,
+            input,
+            _buffer: buffer,
+        }
+    }
+
     fn close(&mut self, index: usize) {
         let window = &self.state.windows[index];
         window.toplevel.destroy();
@@ -639,6 +953,299 @@ impl Dispatch<XdgToplevel, ()> for ClientState {
     }
 }
 
+struct TestPopup {
+    surface: WlSurface,
+    xdg_surface: XdgSurface,
+    popup: XdgPopup,
+    input: usize,
+    _buffer: WlBuffer,
+}
+
+impl TestPopup {
+    fn destroy(&self) {
+        self.popup.destroy();
+        self.xdg_surface.destroy();
+        self.surface.destroy();
+    }
+}
+
+struct LockedSurface {
+    surface: WlSurface,
+    lock_surface: ExtSessionLockSurfaceV1,
+    input: usize,
+    _buffer: WlBuffer,
+}
+
+fn top_bar_anchor() -> zwlr_layer_surface_v1::Anchor {
+    use zwlr_layer_surface_v1::Anchor;
+    Anchor::Top | Anchor::Left | Anchor::Right
+}
+
+impl Dispatch<ZwlrLayerSurfaceV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        layer: &ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let entry = state.layers.iter_mut().find(|entry| entry.layer == *layer);
+        let Some(entry) = entry else {
+            return;
+        };
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                layer.ack_configure(serial);
+                entry.size = (width, height);
+                entry.configures += 1;
+            }
+            zwlr_layer_surface_v1::Event::Closed => entry.closed = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtSessionLockV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ExtSessionLockV1,
+        event: ext_session_lock_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_session_lock_v1::Event::Locked => state.lock_events.push(LockEvent::Locked),
+            ext_session_lock_v1::Event::Finished => state.lock_events.push(LockEvent::Finished),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtSessionLockSurfaceV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        surface: &ExtSessionLockSurfaceV1,
+        event: ext_session_lock_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let ext_session_lock_surface_v1::Event::Configure {
+            serial,
+            width,
+            height,
+        } = event
+        {
+            surface.ack_configure(serial);
+            state.lock_size = Some((width, height));
+        }
+    }
+}
+
+impl Dispatch<ZxdgToplevelDecorationV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgToplevelDecorationV1,
+        event: zxdg_toplevel_decoration_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_toplevel_decoration_v1::Event::Configure {
+            mode: WEnum::Value(mode),
+        } = event
+        {
+            state.decoration_modes.push(mode);
+        }
+    }
+}
+
+impl Dispatch<WlDataDevice, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &WlDataDevice,
+        event: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_device::Event::DataOffer { id } => state.offers.push(id),
+            wl_data_device::Event::Selection { id } => state.selection = id,
+            wl_data_device::Event::Enter {
+                x, y, id, serial, ..
+            } => {
+                if let Some(offer) = id {
+                    offer.accept(serial, Some("text/plain".into()));
+                    offer.set_actions(
+                        wayland_client::protocol::wl_data_device_manager::DndAction::Copy,
+                        wayland_client::protocol::wl_data_device_manager::DndAction::Copy,
+                    );
+                    state.selection = Some(offer);
+                }
+                state.dnd.push(DndEvent::Enter(x, y));
+            }
+            wl_data_device::Event::Motion { x, y, .. } => state.dnd.push(DndEvent::Motion(x, y)),
+            wl_data_device::Event::Leave => state.dnd.push(DndEvent::Leave),
+            wl_data_device::Event::Drop => state.dnd.push(DndEvent::Drop),
+            _ => {}
+        }
+    }
+
+    event_created_child!(ClientState, WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
+    ]);
+}
+
+impl Dispatch<ZwpPrimarySelectionDeviceV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwpPrimarySelectionDeviceV1,
+        event: zwp_primary_selection_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_primary_selection_device_v1::Event::DataOffer { offer } => {
+                state.primary_offers.push(offer);
+            }
+            zwp_primary_selection_device_v1::Event::Selection { id } => state.primary = id,
+            _ => {}
+        }
+    }
+
+    event_created_child!(ClientState, ZwpPrimarySelectionDeviceV1, [
+        zwp_primary_selection_device_v1::EVT_DATA_OFFER_OPCODE => (ZwpPrimarySelectionOfferV1, ()),
+    ]);
+}
+
+/// Answers every request for data with `CLIPBOARD_TEXT`.
+impl Dispatch<WlDataSource, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_source::Event::Send { fd, .. } => {
+                fs::File::from(fd).write_all(CLIPBOARD_TEXT).unwrap();
+            }
+            wl_data_source::Event::Target { .. } => state.source_events.push(SourceEvent::Target),
+            wl_data_source::Event::DndDropPerformed => {
+                state.source_events.push(SourceEvent::Dropped);
+            }
+            wl_data_source::Event::DndFinished => state.source_events.push(SourceEvent::Finished),
+            wl_data_source::Event::Cancelled => state.source_events.push(SourceEvent::Cancelled),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpPrimarySelectionSourceV1, ()> for ClientState {
+    fn event(
+        _: &mut Self,
+        _: &ZwpPrimarySelectionSourceV1,
+        event: zwp_primary_selection_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_primary_selection_source_v1::Event::Send { fd, .. } = event {
+            fs::File::from(fd).write_all(CLIPBOARD_TEXT).unwrap();
+        }
+    }
+}
+
+impl Dispatch<WpFractionalScaleV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            state.preferred_scale = Some(scale);
+        }
+    }
+}
+
+impl Dispatch<ExtIdleNotificationV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => state.idle.push(true),
+            ext_idle_notification_v1::Event::Resumed => state.idle.push(false),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpLinuxBufferParamsV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwpLinuxBufferParamsV1,
+        event: zwp_linux_buffer_params_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_linux_buffer_params_v1::Event::Created { .. } => state.dmabuf = Some(Ok(())),
+            zwp_linux_buffer_params_v1::Event::Failed => state.dmabuf = Some(Err(())),
+            _ => {}
+        }
+    }
+
+    event_created_child!(ClientState, ZwpLinuxBufferParamsV1, [
+        zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => (WlBuffer, ()),
+    ]);
+}
+
+impl Dispatch<WlOutput, ()> for ClientState {
+    fn event(
+        _: &mut Self,
+        _: &WlOutput,
+        _: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZxdgOutputV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_output_v1::Event::LogicalSize { width, height } = event {
+            state.logical_size = Some((width, height));
+        }
+    }
+}
+
 impl Dispatch<WlKeyboard, ()> for ClientState {
     fn event(
         state: &mut Self,
@@ -658,9 +1265,13 @@ impl Dispatch<WlKeyboard, ()> for ClientState {
             },
             wl_keyboard::Event::Key {
                 key,
+                serial,
                 state: WEnum::Value(key_state),
                 ..
-            } => Input::Key(key, key_state),
+            } => {
+                state.key_serial = serial;
+                Input::Key(key, key_state)
+            }
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
                 state.repeat = Some((rate, delay));
                 return;
@@ -683,10 +1294,13 @@ impl Dispatch<WlPointer, ()> for ClientState {
         let input = match event {
             wl_pointer::Event::Enter {
                 surface,
+                serial,
                 surface_x,
                 surface_y,
-                ..
-            } => Input::PointerEnter(state.window_index(&surface), surface_x, surface_y),
+            } => {
+                state.enter_serial = serial;
+                Input::PointerEnter(state.window_index(&surface), surface_x, surface_y)
+            }
             wl_pointer::Event::Leave { surface, .. } => match state.find_window(&surface) {
                 Some(index) => Input::PointerLeave(index),
                 None => return,
@@ -736,8 +1350,10 @@ impl Dispatch<XdgPopup, ()> for ClientState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let xdg_popup::Event::Configure { x, y, .. } = event {
-            state.popup_position = Some((x, y));
+        match event {
+            xdg_popup::Event::Configure { x, y, .. } => state.popup_position = Some((x, y)),
+            xdg_popup::Event::PopupDone => state.popups_done += 1,
+            _ => {}
         }
     }
 }
@@ -749,6 +1365,23 @@ delegate_noop!(ClientState: ignore WlShm);
 delegate_noop!(ClientState: ignore WlShmPool);
 delegate_noop!(ClientState: ignore WlBuffer);
 delegate_noop!(ClientState: ignore WlSeat);
+delegate_noop!(ClientState: ignore ZwlrLayerShellV1);
+delegate_noop!(ClientState: ignore ExtSessionLockManagerV1);
+delegate_noop!(ClientState: ignore ZxdgDecorationManagerV1);
+delegate_noop!(ClientState: ignore WlDataDeviceManager);
+delegate_noop!(ClientState: ignore WlDataOffer);
+delegate_noop!(ClientState: ignore ZwpPrimarySelectionDeviceManagerV1);
+delegate_noop!(ClientState: ignore ZwpPrimarySelectionOfferV1);
+delegate_noop!(ClientState: ignore WpCursorShapeManagerV1);
+delegate_noop!(ClientState: ignore WpCursorShapeDeviceV1);
+delegate_noop!(ClientState: ignore WpViewporter);
+delegate_noop!(ClientState: ignore WpViewport);
+delegate_noop!(ClientState: ignore WpFractionalScaleManagerV1);
+delegate_noop!(ClientState: ignore ZwpIdleInhibitManagerV1);
+delegate_noop!(ClientState: ignore ZwpIdleInhibitorV1);
+delegate_noop!(ClientState: ignore ExtIdleNotifierV1);
+delegate_noop!(ClientState: ignore ZwpLinuxDmabufV1);
+delegate_noop!(ClientState: ignore ZxdgOutputManagerV1);
 
 // Output 1000x600, outer gap 10, inner gap 5, border 4. One window fills the output minus gap and
 // border. Two windows share 975 pixels of width: tiles of 488 and 487 pixels.
@@ -962,7 +1595,7 @@ fn output_resize_retiles() {
             refresh: 60_000,
         };
         output.change_current_state(Some(mode), None, None, None);
-        state.retile();
+        state.output_resized(&output);
     });
     client.sync();
     assert_eq!(client.size(a), (572, 372));
@@ -3147,4 +3780,1589 @@ fn a_spawned_client_finds_the_compositor_it_runs_in() {
     }
     assert_eq!(fs::read_to_string(&path).unwrap(), "21.0 22.0 test\n");
     fs::remove_file(path).unwrap();
+}
+
+// Colours of test surfaces.
+const BAR: u32 = 0x0012_3456;
+const POPUP: u32 = 0x00ab_cdef;
+const LOCK: u32 = 0x0065_4321;
+const CLIPBOARD_TEXT: &[u8] = b"from the other client";
+
+use zwlr_layer_shell_v1::Layer as Level;
+
+fn default_config() -> Config {
+    Config::default()
+}
+
+#[test]
+fn an_exclusive_zone_makes_room_and_gives_it_back() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let bar = client.open_bar(30, BAR);
+    client.sync();
+
+    assert_eq!(client.state.layers[bar].size, (1000, 30));
+    // 10 gap and 4 border below the bar, 14 at the bottom.
+    assert_eq!(compositor.frames(), [Rect::new(14, 44, 972, 542)]);
+    client.sync();
+    assert_eq!(client.size(a), (972, 542));
+
+    client.close_layer(bar);
+    assert_eq!(compositor.frames(), [Rect::new(14, 14, 972, 572)]);
+    client.sync();
+    assert_eq!(client.size(a), FULL);
+}
+
+#[test]
+fn exclusive_zones_of_all_edges_add_up_with_margins() {
+    use zwlr_layer_surface_v1::Anchor;
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.open_layer(Level::Top, BAR, |layer| {
+        layer.set_size(20, 0);
+        layer.set_anchor(Anchor::Left | Anchor::Top | Anchor::Bottom);
+        layer.set_exclusive_zone(20);
+        layer.set_margin(0, 0, 0, 5);
+    });
+    client.open_layer(Level::Bottom, BAR, |layer| {
+        layer.set_size(0, 40);
+        layer.set_anchor(Anchor::Left | Anchor::Right | Anchor::Bottom);
+        layer.set_exclusive_zone(40);
+    });
+    assert_eq!(
+        compositor.with(|state| state.work_area(0)),
+        Some(Rect::new(25, 0, 975, 560))
+    );
+    assert_eq!(compositor.frames(), [Rect::new(39, 14, 947, 532)]);
+}
+
+#[test]
+fn a_zone_larger_than_the_output_leaves_the_windows_alone() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.open_layer(Level::Top, BAR, |layer| {
+        layer.set_size(0, 30);
+        layer.set_anchor(top_bar_anchor());
+        layer.set_exclusive_zone(5000);
+    });
+    assert_eq!(compositor.frames(), [Rect::new(14, 14, 972, 572)]);
+}
+
+#[test]
+fn a_surface_with_exclusive_zone_minus_one_stretches_under_a_bar() {
+    use zwlr_layer_surface_v1::Anchor;
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_bar(30, BAR);
+    let wallpaper = client.open_layer(Level::Background, GREEN, |layer| {
+        layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+        layer.set_exclusive_zone(-1);
+    });
+    assert_eq!(client.state.layers[wallpaper].size, (1000, 600));
+    assert_eq!(compositor.screenshot().at(500, 5), BAR);
+    assert_eq!(compositor.screenshot().at(500, 300), GREEN);
+}
+
+#[test]
+fn layers_stack_around_the_windows() {
+    use zwlr_layer_surface_v1::Anchor;
+    let full = Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right;
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.open_layer(Level::Background, GREEN, |layer| layer.set_anchor(full));
+    // In the gap only something below the windows is seen.
+    assert_eq!(compositor.screenshot().at(3, 3), GREEN);
+    assert_eq!(compositor.screenshot().at(500, 300), RED);
+
+    client.open_layer(Level::Bottom, BLUE, |layer| {
+        layer.set_size(1000, 100);
+        layer.set_anchor(Anchor::Top);
+    });
+    let shot = compositor.screenshot();
+    assert_eq!(shot.at(3, 3), BLUE);
+    assert_eq!(shot.at(500, 50), RED);
+
+    client.open_layer(Level::Top, BAR, |layer| {
+        layer.set_size(100, 100);
+        layer.set_anchor(Anchor::Top);
+    });
+    client.open_layer(Level::Overlay, POPUP, |layer| {
+        layer.set_size(50, 50);
+        layer.set_anchor(Anchor::Top);
+    });
+    let shot = compositor.screenshot();
+    assert_eq!(shot.at(500, 75), BAR);
+    assert_eq!(shot.at(500, 25), POPUP);
+}
+
+#[test]
+fn fullscreen_covers_the_top_layer_but_not_the_overlay() {
+    use zwlr_layer_surface_v1::Anchor;
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let bar = client.open_bar(30, BAR);
+    client.open_layer(Level::Overlay, POPUP, |layer| {
+        layer.set_size(50, 50);
+        layer.set_anchor(Anchor::Bottom);
+    });
+    client.sync();
+    client.draw(a, RED);
+
+    client.toplevel(a).set_fullscreen(None);
+    client.sync();
+    assert_eq!(client.size(a), (WIDTH, HEIGHT));
+    client.draw(a, RED);
+    let shot = compositor.screenshot();
+    assert_eq!(shot.at(500, 5), RED, "the bar shows through");
+    assert_eq!(shot.at(500, 575), POPUP, "the overlay is gone");
+
+    compositor.pointer_at(500.0, 300.0);
+    client.take_input();
+    compositor.pointer_at(500.0, 5.0);
+    assert_eq!(
+        client.take_input().last(),
+        Some(&Input::PointerMotion(500.0, 5.0))
+    );
+
+    client.toplevel(a).unset_fullscreen();
+    client.sync();
+    assert_eq!(compositor.screenshot().at(500, 5), BAR);
+    let input = client.layer_input(bar);
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::PointerEnter(input, 500.0, 5.0))
+    );
+}
+
+#[test]
+fn maximize_stays_inside_the_work_area() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    client.open_bar(30, BAR);
+    client.toplevel(a).set_maximized();
+    client.sync();
+    assert_eq!(compositor.frames(), [Rect::new(14, 44, 972, 542)]);
+}
+
+#[test]
+fn new_floating_windows_open_in_the_middle_of_the_work_area() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_bar(100, BAR);
+    client.open_sized_window((200, 100), RED, |toplevel| {
+        toplevel.set_min_size(200, 100);
+        toplevel.set_max_size(200, 100);
+    });
+    assert_eq!(compositor.frames(), [Rect::new(400, 300, 200, 100)]);
+}
+
+#[test]
+fn the_pointer_reaches_a_panel_and_sloppy_focus_ignores_it() {
+    let compositor = Compositor::start_with("warp_cursor = 0\n");
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let bar = client.open_bar(30, BAR);
+    let input = client.layer_input(bar);
+    client.take_input();
+
+    compositor.pointer_at(500.0, 300.0);
+    client.take_input();
+    compositor.run(&["move", "400.5", "10.25"]);
+    assert_eq!(
+        client.take_input(),
+        [
+            Input::PointerLeave(a),
+            Input::PointerEnter(input, 400.5, 10.25)
+        ]
+    );
+    assert_eq!(compositor.run(&["pos", "--once"]), "400.5 10.25 test\n");
+    assert!(compositor.with(|state| state.window_at((400.0, 10.0).into()).is_none()));
+    assert!(compositor.with(|state| state.focused.is_some()));
+}
+
+#[test]
+fn a_panel_can_be_clicked_without_taking_the_focus() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let bar = client.open_bar(30, BAR);
+    client.take_input();
+
+    compositor.pointer_at(500.0, 300.0);
+    client.take_input();
+    compositor.pointer_at(500.0, 10.0);
+    compositor.click();
+    let input = client.take_input();
+    assert!(input.contains(&Input::PointerEnter(client.layer_input(bar), 500.0, 10.0)));
+    assert!(input.contains(&Input::Button(BTN_LEFT, wl_pointer::ButtonState::Pressed)));
+    assert!(!input.contains(&Input::KeyboardLeave(a)));
+    compositor.tap_key(KEY_A);
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::Key(KEY_A, wl_keyboard::KeyState::Pressed))
+    );
+    assert!(client.activated(a));
+}
+
+#[test]
+fn a_mouse_bind_does_not_apply_to_a_panel() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.open_bar(30, BAR);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.pointer_at(500.0, 10.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    assert!(compositor.with(|state| state.drag.is_none()));
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    compositor.key(KEY_LEFTMETA, KeyState::Released);
+}
+
+#[test]
+fn an_exclusive_layer_holds_the_keyboard_until_it_goes() {
+    use zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity};
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    client.take_input();
+
+    let launcher = client.open_layer(Level::Overlay, BAR, |layer| {
+        layer.set_size(100, 100);
+        layer.set_anchor(Anchor::Top);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    });
+    let input = client.layer_input(launcher);
+    assert_eq!(
+        client.take_input(),
+        [Input::KeyboardLeave(a), Input::KeyboardEnter(input)]
+    );
+
+    // Clicking a window does not take it away.
+    compositor.pointer_at(100.0, 300.0);
+    compositor.click();
+    client.take_input();
+    compositor.tap_key(KEY_A);
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::Key(KEY_A, wl_keyboard::KeyState::Pressed))
+    );
+
+    client.close_layer(launcher);
+    assert_eq!(client.take_input().last(), Some(&Input::KeyboardEnter(a)));
+}
+
+#[test]
+fn an_exclusive_layer_gets_the_keyboard_only_with_its_first_buffer() {
+    use zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity};
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    client.take_input();
+    let index = client.open_unmapped_layer(Level::Top, |layer| {
+        layer.set_size(100, 100);
+        layer.set_anchor(Anchor::Top);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    });
+    assert_eq!(client.take_input(), []);
+    client.draw_layer(index, BAR);
+    assert_eq!(client.take_input().first(), Some(&Input::KeyboardLeave(a)));
+}
+
+#[test]
+fn an_exclusive_layer_on_the_bottom_acts_on_demand() {
+    use zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity};
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    client.open_layer(Level::Bottom, BAR, |layer| {
+        layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    });
+    assert!(!client.take_input().contains(&Input::KeyboardLeave(a)));
+}
+
+#[test]
+fn an_on_demand_layer_gets_the_keyboard_by_click_and_loses_it_the_same_way() {
+    use zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity};
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let panel = client.open_layer(Level::Top, BAR, |layer| {
+        layer.set_size(100, 100);
+        layer.set_anchor(Anchor::Top);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    });
+    let input = client.layer_input(panel);
+    client.take_input();
+
+    compositor.pointer_at(500.0, 50.0);
+    compositor.click();
+    assert!(client.take_input().contains(&Input::KeyboardEnter(input)));
+
+    compositor.pointer_at(100.0, 300.0);
+    assert!(!client.take_input().contains(&Input::KeyboardLeave(input)));
+    compositor.click();
+    let events = client.take_input();
+    assert!(events.contains(&Input::KeyboardLeave(input)));
+    assert!(events.contains(&Input::KeyboardEnter(a)));
+}
+
+#[test]
+fn sloppy_focus_leaves_the_keyboard_on_an_on_demand_layer() {
+    use zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity};
+    let compositor = Compositor::start_with("warp_cursor = 0\n");
+    let mut client = Client::connect(&compositor);
+    let _a = client.open_window(RED);
+    let _b = client.open_window(GREEN);
+    let panel = client.open_layer(Level::Top, BAR, |layer| {
+        layer.set_size(100, 100);
+        layer.set_anchor(Anchor::Top);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    });
+    let input = client.layer_input(panel);
+    compositor.pointer_at(500.0, 50.0);
+    compositor.click();
+    compositor.pointer_at(100.0, 300.0);
+    assert!(!client.take_input().contains(&Input::KeyboardLeave(input)));
+}
+
+#[test]
+fn a_closing_window_leaves_the_keyboard_on_an_on_demand_layer() {
+    use zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity};
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let b = client.open_window(GREEN);
+    let panel = client.open_layer(Level::Top, BAR, |layer| {
+        layer.set_size(100, 100);
+        layer.set_anchor(Anchor::Top);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    });
+    let input = client.layer_input(panel);
+    compositor.pointer_at(500.0, 50.0);
+    compositor.click();
+    client.take_input();
+    client.close(b);
+    assert!(!client.take_input().contains(&Input::KeyboardLeave(input)));
+    client.close_layer(panel);
+    assert_eq!(client.take_input().last(), Some(&Input::KeyboardEnter(a)));
+}
+
+#[test]
+fn a_null_buffer_unmaps_a_layer_surface_until_it_starts_over() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let bar = client.open_bar(30, BAR);
+    assert_eq!(compositor.frames(), [Rect::new(14, 44, 972, 542)]);
+    assert_eq!(client.state.layers[bar].configures, 1);
+
+    let surface = client.state.layers[bar].surface.clone();
+    surface.attach(None, 0, 0);
+    surface.commit();
+    client.sync();
+    assert_eq!(compositor.frames(), [Rect::new(14, 14, 972, 572)]);
+    assert_eq!(
+        compositor.screenshot().at(500, 5),
+        rgb(default_config().background_color)
+    );
+
+    // Unmapping forgets everything, as if the surface had just been created.
+    let layer = client.state.layers[bar].layer.clone();
+    layer.set_size(0, 30);
+    layer.set_anchor(top_bar_anchor());
+    layer.set_exclusive_zone(30);
+    surface.commit();
+    client.sync();
+    assert_eq!(client.state.layers[bar].configures, 2);
+    client.draw_layer(bar, BAR);
+    assert_eq!(compositor.frames(), [Rect::new(14, 44, 972, 542)]);
+    assert_eq!(compositor.screenshot().at(500, 5), BAR);
+}
+
+#[test]
+fn a_panel_follows_its_output_and_goes_with_it() {
+    let compositor = Compositor::start();
+    let second = compositor.add_output("second", (1000, 0));
+    let mut client = Client::connect(&compositor);
+    client.sync();
+
+    let shell: ZwlrLayerShellV1 = client.bind(1..=5);
+    let outputs: Vec<WlOutput> = client
+        .globals
+        .contents()
+        .clone_list()
+        .into_iter()
+        .filter(|global| global.interface == "wl_output")
+        .map(|global| {
+            client
+                .globals
+                .registry()
+                .bind(global.name, 4, &client.handle, ())
+        })
+        .collect();
+    client.sync();
+    // Whichever of them it is, the surface must end up on exactly that output.
+    let surface = client.compositor.create_surface(&client.handle, ());
+    let layer = shell.get_layer_surface(
+        &surface,
+        Some(&outputs[1]),
+        Level::Top,
+        "test".into(),
+        &client.handle,
+        (),
+    );
+    layer.set_size(0, 30);
+    layer.set_anchor(top_bar_anchor());
+    layer.set_exclusive_zone(30);
+    surface.commit();
+    client.state.others.push(surface.clone());
+    client.state.layers.push(LayerState {
+        surface,
+        layer,
+        size: (0, 0),
+        configures: 0,
+        closed: false,
+        buffer: None,
+    });
+    client.sync();
+    client.draw_layer(0, BAR);
+
+    let (zones, on_second) = compositor.with(|state| {
+        let zones = (state.work_area(0), state.work_area(1));
+        let surface = state.space.outputs().count();
+        (zones, surface)
+    });
+    assert_eq!(on_second, 2);
+    let (x, zone) = if zones.1 == Some(Rect::new(1000, 30, 1000, 570)) {
+        (1500.0, 1)
+    } else {
+        assert_eq!(zones.0, Some(Rect::new(0, 30, 1000, 570)));
+        (500.0, 0)
+    };
+    compositor.pointer_at(x, 10.0);
+    let input = client.layer_input(0);
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::PointerEnter(input, 500.0, 10.0))
+    );
+    assert_eq!(compositor.screenshot_of(zone).at(500, 10), BAR);
+
+    let output = if zone == 1 {
+        second
+    } else {
+        compositor.with(|state| state.monitors[0].output.clone())
+    };
+    compositor.with(move |state| state.remove_output(&output));
+    client.sync();
+    assert!(client.state.layers[0].closed);
+}
+
+#[test]
+fn a_panel_grows_with_its_output() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let bar = client.open_bar(30, BAR);
+    compositor.with(|state| {
+        let output = state.monitors[0].output.clone();
+        let mode = Mode {
+            size: (800, 400).into(),
+            refresh: 60_000,
+        };
+        output.change_current_state(Some(mode), None, None, None);
+        state.output_resized(&output);
+    });
+    client.sync();
+    assert_eq!(client.state.layers[bar].size, (800, 30));
+    assert_eq!(compositor.frames(), [Rect::new(14, 44, 772, 342)]);
+}
+
+#[test]
+fn a_layer_without_output_goes_to_the_active_one_and_with_no_output_closes() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    compositor.with(|state| {
+        let output = state.monitors[0].output.clone();
+        state.remove_output(&output);
+    });
+    let shell: ZwlrLayerShellV1 = client.bind(1..=5);
+    let surface = client.compositor.create_surface(&client.handle, ());
+    let layer = shell.get_layer_surface(
+        &surface,
+        None,
+        Level::Top,
+        "test".into(),
+        &client.handle,
+        (),
+    );
+    client.state.layers.push(LayerState {
+        surface,
+        layer,
+        size: (0, 0),
+        configures: 0,
+        closed: false,
+        buffer: None,
+    });
+    client.sync();
+    assert!(client.state.layers[0].closed);
+}
+
+#[test]
+fn a_dying_client_takes_its_panel_along() {
+    let compositor = Compositor::start();
+    let mut windows = Client::connect(&compositor);
+    windows.open_window(RED);
+    {
+        let mut panel = Client::connect(&compositor);
+        panel.open_bar(30, BAR);
+        assert_eq!(compositor.frames(), [Rect::new(14, 44, 972, 542)]);
+    }
+    windows.sync();
+    let start = Instant::now();
+    while compositor.frames() != [Rect::new(14, 14, 972, 572)] {
+        assert!(start.elapsed() < ANSWER, "the zone stays taken");
+        windows.sync();
+    }
+}
+
+#[test]
+fn a_panel_popup_opens_above_windows_and_stays_on_the_output() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let bar = client.open_bar(30, BAR);
+    let positioner = client.positioner((950, 20), (100, 50));
+    positioner.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::SlideX);
+    let surface = client.compositor.create_surface(&client.handle, ());
+    let xdg_surface = client.wm_base.get_xdg_surface(&surface, &client.handle, ());
+    let popup = xdg_surface.get_popup(None, &positioner, &client.handle, ());
+    client.state.layers[bar].layer.get_popup(&popup);
+    let popup = client.finish_popup(surface, xdg_surface, popup, (100, 50), POPUP, None);
+
+    assert_eq!(client.state.popup_position, Some((900, 20)));
+    assert_eq!(compositor.screenshot().at(950, 40), POPUP);
+    compositor.pointer_at(950.0, 40.0);
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::PointerEnter(popup.input, 50.0, 20.0))
+    );
+}
+
+#[test]
+fn a_popup_of_a_lower_layer_opens_above_the_windows() {
+    use zwlr_layer_surface_v1::Anchor;
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let desktop = client.open_layer(Level::Bottom, BAR, |layer| {
+        layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+    });
+    let popup = client.open_layer_popup(desktop, (400, 200), (100, 100), POPUP, None);
+    assert_eq!(compositor.screenshot().at(450, 250), POPUP);
+    compositor.pointer_at(450.0, 250.0);
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::PointerEnter(popup.input, 50.0, 50.0))
+    );
+}
+
+#[test]
+fn window_popups_stay_clear_of_a_panel() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    client.open_layer(Level::Top, BAR, |layer| {
+        use zwlr_layer_surface_v1::Anchor;
+        layer.set_size(0, 30);
+        layer.set_anchor(Anchor::Bottom | Anchor::Left | Anchor::Right);
+        layer.set_exclusive_zone(30);
+    });
+    client.sync();
+    client.draw(a, RED);
+    let positioner = client.positioner((100, 500), (100, 200));
+    positioner.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::SlideY);
+    let surface = client.compositor.create_surface(&client.handle, ());
+    let xdg_surface = client.wm_base.get_xdg_surface(&surface, &client.handle, ());
+    let parent = client.xdg_surface(a);
+    let _popup = xdg_surface.get_popup(Some(&parent), &positioner, &client.handle, ());
+    surface.commit();
+    client.sync();
+    // The window starts at y=14, the room ends at 570.
+    assert_eq!(client.state.popup_position, Some((100, 570 - 200 - 14)));
+}
+
+/// A window with a popup holding a grab, opened by a click at (100, 100).
+fn window_with_grabbing_popup() -> (Compositor, Client, usize, TestPopup) {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    client.sync();
+    let serial = client.state.button_serial;
+    let parent = client.xdg_surface(a);
+    let popup = client.open_popup(&parent, (200, 200), (100, 100), POPUP, Some(serial));
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    client.take_input();
+    (compositor, client, a, popup)
+}
+
+#[test]
+fn a_grabbing_popup_gets_the_keyboard_and_gives_it_back() {
+    let (compositor, mut client, a, popup) = window_with_grabbing_popup();
+    compositor.tap_key(KEY_A);
+    let input = client.take_input();
+    assert!(input.contains(&Input::Key(KEY_A, wl_keyboard::KeyState::Pressed)));
+    assert!(compositor.with(|state| state.popup_grab.is_some()));
+    let focus = compositor.with(|state| {
+        let keyboard = state.seat.get_keyboard().unwrap();
+        keyboard.current_focus().map(|surface| {
+            use smithay::reexports::wayland_server::Resource;
+            surface.id().protocol_id()
+        })
+    });
+    assert_eq!(focus, Some(popup.surface.id().protocol_id()));
+
+    popup.destroy();
+    client.sync();
+    compositor.with(|_| ());
+    assert!(compositor.with(|state| state.popup_grab.is_none()));
+    assert!(client.take_input().contains(&Input::KeyboardEnter(a)));
+}
+
+#[test]
+fn a_click_outside_ends_the_grab_and_counts_as_a_click() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let mut other = Client::connect(&compositor);
+    let b = other.open_window(GREEN);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    client.sync();
+    let serial = client.state.button_serial;
+    let parent = client.xdg_surface(a);
+    let _popup = client.open_popup(&parent, (100, 100), (100, 100), POPUP, Some(serial));
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    client.sync();
+    other.take_input();
+
+    compositor.pointer_at(RIGHT_X + 50.0, 300.0);
+    // Inside the grab, the other client hears nothing.
+    assert_eq!(other.take_input(), []);
+    compositor.click();
+    client.sync();
+    assert_eq!(client.state.popups_done, 1);
+    let input = other.take_input();
+    assert!(input.contains(&Input::KeyboardEnter(b)), "{input:?}");
+    assert!(input.contains(&Input::Button(BTN_LEFT, wl_pointer::ButtonState::Pressed)));
+    assert!(compositor.with(|state| state.popup_grab.is_none()));
+}
+
+#[test]
+fn a_click_inside_the_popup_keeps_it_open() {
+    let (compositor, mut client, _a, popup) = window_with_grabbing_popup();
+    compositor.pointer_at(250.0, 250.0);
+    let input = client.take_input();
+    assert!(
+        input.contains(&Input::PointerEnter(popup.input, 36.0, 36.0)),
+        "{input:?}"
+    );
+    compositor.click();
+    client.sync();
+    assert_eq!(client.state.popups_done, 0);
+    assert!(compositor.with(|state| state.popup_grab.is_some()));
+}
+
+#[test]
+fn nested_popups_hand_the_grab_down_and_back() {
+    let (compositor, mut client, _a, first) = window_with_grabbing_popup();
+    compositor.pointer_at(220.0, 220.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    client.sync();
+    let serial = client.state.button_serial;
+    let parent = first.xdg_surface.clone();
+    let second = client.open_popup(&parent, (50, 50), (50, 50), BLUE, Some(serial));
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    client.sync();
+
+    compositor.tap_key(KEY_A);
+    client.take_input();
+    second.destroy();
+    client.sync();
+    compositor.tap_key(KEY_A);
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::KeyboardEnter(first.input))
+    );
+    assert_eq!(client.state.popups_done, 0);
+    assert!(compositor.with(|state| state.popup_grab.is_some()));
+}
+
+#[test]
+fn hiding_a_window_withdraws_its_popups_and_frees_the_seat() {
+    let (compositor, mut client, _a, _popup) = window_with_grabbing_popup();
+    compositor.chord(&[KEY_LEFTMETA], KEY_2);
+    client.sync();
+    assert_eq!(compositor.active_workspace(), 1);
+    assert_eq!(client.state.popups_done, 1);
+    assert!(compositor.with(|state| {
+        state.popup_grab.is_none() && !state.seat.get_pointer().unwrap().is_grabbed()
+    }));
+    assert!(!compositor.with(|state| state.seat.get_keyboard().unwrap().is_grabbed()));
+}
+
+#[test]
+fn popups_without_a_grab_are_withdrawn_along_with_their_window() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let parent = client.xdg_surface(a);
+    let _popup = client.open_popup(&parent, (100, 100), (100, 100), POPUP, None);
+    compositor.chord(&[KEY_LEFTMETA], KEY_2);
+    client.sync();
+    assert_eq!(client.state.popups_done, 1);
+}
+
+#[test]
+fn a_bound_focus_change_ends_the_grab() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let b = client.open_window(GREEN);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    client.sync();
+    let serial = client.state.button_serial;
+    let parent = client.xdg_surface(a);
+    let _popup = client.open_popup(&parent, (20, 20), (100, 100), POPUP, Some(serial));
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    client.take_input();
+
+    compositor.chord(&[KEY_LEFTALT], KEY_RIGHT);
+    client.sync();
+    assert_eq!(client.state.popups_done, 1);
+    assert!(client.take_input().contains(&Input::KeyboardEnter(b)));
+}
+
+#[test]
+fn pos_and_move_keep_working_through_a_popup_grab() {
+    let (compositor, mut client, _a, popup) = window_with_grabbing_popup();
+    let watcher = Watcher::start(&compositor, &[]);
+    assert_eq!(watcher.next(), "100.0 100.0 test");
+
+    compositor.run(&["move", "250", "250"]);
+    assert_eq!(watcher.next(), "250.0 250.0 test");
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::PointerEnter(popup.input, 36.0, 36.0))
+    );
+
+    // The first motion after the client took the popup away must not get lost.
+    popup.destroy();
+    client.sync();
+    compositor.run(&["move", "300", "300"]);
+    assert_eq!(watcher.next(), "300.0 300.0 test");
+    assert_eq!(compositor.pointer(), (300.0, 300.0));
+}
+
+#[test]
+fn a_grab_with_a_foreign_pointer_grab_running_is_refused() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.button(BTN_RIGHT, ButtonState::Pressed);
+    assert!(compositor.with(|state| state.drag.is_some()));
+    let positioner = client.positioner((20, 20), (100, 100));
+    let surface = client.compositor.create_surface(&client.handle, ());
+    let xdg_surface = client.wm_base.get_xdg_surface(&surface, &client.handle, ());
+    let parent = client.xdg_surface(a);
+    let popup = xdg_surface.get_popup(Some(&parent), &positioner, &client.handle, ());
+    popup.grab(&client.seat(), 1);
+    surface.commit();
+    client.sync();
+    assert_eq!(client.state.popups_done, 1);
+    assert!(compositor.with(|state| state.drag.is_some()));
+    compositor.button(BTN_RIGHT, ButtonState::Released);
+    compositor.key(KEY_LEFTMETA, KeyState::Released);
+}
+
+#[test]
+fn every_window_is_decorated_by_the_server_whatever_it_asks() {
+    use zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let manager: ZxdgDecorationManagerV1 = client.bind(1..=1);
+    let handle = client.handle.clone();
+    let mut decoration = None;
+    let a = client.open_unmapped_window_with(|toplevel| {
+        decoration = Some(manager.get_toplevel_decoration(toplevel, &handle, ()));
+    });
+    assert_eq!(client.state.decoration_modes, [DecorationMode::ServerSide]);
+    client.draw(a, RED);
+
+    let decoration = decoration.unwrap();
+    decoration.set_mode(DecorationMode::ClientSide);
+    client.sync();
+    assert_eq!(
+        client.state.decoration_modes.last(),
+        Some(&DecorationMode::ServerSide)
+    );
+    decoration.unset_mode();
+    client.sync();
+    assert_eq!(client.state.decoration_modes.len(), 3);
+    assert_eq!(
+        client.state.decoration_modes.last(),
+        Some(&DecorationMode::ServerSide)
+    );
+}
+
+fn read_pipe(read: std::os::fd::OwnedFd) -> Vec<u8> {
+    use std::io::Read;
+    let mut text = Vec::new();
+    fs::File::from(read).read_to_end(&mut text).unwrap();
+    text
+}
+
+/// Two clients with a window each. The second has the keyboard.
+fn two_clients() -> (Compositor, Client, Client) {
+    let compositor = Compositor::start();
+    let mut first = Client::connect(&compositor);
+    first.open_window(RED);
+    let mut second = Client::connect(&compositor);
+    second.open_window(GREEN);
+    first.sync();
+    (compositor, first, second)
+}
+
+/// Runs both clients until `source` has answered a pending request. Reading blocks, so that
+/// happens on another thread.
+fn exchange(
+    source_client: &mut Client,
+    target: &mut Client,
+    request: impl FnOnce(&mut Client, std::os::fd::BorrowedFd<'_>),
+) -> Vec<u8> {
+    let (read, write) = rustix::pipe::pipe().unwrap();
+    request(target, write.as_fd());
+    target.sync();
+    drop(write);
+    source_client.sync();
+    source_client.sync();
+    read_pipe(read)
+}
+
+#[test]
+fn the_clipboard_travels_between_clients_with_the_keyboard() {
+    let (compositor, mut first, mut second) = two_clients();
+    let manager: WlDataDeviceManager = second.bind(1..=3);
+    let seat = second.seat();
+    let device = manager.get_data_device(&seat, &second.handle, ());
+    let source = manager.create_data_source(&second.handle, ());
+    source.offer("text/plain".into());
+    compositor.tap_key(KEY_A);
+    second.sync();
+    device.set_selection(Some(&source), second.state.key_serial);
+    second.sync();
+
+    let first_manager: WlDataDeviceManager = first.bind(1..=3);
+    let first_seat = first.seat();
+    let _first_device = first_manager.get_data_device(&first_seat, &first.handle, ());
+    first.sync();
+    assert!(
+        first.state.selection.is_none(),
+        "offered without the keyboard"
+    );
+
+    compositor.pointer_at(100.0, 100.0);
+    compositor.click();
+    first.sync();
+    let offer = first
+        .state
+        .selection
+        .clone()
+        .expect("no offer with the keyboard");
+    let text = exchange(&mut second, &mut first, |_, fd| {
+        offer.receive("text/plain".into(), fd);
+    });
+    assert_eq!(text, CLIPBOARD_TEXT);
+}
+
+#[test]
+fn the_primary_selection_travels_too() {
+    let (compositor, mut first, mut second) = two_clients();
+    let manager: ZwpPrimarySelectionDeviceManagerV1 = second.bind(1..=1);
+    let seat = second.seat();
+    let device = manager.get_device(&seat, &second.handle, ());
+    let source = manager.create_source(&second.handle, ());
+    source.offer("text/plain".into());
+    compositor.tap_key(KEY_A);
+    second.sync();
+    device.set_selection(Some(&source), second.state.key_serial);
+    second.sync();
+
+    let first_manager: ZwpPrimarySelectionDeviceManagerV1 = first.bind(1..=1);
+    let first_seat = first.seat();
+    let _first_device = first_manager.get_device(&first_seat, &first.handle, ());
+    first.sync();
+    compositor.pointer_at(100.0, 100.0);
+    compositor.click();
+    first.sync();
+    let offer = first
+        .state
+        .primary
+        .clone()
+        .expect("no offer with the keyboard");
+    let text = exchange(&mut second, &mut first, |_, fd| {
+        offer.receive("text/plain".into(), fd);
+    });
+    assert_eq!(text, CLIPBOARD_TEXT);
+}
+
+#[test]
+fn drag_and_drop_reaches_another_client_and_the_pointer_stays_visible_to_pos() {
+    let (compositor, mut first, mut second) = two_clients();
+    let manager: WlDataDeviceManager = first.bind(1..=3);
+    let seat = first.seat();
+    let device = manager.get_data_device(&seat, &first.handle, ());
+    let source = manager.create_data_source(&first.handle, ());
+    source.offer("text/plain".into());
+    source.set_actions(wayland_client::protocol::wl_data_device_manager::DndAction::Copy);
+    first.sync();
+
+    let target_manager: WlDataDeviceManager = second.bind(1..=3);
+    let target_seat = second.seat();
+    let _target = target_manager.get_data_device(&target_seat, &second.handle, ());
+    second.sync();
+
+    compositor.pointer_at(100.0, 100.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    first.sync();
+    let surface = first.state.windows[0].surface.clone();
+    let icon = first.compositor.create_surface(&first.handle, ());
+    device.start_drag(
+        Some(&source),
+        &surface,
+        Some(&icon),
+        first.state.button_serial,
+    );
+    let _icon_buffer = first.fill(&icon, 10, 10, BLUE);
+    first.sync();
+
+    assert_eq!(compositor.screenshot().at(105, 105), BLUE);
+    let watcher = Watcher::start(&compositor, &[]);
+    assert_eq!(watcher.next(), "100.0 100.0 test");
+    compositor.run(&["move", "700", "300"]);
+    assert_eq!(watcher.next(), "700.0 300.0 test");
+    second.sync();
+    assert_eq!(
+        second.state.dnd,
+        [DndEvent::Enter(700.0 - RIGHT_X, 300.0 - 14.0)]
+    );
+    assert_eq!(compositor.screenshot().at(705, 305), BLUE);
+
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    second.sync();
+    assert!(second.state.dnd.contains(&DndEvent::Drop));
+    first.sync();
+    assert!(first.state.source_events.contains(&SourceEvent::Dropped));
+    assert!(compositor.with(|state| state.dnd_icon.is_none()));
+    assert!(compositor.with(|state| !state.seat.get_pointer().unwrap().is_grabbed()));
+}
+
+#[test]
+fn a_cursor_shape_reaches_the_backend() {
+    use smithay::input::pointer::{CursorIcon, CursorImageStatus};
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let manager: WpCursorShapeManagerV1 = client.bind(1..=1);
+    let pointer = client._pointer.clone();
+    let device = manager.get_pointer(&pointer, &client.handle, ());
+    compositor.pointer_at(100.0, 100.0);
+    client.sync();
+    device.set_shape(
+        client.state.enter_serial,
+        wp_cursor_shape_device_v1::Shape::Text,
+    );
+    client.sync();
+    let status = compositor.with(|state| {
+        matches!(
+            state.cursor_status,
+            CursorImageStatus::Named(CursorIcon::Text)
+        )
+    });
+    assert!(status);
+}
+
+#[test]
+fn a_viewport_scales_a_small_buffer_up() {
+    use zwlr_layer_surface_v1::Anchor;
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let viewporter: WpViewporter = client.bind(1..=1);
+    let index = client.open_unmapped_layer(Level::Top, |layer| {
+        layer.set_size(100, 100);
+        layer.set_anchor(Anchor::Top);
+    });
+    let surface = client.state.layers[index].surface.clone();
+    let viewport = viewporter.get_viewport(&surface, &client.handle, ());
+    viewport.set_destination(100, 100);
+    let _buffer = client.fill(&surface, 10, 10, BAR);
+    let shot = compositor.screenshot();
+    let background = rgb(default_config().background_color);
+    assert_eq!(shot.at(500, 50), BAR);
+    assert_ne!(shot.at(500, 95), background, "not stretched downwards");
+    assert_ne!(shot.at(545, 50), background, "not stretched sideways");
+    assert_eq!(shot.at(500, 105), background);
+}
+
+#[test]
+fn the_preferred_scale_comes_from_the_output_and_follows_it() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let manager: WpFractionalScaleManagerV1 = client.bind(1..=1);
+    let surface = client.state.windows[a].surface.clone();
+    let _scale = manager.get_fractional_scale(&surface, &client.handle, ());
+    client.sync();
+    assert_eq!(client.state.preferred_scale, Some(120));
+
+    compositor.with(|state| {
+        let output = state.monitors[0].output.clone();
+        let scale = smithay::output::Scale::Fractional(1.5);
+        output.change_current_state(None, None, Some(scale), None);
+        state.output_resized(&output);
+    });
+    client.sync();
+    assert_eq!(client.state.preferred_scale, Some(180));
+}
+
+#[test]
+fn xdg_output_reports_the_logical_size() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let manager: ZxdgOutputManagerV1 = client.bind(1..=3);
+    let output: WlOutput = client.bind(1..=4);
+    let _xdg_output = manager.get_xdg_output(&output, &client.handle, ());
+    client.sync();
+    assert_eq!(client.state.logical_size, Some((WIDTH, HEIGHT)));
+}
+
+/// Starts offering dmabufs of a made-up device, with `answer` as the result of every import.
+fn offer_dmabufs(compositor: &Compositor, answer: bool) {
+    compositor.with(move |state| {
+        use smithay::backend::allocator::{Format as DmabufFormat, Modifier};
+        state.import_dmabuf = Box::new(move |_| answer);
+        let format = DmabufFormat {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Linear,
+        };
+        state.offer_dmabufs(1, [format]);
+    });
+}
+
+fn create_dmabuf(client: &mut Client) {
+    let manager: ZwpLinuxDmabufV1 = client.bind(4..=5);
+    let params = manager.create_params(&client.handle, ());
+    let file = fs::File::create(scratch_path("dmabuf")).unwrap();
+    file.set_len(4096).unwrap();
+    let modifier = u64::from(smithay::backend::allocator::Modifier::Linear);
+    params.add(
+        file.as_fd(),
+        0,
+        0,
+        64,
+        (modifier >> 32) as u32,
+        modifier as u32,
+    );
+    params.create(
+        16,
+        16,
+        Fourcc::Argb8888 as u32,
+        zwp_linux_buffer_params_v1::Flags::empty(),
+    );
+    client.sync();
+    fs::remove_file(scratch_path("dmabuf")).ok();
+}
+
+#[test]
+fn a_dmabuf_the_renderer_accepts_becomes_a_buffer() {
+    let compositor = Compositor::start();
+    offer_dmabufs(&compositor, true);
+    let mut client = Client::connect(&compositor);
+    create_dmabuf(&mut client);
+    assert_eq!(client.state.dmabuf, Some(Ok(())));
+}
+
+#[test]
+fn a_dmabuf_the_renderer_refuses_fails_cleanly() {
+    let compositor = Compositor::start();
+    offer_dmabufs(&compositor, false);
+    let mut client = Client::connect(&compositor);
+    create_dmabuf(&mut client);
+    assert_eq!(client.state.dmabuf, Some(Err(())));
+}
+
+#[test]
+fn without_a_backend_there_are_no_dmabufs_to_get() {
+    let compositor = Compositor::start();
+    let client = Client::connect(&compositor);
+    let list = client.globals.contents().clone_list();
+    assert!(
+        !list
+            .iter()
+            .any(|global| global.interface == "zwp_linux_dmabuf_v1")
+    );
+}
+
+fn bound_output(client: &mut Client) -> WlOutput {
+    let output = client.bind(1..=4);
+    client.sync();
+    output
+}
+
+/// A window and a session locked by a second client whose lock surface fills the output.
+fn locked_session() -> (Compositor, Client, Client, ExtSessionLockV1, LockedSurface) {
+    let compositor = Compositor::start();
+    let mut windows = Client::connect(&compositor);
+    windows.open_window(RED);
+    let mut locker = Client::connect(&compositor);
+    let lock = locker.lock();
+    let output = bound_output(&mut locker);
+    let surface = locker.lock_surface(&lock, &output, LOCK);
+    compositor.present();
+    locker.sync();
+    windows.take_input();
+    (compositor, windows, locker, lock, surface)
+}
+
+#[test]
+fn locked_is_only_said_once_a_blank_frame_was_presented() {
+    let compositor = Compositor::start();
+    let mut windows = Client::connect(&compositor);
+    windows.open_window(RED);
+    let mut locker = Client::connect(&compositor);
+    let lock = locker.lock();
+    assert_eq!(locker.state.lock_events, []);
+
+    // The window is gone from the very next frame, before any lock surface exists.
+    let background = rgb(default_config().background_color);
+    assert_eq!(compositor.screenshot().at(500, 300), background);
+    assert_eq!(locker.state.lock_events, []);
+    compositor.present();
+    locker.sync();
+    assert_eq!(locker.state.lock_events, [LockEvent::Locked]);
+
+    let output = bound_output(&mut locker);
+    locker.lock_surface(&lock, &output, LOCK);
+    assert_eq!(locker.state.lock_size, Some((WIDTH as u32, HEIGHT as u32)));
+    assert_eq!(compositor.screenshot().at(500, 300), LOCK);
+}
+
+#[test]
+fn a_locked_session_shows_no_panel_and_no_window() {
+    let compositor = Compositor::start();
+    let mut panel = Client::connect(&compositor);
+    panel.open_bar(30, BAR);
+    panel.open_window(RED);
+    let mut locker = Client::connect(&compositor);
+    locker.lock();
+    let shot = compositor.screenshot();
+    let background = rgb(default_config().background_color);
+    assert_eq!(shot.at(500, 5), background);
+    assert_eq!(shot.at(500, 300), background);
+}
+
+#[test]
+fn only_the_lock_surface_gets_keys_and_binds_are_off() {
+    let (compositor, mut windows, mut locker, _lock, surface) = locked_session();
+    locker.sync();
+    let input = locker.take_input();
+    assert!(
+        input.contains(&Input::KeyboardEnter(surface.input)),
+        "{input:?}"
+    );
+    assert_eq!(windows.take_input(), []);
+
+    // Super+2 switches workspaces, Super+Return starts a program, Super+M quits.
+    compositor.chord(&[KEY_LEFTMETA], KEY_2);
+    assert_eq!(compositor.active_workspace(), 0);
+    let keys = locker.take_input();
+    assert!(
+        keys.contains(&Input::Key(KEY_2, wl_keyboard::KeyState::Pressed)),
+        "{keys:?}"
+    );
+    assert_eq!(windows.take_input(), []);
+}
+
+#[test]
+fn the_window_loses_the_keyboard_when_the_lock_begins() {
+    let compositor = Compositor::start();
+    let mut windows = Client::connect(&compositor);
+    let a = windows.open_window(RED);
+    compositor.pointer_at(100.0, 100.0);
+    windows.take_input();
+    let mut locker = Client::connect(&compositor);
+    locker.lock();
+    let input = windows.take_input();
+    assert!(input.contains(&Input::KeyboardLeave(a)), "{input:?}");
+    assert!(input.contains(&Input::PointerLeave(a)), "{input:?}");
+    compositor.tap_key(KEY_A);
+    compositor.pointer_at(200.0, 200.0);
+    compositor.click();
+    assert_eq!(windows.take_input(), []);
+}
+
+#[test]
+fn move_and_pos_keep_working_but_only_the_lock_surface_sees_the_pointer() {
+    let (compositor, mut windows, mut locker, _lock, surface) = locked_session();
+    locker.take_input();
+    let watcher = Watcher::start(&compositor, &[]);
+    assert_eq!(watcher.next(), "0.0 0.0 test");
+
+    compositor.run(&["move", "300.5", "200.25"]);
+    assert_eq!(watcher.next(), "300.5 200.25 test");
+    compositor.run(&["move", "--rel", "1", "1"]);
+    assert_eq!(watcher.next(), "301.5 201.25 test");
+    assert_eq!(compositor.run(&["pos", "--once"]), "301.5 201.25 test\n");
+
+    let input = locker.take_input();
+    let _ = surface;
+    assert_eq!(
+        input,
+        [
+            Input::PointerMotion(300.5, 200.25),
+            Input::PointerMotion(301.5, 201.25)
+        ]
+    );
+    assert_eq!(windows.take_input(), []);
+}
+
+#[test]
+fn clicks_of_a_locked_session_neither_focus_nor_raise_nor_drag() {
+    let (compositor, mut windows, mut locker, _lock, _surface) = locked_session();
+    let a = compositor.with(|state| state.focused.clone());
+    compositor.pointer_at(500.0, 300.0);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    assert!(compositor.with(|state| state.drag.is_none()));
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    compositor.key(KEY_LEFTMETA, KeyState::Released);
+    assert!(compositor.with(move |state| state.focused == a));
+    assert_eq!(windows.take_input(), []);
+    let input = locker.take_input();
+    assert!(input.contains(&Input::Button(BTN_LEFT, wl_pointer::ButtonState::Pressed)));
+}
+
+#[test]
+fn locking_takes_the_pointer_away_from_a_held_button() {
+    let compositor = Compositor::start();
+    let mut windows = Client::connect(&compositor);
+    let a = windows.open_window(RED);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    windows.take_input();
+    let mut locker = Client::connect(&compositor);
+    locker.lock();
+    assert!(windows.take_input().contains(&Input::PointerLeave(a)));
+    compositor.run(&["move", "200", "200"]);
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(windows.take_input(), []);
+    assert_eq!(compositor.pointer(), (200.0, 200.0));
+}
+
+#[test]
+fn locking_ends_grabs_and_drags() {
+    let (compositor, mut client, _a, _popup) = window_with_grabbing_popup();
+    let mut locker = Client::connect(&compositor);
+    locker.lock();
+    client.sync();
+    assert_eq!(client.state.popups_done, 1);
+    assert!(compositor.with(|state| !state.seat.get_keyboard().unwrap().is_grabbed()));
+
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.button(BTN_RIGHT, ButtonState::Pressed);
+    assert!(compositor.with(|state| state.drag.is_some()));
+    let mut locker = Client::connect(&compositor);
+    locker.lock();
+    assert!(compositor.with(|state| state.drag.is_none()));
+    assert!(compositor.with(|state| !state.seat.get_pointer().unwrap().is_grabbed()));
+    compositor.key(KEY_LEFTMETA, KeyState::Released);
+    compositor.button(BTN_RIGHT, ButtonState::Released);
+}
+
+#[test]
+fn a_grab_during_the_lock_is_refused() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    client.sync();
+    let serial = client.state.button_serial;
+    let mut locker = Client::connect(&compositor);
+    locker.lock();
+    let parent = client.xdg_surface(a);
+    let _popup = client.open_popup(&parent, (20, 20), (100, 100), POPUP, Some(serial));
+    client.sync();
+    assert_eq!(client.state.popups_done, 1);
+    assert!(compositor.with(|state| state.popup_grab.is_none()));
+}
+
+#[test]
+fn a_new_window_during_the_lock_gets_nothing() {
+    let (compositor, mut windows, mut locker, _lock, surface) = locked_session();
+    locker.take_input();
+    let b = windows.open_window(GREEN);
+    assert_eq!(compositor.screenshot().at(800, 300), LOCK);
+    compositor.tap_key(KEY_A);
+    assert!(!windows.take_input().contains(&Input::KeyboardEnter(b)));
+    let _ = surface;
+    assert!(
+        locker
+            .take_input()
+            .contains(&Input::Key(KEY_A, wl_keyboard::KeyState::Pressed))
+    );
+}
+
+#[test]
+fn unlocking_brings_screen_and_input_back() {
+    let (compositor, mut windows, mut locker, lock, surface) = locked_session();
+    compositor.pointer_at(100.0, 100.0);
+    locker.take_input();
+    surface.lock_surface.destroy();
+    surface.surface.destroy();
+    lock.unlock_and_destroy();
+    locker.sync();
+    assert!(!compositor.with(|state| state.lock.is_active()));
+    let input = windows.take_input();
+    assert!(input.contains(&Input::KeyboardEnter(0)), "{input:?}");
+    assert!(
+        input.contains(&Input::PointerEnter(0, 86.0, 86.0)),
+        "{input:?}"
+    );
+    assert_eq!(compositor.screenshot().at(100, 100), RED);
+    compositor.chord(&[KEY_LEFTMETA], KEY_2);
+    assert_eq!(compositor.active_workspace(), 1);
+}
+
+#[test]
+fn a_dead_locker_leaves_the_session_locked_for_the_next_one() {
+    let (compositor, mut windows, locker, lock, surface) = locked_session();
+    drop((lock, surface, locker));
+    let start = Instant::now();
+    while compositor.with(|state| state.lock.surfaces().count()) != 0 {
+        assert!(start.elapsed() < ANSWER, "the lock surface stays");
+    }
+    let background = rgb(default_config().background_color);
+    assert_eq!(compositor.screenshot().at(500, 300), background);
+    compositor.tap_key(KEY_A);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.click();
+    assert_eq!(windows.take_input(), []);
+    assert_eq!(compositor.active_workspace(), 0);
+
+    let mut next = Client::connect(&compositor);
+    let lock = next.lock();
+    assert_eq!(next.state.lock_events, [LockEvent::Locked]);
+    let output = bound_output(&mut next);
+    let surface = next.lock_surface(&lock, &output, LOCK);
+    assert_eq!(compositor.screenshot().at(500, 300), LOCK);
+    assert!(
+        next.take_input()
+            .contains(&Input::KeyboardEnter(surface.input))
+    );
+
+    surface.lock_surface.destroy();
+    lock.unlock_and_destroy();
+    next.sync();
+    assert_eq!(compositor.screenshot().at(500, 300), RED);
+}
+
+#[test]
+fn a_second_locker_is_turned_away_while_the_first_lives() {
+    let (compositor, _windows, mut locker, _lock, _surface) = locked_session();
+    let mut other = Client::connect(&compositor);
+    let _second = other.lock();
+    assert_eq!(other.state.lock_events, [LockEvent::Finished]);
+    locker.sync();
+    assert_eq!(locker.state.lock_events, [LockEvent::Locked]);
+}
+
+#[test]
+fn a_second_locker_is_turned_away_before_the_first_is_confirmed() {
+    let compositor = Compositor::start();
+    let mut first = Client::connect(&compositor);
+    let _first_lock = first.lock();
+    let mut other = Client::connect(&compositor);
+    let _second = other.lock();
+    assert_eq!(other.state.lock_events, [LockEvent::Finished]);
+    compositor.present();
+    first.sync();
+    assert_eq!(first.state.lock_events, [LockEvent::Locked]);
+}
+
+#[test]
+fn every_output_waits_for_its_blank_frame_and_keeps_its_lock_surface() {
+    let compositor = Compositor::start();
+    compositor.add_output("second", (1000, 0));
+    let mut locker = Client::connect(&compositor);
+    let lock = locker.lock();
+
+    let first_output = compositor.with(|state| state.monitors[0].output.clone());
+    compositor.with(move |state| state.send_frame_callbacks(&first_output));
+    locker.sync();
+    assert_eq!(locker.state.lock_events, []);
+    let second_output = compositor.with(|state| state.monitors[1].output.clone());
+    compositor.with(move |state| state.send_frame_callbacks(&second_output));
+    locker.sync();
+    assert_eq!(locker.state.lock_events, [LockEvent::Locked]);
+
+    let outputs: Vec<WlOutput> = locker
+        .globals
+        .contents()
+        .clone_list()
+        .into_iter()
+        .filter(|global| global.interface == "wl_output")
+        .map(|global| {
+            locker
+                .globals
+                .registry()
+                .bind(global.name, 4, &locker.handle, ())
+        })
+        .collect();
+    locker.sync();
+    let a = locker.lock_surface(&lock, &outputs[0], LOCK);
+    let b = locker.lock_surface(&lock, &outputs[1], LOCK);
+    locker.take_input();
+
+    compositor.pointer_at(1500.0, 300.0);
+    let on_b = locker.take_input();
+    compositor.pointer_at(500.0, 300.0);
+    let on_a = locker.take_input();
+    // The surfaces are on different outputs, so each side enters a different one, and the
+    // keyboard goes where the pointer goes.
+    let entered = |input: &[Input]| {
+        input.iter().find_map(|event| match event {
+            Input::KeyboardEnter(index) => Some(*index),
+            _ => None,
+        })
+    };
+    let (first, second) = (entered(&on_b), entered(&on_a));
+    assert!(first.is_some() && second.is_some(), "{on_b:?} {on_a:?}");
+    assert_ne!(first, second);
+    assert!([a.input, b.input].contains(&first.unwrap()));
+    assert!([a.input, b.input].contains(&second.unwrap()));
+}
+
+#[test]
+fn removing_the_last_waiting_output_confirms_the_lock() {
+    let compositor = Compositor::start();
+    let second = compositor.add_output("second", (1000, 0));
+    let mut locker = Client::connect(&compositor);
+    let _lock = locker.lock();
+    let first = compositor.with(|state| state.monitors[0].output.clone());
+    compositor.with(move |state| state.send_frame_callbacks(&first));
+    locker.sync();
+    assert_eq!(locker.state.lock_events, []);
+    compositor.with(move |state| state.remove_output(&second));
+    locker.sync();
+    assert_eq!(locker.state.lock_events, [LockEvent::Locked]);
+}
+
+#[test]
+fn a_lock_surface_follows_the_size_of_its_output() {
+    let (compositor, _windows, mut locker, _lock, _surface) = locked_session();
+    compositor.with(|state| {
+        let output = state.monitors[0].output.clone();
+        let mode = Mode {
+            size: (800, 400).into(),
+            refresh: 60_000,
+        };
+        output.change_current_state(Some(mode), None, None, None);
+        state.output_resized(&output);
+    });
+    locker.sync();
+    assert_eq!(locker.state.lock_size, Some((800, 400)));
+}
+
+/// A client with an idle notification of a few milliseconds.
+fn idle_client(compositor: &Compositor) -> (Client, ExtIdleNotificationV1) {
+    let client = Client::connect(compositor);
+    let notifier: ExtIdleNotifierV1 = client.bind(1..=2);
+    let seat = client.seat();
+    let notification = notifier.get_idle_notification(20, &seat, &client.handle, ());
+    (client, notification)
+}
+
+fn wait_for_idle(client: &mut Client, wanted: usize) {
+    let start = Instant::now();
+    while client.state.idle.len() < wanted {
+        assert!(
+            start.elapsed() < ANSWER,
+            "no idle event: {:?}",
+            client.state.idle
+        );
+        client.sync();
+    }
+}
+
+#[test]
+fn the_session_goes_idle_and_input_wakes_it() {
+    let compositor = Compositor::start();
+    let (mut client, _notification) = idle_client(&compositor);
+    wait_for_idle(&mut client, 1);
+    assert_eq!(client.state.idle, [true]);
+    compositor.pointer_at(10.0, 10.0);
+    wait_for_idle(&mut client, 2);
+    assert_eq!(client.state.idle, [true, false]);
+}
+
+#[test]
+fn a_visible_inhibitor_holds_off_idling_and_a_hidden_one_does_not() {
+    let compositor = Compositor::start();
+    let (mut client, _notification) = idle_client(&compositor);
+    let a = client.open_window(RED);
+    let manager: ZwpIdleInhibitManagerV1 = client.bind(1..=1);
+    let surface = client.state.windows[a].surface.clone();
+    let _inhibitor = manager.create_inhibitor(&surface, &client.handle, ());
+    client.sync();
+    compositor.with(|_| ());
+    compositor.pointer_at(10.0, 10.0);
+    assert!(compositor.with(|state| state.idle_notifier_state.is_inhibited()));
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(100) {
+        client.sync();
+    }
+    assert!(
+        !client.state.idle.contains(&true),
+        "{:?}",
+        client.state.idle
+    );
+
+    compositor.chord(&[KEY_LEFTMETA], KEY_2);
+    compositor.with(|_| ());
+    assert!(!compositor.with(|state| state.idle_notifier_state.is_inhibited()));
+    wait_for_idle(&mut client, 1);
 }

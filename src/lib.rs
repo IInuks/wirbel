@@ -5,7 +5,7 @@ pub mod backend;
 pub mod cli;
 pub mod config;
 pub mod grabs;
-mod handlers;
+pub mod handlers;
 pub mod input;
 pub mod ipc;
 pub mod layout;

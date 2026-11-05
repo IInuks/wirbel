@@ -7,8 +7,16 @@ use std::{
 };
 
 use smithay::{
-    backend::{input::InputTime, renderer::element::solid::SolidColorBuffer},
-    desktop::{PopupManager, Space, Window, WindowSurfaceType},
+    backend::{
+        allocator::dmabuf::Dmabuf,
+        input::InputTime,
+        renderer::{element::solid::SolidColorBuffer, utils::with_renderer_surface_state},
+    },
+    desktop::{
+        LayerSurface, PopupGrab, PopupManager, PopupUngrabStrategy, Space, Window,
+        WindowSurfaceType, find_popup_root_surface, layer_map_for_output,
+        utils::{under_from_surface_tree, with_surfaces_surface_tree},
+    },
     input::{
         Seat, SeatState,
         keyboard::Keycode,
@@ -16,7 +24,9 @@ use smithay::{
     },
     output::Output,
     reexports::{
-        calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic},
+        calloop::{
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
+        },
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             Display, DisplayHandle, Resource,
@@ -26,19 +36,38 @@ use smithay::{
     },
     utils::{Logical, Point, SERIAL_COUNTER},
     wayland::{
-        compositor::{CompositorClientState, CompositorState, with_states},
+        compositor::{
+            CompositorClientState, CompositorState, SurfaceData, get_parent, send_surface_state,
+            with_states,
+        },
+        cursor_shape::CursorShapeManagerState,
+        dmabuf::DmabufState,
+        fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
+        idle_inhibit::IdleInhibitManagerState,
+        idle_notify::IdleNotifierState,
         output::OutputManagerState,
-        shell::xdg::{SurfaceCachedState, ToplevelSurface, XdgShellState, XdgToplevelSurfaceData},
+        selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
+        session_lock::SessionLockManagerState,
+        shell::{
+            wlr_layer::{KeyboardInteractivity, Layer, WlrLayerShellState},
+            xdg::{
+                SurfaceCachedState, ToplevelSurface, XdgShellState, XdgToplevelSurfaceData,
+                decoration::XdgDecorationState,
+            },
+        },
         shm::ShmState,
         socket::ListeningSocketSource,
+        viewporter::ViewporterState,
     },
 };
 
 use crate::{
     config::Config,
     grabs::Drag,
+    handlers::SessionLock,
     ipc::{Ipc, Position},
     layout::Rect,
+    render::{LayerEntry, LayerPart, LayerTiers},
     workspace::{Frame, FullKind, Monitor, Placement, Workspace},
 };
 
@@ -73,18 +102,38 @@ fn answered_last_size(toplevel: &ToplevelSurface) -> bool {
     requested == toplevel.with_committed_state(|state| state.and_then(|state| state.size))
 }
 
+/// What lies under a point of the screen.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    Lock,
+    Layer(LayerSurface),
+    Window(Window),
+}
+
 pub struct Wirbel {
     pub start_time: Instant,
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
+    pub loop_handle: LoopHandle<'static, Self>,
     pub loop_signal: LoopSignal,
 
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub layer_shell_state: WlrLayerShellState,
+    pub decoration_state: XdgDecorationState,
     pub shm_state: ShmState,
+    pub dmabuf_state: DmabufState,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Self>,
     pub seat: Seat<Self>,
+    pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
+    pub cursor_shape_state: CursorShapeManagerState,
+    pub viewporter_state: ViewporterState,
+    pub fractional_scale_state: FractionalScaleManagerState,
+    pub session_lock_state: SessionLockManagerState,
+    pub idle_inhibit_state: IdleInhibitManagerState,
+    pub idle_notifier_state: IdleNotifierState<Self>,
 
     pub config: Config,
     /// Where `reload` reads the configuration from.
@@ -102,6 +151,15 @@ pub struct Wirbel {
     /// Placed windows waiting for their first buffer. They get focus when it arrives.
     pub awaiting_buffer: Vec<Window>,
     pub focused: Option<Window>,
+    /// Layer surfaces between their creation or unmap and the commit that maps them.
+    pub unmapped_layers: Vec<(LayerSurface, Output)>,
+    /// The layer surface that got the keyboard by a click. Goes before `focused`.
+    pub layer_focus: Option<LayerSurface>,
+    /// The popup grab in progress and the root surface of its popups.
+    pub popup_grab: Option<(PopupGrab<Self>, WlSurface)>,
+    pub lock: SessionLock,
+    /// Surfaces that keep the session from going idle while they are visible.
+    pub idle_inhibitors: Vec<WlSurface>,
     /// All visible windows, bottom to top, as of the last `retile`.
     pub frames: Vec<Frame>,
     pub borders: Vec<(Window, Vec<BorderEdge>)>,
@@ -110,7 +168,11 @@ pub struct Wirbel {
     /// The window drag in progress.
     pub drag: Option<Drag>,
     pub cursor_status: CursorImageStatus,
+    /// What the client shows at the pointer during drag and drop.
+    pub dnd_icon: Option<WlSurface>,
     pub ipc: Ipc,
+    /// Asks the renderer whether it can use a dmabuf. Set by a backend that offers dmabufs.
+    pub import_dmabuf: Box<dyn FnMut(&Dmabuf) -> bool>,
 
     pub needs_redraw: bool,
     /// Asks the backend for a new frame. Set by the backend.
@@ -140,14 +202,26 @@ impl Wirbel {
         Ok(Self {
             start_time: Instant::now(),
             socket_name,
+            loop_handle: event_loop.handle(),
             loop_signal: event_loop.get_signal(),
 
             compositor_state: CompositorState::new::<Self>(&dh),
             xdg_shell_state: XdgShellState::new::<Self>(&dh),
+            layer_shell_state: WlrLayerShellState::new::<Self>(&dh),
+            decoration_state: XdgDecorationState::new::<Self>(&dh),
             shm_state: ShmState::new::<Self>(&dh, vec![]),
+            dmabuf_state: DmabufState::new(),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(&dh),
             seat_state,
             seat,
+            data_device_state: DataDeviceState::new::<Self>(&dh),
+            primary_selection_state: PrimarySelectionState::new::<Self>(&dh),
+            cursor_shape_state: CursorShapeManagerState::new::<Self>(&dh),
+            viewporter_state: ViewporterState::new::<Self>(&dh),
+            fractional_scale_state: FractionalScaleManagerState::new::<Self>(&dh),
+            session_lock_state: SessionLockManagerState::new::<Self, _>(&dh, |_| true),
+            idle_inhibit_state: IdleInhibitManagerState::new::<Self>(&dh),
+            idle_notifier_state: IdleNotifierState::new(&dh, event_loop.handle()),
 
             config,
             config_path: None,
@@ -159,12 +233,19 @@ impl Wirbel {
             unconfigured: Vec::new(),
             awaiting_buffer: Vec::new(),
             focused: None,
+            unmapped_layers: Vec::new(),
+            layer_focus: None,
+            popup_grab: None,
+            lock: SessionLock::default(),
+            idle_inhibitors: Vec::new(),
             frames: Vec::new(),
             borders: Vec::new(),
             swallowed_keys: Vec::new(),
             drag: None,
             cursor_status: CursorImageStatus::default_named(),
+            dnd_icon: None,
             ipc,
+            import_dmabuf: Box::new(|_| false),
 
             needs_redraw: true,
             redraw: Box::new(|| {}),
@@ -205,6 +286,9 @@ impl Wirbel {
     pub fn after_dispatch(&mut self) {
         self.space.refresh();
         self.popups.cleanup();
+        self.reap_popup_grab();
+        self.lock_refresh();
+        self.update_idle_inhibit();
         if std::mem::take(&mut self.needs_redraw) {
             (self.redraw)();
         }
@@ -290,6 +374,8 @@ impl Wirbel {
             .map(|pointer| pointer.current_location());
         let pointer_lost =
             location.is_some_and(|location| self.monitor_at(location) == Some(index));
+        self.close_layers(output);
+        self.lock_remove_output(output);
         self.space.unmap_output(output);
         let target = self
             .monitors
@@ -339,8 +425,10 @@ impl Wirbel {
         }
     }
 
-    /// To be called by the backend after the size of `output` changed.
+    /// To be called by the backend after the size or the scale of `output` changed.
     pub fn output_resized(&mut self, output: &Output) {
+        layer_map_for_output(output).arrange();
+        self.lock_configure_output(output);
         if let Some(index) = self.monitor_of_output(output)
             && let Some(area) = self.monitor_area(index)
         {
@@ -368,6 +456,21 @@ impl Wirbel {
             .filter(|monitor| monitor.connected)?;
         let area = self.space.output_geometry(&monitor.output)?;
         Some(Rect::new(area.loc.x, area.loc.y, area.size.w, area.size.h))
+    }
+
+    /// The part of a connected monitor that panels leave free.
+    pub fn work_area(&self, index: usize) -> Option<Rect> {
+        let area = self.monitor_area(index)?;
+        let zone = layer_map_for_output(&self.monitors[index].output).non_exclusive_zone();
+        if zone.size.w <= 0 || zone.size.h <= 0 {
+            return Some(area);
+        }
+        Some(Rect::new(
+            area.x + zone.loc.x,
+            area.y + zone.loc.y,
+            zone.size.w,
+            zone.size.h,
+        ))
     }
 
     pub fn monitor_at(&self, location: Point<f64, Logical>) -> Option<usize> {
@@ -458,7 +561,7 @@ impl Wirbel {
         let (Some((m, w)), geometry) = (self.locate(window), window.geometry().size) else {
             return;
         };
-        let area = self.monitor_area(m);
+        let area = self.work_area(m);
         let settled = answered_last_size(&toplevel);
         let dragged = self
             .drag
@@ -496,9 +599,11 @@ impl Wirbel {
     pub fn retile(&mut self) {
         let mut frames = Vec::new();
         for index in 0..self.monitors.len() {
-            if let Some(area) = self.monitor_area(index) {
+            let work = self.work_area(index);
+            self.monitors[index].work_area = work;
+            if let (Some(area), Some(work)) = (self.monitor_area(index), work) {
                 let workspace = self.monitors[index].workspace();
-                frames.extend(workspace.frames(area, &self.config));
+                frames.extend(workspace.frames(area, work, &self.config));
             }
         }
 
@@ -510,6 +615,7 @@ impl Wirbel {
             .collect();
         for window in &hidden {
             self.space.unmap_elem(window);
+            self.dismiss_popups(window);
         }
 
         for frame in &frames {
@@ -553,7 +659,60 @@ impl Wirbel {
 
         self.frames = frames;
         self.update_borders();
+        self.update_surface_scales();
         self.refresh_pointer_focus();
+    }
+
+    /// Tells visible surfaces the scale and transform of their output, as far as they changed.
+    pub(crate) fn update_surface_scales(&self) {
+        let mut roots: Vec<(WlSurface, Output)> = Vec::new();
+        for frame in &self.frames {
+            if let (Some(toplevel), Some((m, _))) =
+                (frame.window.toplevel(), self.locate(&frame.window))
+            {
+                let root = toplevel.wl_surface().clone();
+                roots.push((root, self.monitors[m].output.clone()));
+            }
+        }
+        for monitor in self.monitors.iter().filter(|monitor| monitor.connected) {
+            let map = layer_map_for_output(&monitor.output);
+            let layers = map.layers().map(LayerSurface::wl_surface);
+            roots.extend(layers.map(|layer| (layer.clone(), monitor.output.clone())));
+        }
+        roots.extend(self.lock.surfaces());
+
+        for (root, output) in roots {
+            let popups = PopupManager::popups_for_surface(&root);
+            let popups = popups.map(|(popup, _)| popup.wl_surface().clone());
+            for tree in popups.chain([root.clone()]) {
+                with_surfaces_surface_tree(&tree, |surface, states| {
+                    apply_output_scale(surface, states, &output);
+                });
+            }
+        }
+    }
+
+    /// The output a surface is shown on, or else the one it is likely to appear on.
+    pub fn output_of_surface(&self, surface: &WlSurface) -> Option<Output> {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        if let Some(popup) = self.popups.find_popup(&root)
+            && let Ok(parent) = find_popup_root_surface(&popup)
+        {
+            root = parent;
+        }
+        let window = self.find_window(&root);
+        window
+            .and_then(|window| self.locate(&window))
+            .map(|(m, _)| self.monitors[m].output.clone())
+            .or_else(|| self.find_layer(&root).map(|(_, output)| output))
+            .or_else(|| self.lock.output_of(&root))
+            .or_else(|| {
+                let monitor = self.monitors.get(self.active_monitor)?;
+                Some(monitor.output.clone())
+            })
     }
 
     fn update_borders(&mut self) {
@@ -572,7 +731,132 @@ impl Wirbel {
 
     /// Gives `window` the keyboard and raises it. `None` clears the focus.
     pub fn set_focus(&mut self, window: Option<Window>) {
+        if window.is_some() {
+            self.layer_focus = None;
+        }
         self.focus_window(window, true);
+        self.update_keyboard_focus();
+    }
+
+    /// Who should have the keyboard: the lock screen rules everything, then a layer surface that
+    /// claims the keyboard, then one that was clicked, then the focused window.
+    fn keyboard_target(&self) -> Option<WlSurface> {
+        if self.lock.is_active() {
+            return self
+                .lock
+                .surface_for_input(self.monitors.get(self.active_monitor));
+        }
+        let active = self.monitors.get(self.active_monitor).into_iter();
+        let monitors = active.chain(&self.monitors);
+        for monitor in monitors {
+            let map = layer_map_for_output(&monitor.output);
+            for layer in [Layer::Overlay, Layer::Top] {
+                let exclusive = map.layers_on(layer).rev().find(|surface| {
+                    surface.cached_state().keyboard_interactivity
+                        == KeyboardInteractivity::Exclusive
+                        && has_buffer(surface.wl_surface())
+                });
+                if let Some(surface) = exclusive {
+                    return Some(surface.wl_surface().clone());
+                }
+            }
+        }
+        let layer = self.layer_focus.as_ref().filter(|layer| {
+            self.find_layer(layer.wl_surface()).is_some()
+                && layer.can_receive_keyboard_focus()
+                && has_buffer(layer.wl_surface())
+        });
+        layer.map(|layer| layer.wl_surface().clone()).or_else(|| {
+            let toplevel = self.focused.as_ref()?.toplevel()?;
+            Some(toplevel.wl_surface().clone())
+        })
+    }
+
+    /// Brings the keyboard in line with `keyboard_target`. Whatever changes the answer calls this.
+    pub fn update_keyboard_focus(&mut self) {
+        let target = self.keyboard_target();
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && keyboard.current_focus() != target
+        {
+            keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    /// Withdraws the popups of `window`, which the user can no longer see.
+    pub fn dismiss_popups(&mut self, window: &Window) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+        let surface = toplevel.wl_surface().clone();
+        if self
+            .popup_grab
+            .as_ref()
+            .is_some_and(|(_, root)| *root == surface)
+        {
+            self.end_popup_grab();
+        }
+        for (popup, _) in PopupManager::popups_for_surface(&surface) {
+            // Fails only for a surface that is gone along with its popups.
+            let _ = PopupManager::dismiss_popup(&surface, &popup);
+        }
+    }
+
+    /// Ends the popup grab and withdraws its popups.
+    pub fn end_popup_grab(&mut self) {
+        let Some((mut grab, _)) = self.popup_grab.take() else {
+            return;
+        };
+        grab.ungrab(PopupUngrabStrategy::All);
+        let serials = [Some(grab.serial()), grab.previous_serial()];
+        let serials = serials.into_iter().flatten();
+        if let Some(pointer) = self.seat.get_pointer()
+            && serials.clone().any(|serial| pointer.has_grab(serial))
+        {
+            let serial = SERIAL_COUNTER.next_serial();
+            pointer.unset_grab(self, serial, InputTime::now());
+        }
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && serials.clone().any(|serial| keyboard.has_grab(serial))
+        {
+            keyboard.unset_grab(self);
+        }
+        self.update_keyboard_focus();
+        self.update_pointer_focus();
+    }
+
+    /// Notices a grab that came to an end without us, because its popups went away.
+    fn reap_popup_grab(&mut self) {
+        if self
+            .popup_grab
+            .as_ref()
+            .is_some_and(|(grab, _)| grab.has_ended())
+        {
+            self.end_popup_grab();
+        }
+    }
+
+    /// Only a surface the user can see holds off idling.
+    fn update_idle_inhibit(&mut self) {
+        self.idle_inhibitors.retain(Resource::is_alive);
+        let inhibited = self.idle_inhibitors.iter().any(|surface| {
+            let mut root = surface.clone();
+            while let Some(parent) = get_parent(&root) {
+                root = parent;
+            }
+            self.is_shown(&root)
+        });
+        self.idle_notifier_state.set_is_inhibited(inhibited);
+    }
+
+    /// Whether the root surface `root` is on screen right now.
+    fn is_shown(&self, root: &WlSurface) -> bool {
+        if self.lock.is_active() {
+            return self.lock.output_of(root).is_some();
+        }
+        self.find_layer(root).is_some()
+            || self
+                .find_window(root)
+                .is_some_and(|window| self.frames.iter().any(|frame| frame.window == window))
     }
 
     /// Like `set_focus`, with stacking left alone if `raise` is false. A window on a hidden
@@ -620,15 +904,9 @@ impl Wirbel {
                 toplevel.send_pending_configure();
             }
         }
-        let surface = window
-            .as_ref()
-            .and_then(|window| window.toplevel())
-            .map(|toplevel| toplevel.wl_surface().clone());
         self.focused = window;
-
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
-        }
+        self.end_popup_grab();
+        self.update_keyboard_focus();
         if restack {
             self.retile();
         } else {
@@ -638,6 +916,7 @@ impl Wirbel {
 
     /// Forgets a window that is gone, or unmapped itself, and moves focus to its neighbour.
     pub fn remove_window(&mut self, window: &Window) {
+        self.dismiss_popups(window);
         self.awaiting_buffer.retain(|other| other != window);
         let next = self.workspace_of_mut(window).and_then(|workspace| {
             workspace.take(window);
@@ -645,7 +924,8 @@ impl Wirbel {
         });
         self.space.unmap_elem(window);
         if self.focused.as_ref() == Some(window) {
-            self.set_focus(next);
+            self.focus_window(next, true);
+            self.update_keyboard_focus();
         }
         self.retile();
     }
@@ -657,7 +937,7 @@ impl Wirbel {
             return;
         };
         let size = window.geometry().size;
-        let area = self.monitor_area(m);
+        let area = self.work_area(m);
         let workspace = &mut self.monitors[m].workspaces[w];
         match workspace.take(window) {
             Some(Placement::Floating(_)) => workspace.put(window.clone(), Placement::Tiled),
@@ -714,19 +994,63 @@ impl Wirbel {
     }
 
     pub fn window_at(&self, position: Point<f64, Logical>) -> Option<Window> {
-        self.space
-            .element_under(position)
-            .map(|(window, _)| window.clone())
+        match self.under(position)?.0 {
+            Target::Window(window) => Some(window),
+            _ => None,
+        }
     }
 
     pub fn surface_under(
         &self,
         position: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let (window, location) = self.space.element_under(position)?;
-        window
-            .surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
-            .map(|(surface, offset)| (surface, (offset + location).to_f64()))
+        self.under(position)
+            .map(|(_, surface, location)| (surface, location))
+    }
+
+    /// The topmost thing at `position`, with its surface and where that surface begins. A locked
+    /// session has nothing but lock surfaces.
+    pub fn under(
+        &self,
+        position: Point<f64, Logical>,
+    ) -> Option<(Target, WlSurface, Point<f64, Logical>)> {
+        let monitor = self.monitor_at(position);
+        if self.lock.is_active() {
+            let area = self.monitor_area(monitor?)?;
+            let root = self.lock.surface_on(&self.monitors[monitor?].output)?;
+            let origin = Point::<i32, Logical>::from((area.x, area.y));
+            let relative = position - origin.to_f64();
+            let (surface, offset) =
+                under_from_surface_tree(&root, relative, (0, 0), WindowSurfaceType::ALL)?;
+            return Some((Target::Lock, surface, (offset + origin).to_f64()));
+        }
+
+        let LayerTiers { above, below } =
+            monitor.map_or_else(LayerTiers::default, |index| self.layer_tiers(index));
+        let on_layer = |entries: &[LayerEntry]| {
+            entries.iter().find_map(|entry| {
+                let relative = position - entry.location.to_f64();
+                let kind = match entry.part {
+                    LayerPart::Whole => WindowSurfaceType::ALL,
+                    LayerPart::Surface => {
+                        WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE
+                    }
+                    LayerPart::Popups => WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE,
+                };
+                let (surface, offset) = entry.layer.surface_under(relative, kind)?;
+                let location = (offset + entry.location).to_f64();
+                Some((Target::Layer(entry.layer.clone()), surface, location))
+            })
+        };
+        on_layer(&above)
+            .or_else(|| {
+                let (window, location) = self.space.element_under(position)?;
+                let relative = position - location.to_f64();
+                let (surface, offset) = window.surface_under(relative, WindowSurfaceType::ALL)?;
+                let location = (offset + location).to_f64();
+                Some((Target::Window(window.clone()), surface, location))
+            })
+            .or_else(|| on_layer(&below))
     }
 
     /// The nearest point to `location` on any output. Without outputs, `location` itself.
@@ -818,6 +1142,25 @@ impl Wirbel {
     pub fn time(&self) -> Duration {
         self.start_time.elapsed()
     }
+}
+
+/// Whether a surface has content to show.
+pub(crate) fn has_buffer(surface: &WlSurface) -> bool {
+    with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
+}
+
+/// Sends the scale and transform of `output` to `surface`, as far as they changed.
+pub(crate) fn apply_output_scale(surface: &WlSurface, states: &SurfaceData, output: &Output) {
+    let scale = output.current_scale();
+    send_surface_state(
+        surface,
+        states,
+        scale.integer_scale(),
+        output.current_transform(),
+    );
+    with_fractional_scale(states, |fractional| {
+        fractional.set_preferred_scale(scale.fractional_scale());
+    });
 }
 
 fn border_edges(tile: Rect, width: i32, color: [f32; 4]) -> impl Iterator<Item = BorderEdge> {

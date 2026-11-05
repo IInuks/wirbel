@@ -202,7 +202,7 @@ impl Wirbel {
         };
         let (dx, dy) = (location.x - drag.start.x, location.y - drag.start.y);
         let (dx, dy) = (dx.round() as i32, dy.round() as i32);
-        let area = self.monitor_area(m);
+        let area = self.work_area(m);
         let gaps = self.config.gaps;
         let workspace = &mut self.monitors[m].workspaces[w];
 

@@ -21,11 +21,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 git = "https://github.com/Smithay/smithay"
 rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca"
 default-features = false
-features = ["backend_winit", "desktop", "wayland_frontend"]
+features = ["backend_drm", "backend_winit", "desktop", "wayland_frontend"]
 
 [dev-dependencies]
+rustix = { version = "1", features = ["pipe"] }
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [dev-dependencies.smithay]
 git = "https://github.com/Smithay/smithay"

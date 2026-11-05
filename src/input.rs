@@ -10,10 +10,10 @@ use smithay::{
         keyboard::FilterResult,
         pointer::{AxisFrame, ButtonEvent},
     },
-    utils::{Logical, Point, SERIAL_COUNTER},
+    utils::{Logical, Point, SERIAL_COUNTER, Serial},
 };
 
-use crate::Wirbel;
+use crate::{Wirbel, state::Target};
 
 impl Wirbel {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
@@ -47,8 +47,16 @@ impl Wirbel {
         }
     }
 
-    /// Binds take the key from clients, press and release alike.
+    /// The user did something, so the session is not idle.
+    fn note_activity(&mut self) {
+        let seat = self.seat.clone();
+        self.idle_notifier_state.notify_activity(&seat);
+    }
+
+    /// Binds take the key from clients, press and release alike. A locked session has no binds:
+    /// every key belongs to the lock screen.
     pub fn on_key(&mut self, key: Keycode, state: KeyState, time: InputTime) {
+        self.note_activity();
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
@@ -60,6 +68,7 @@ impl Wirbel {
             serial,
             time,
             |wirbel, modifiers, handle| match state {
+                KeyState::Pressed if wirbel.lock.is_active() => FilterResult::Forward,
                 KeyState::Pressed => {
                     let action = wirbel.config.action_for_key(modifiers.into(), &handle);
                     match action.cloned() {
@@ -88,12 +97,17 @@ impl Wirbel {
     }
 
     pub fn on_pointer_motion(&mut self, location: Point<f64, Logical>, time: InputTime) {
+        self.note_activity();
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
         let location = self.move_pointer(location, time);
-        if let Some(monitor) = self.monitor_at(location) {
+        if let Some(monitor) = self.monitor_at(location)
+            && monitor != self.active_monitor
+        {
             self.active_monitor = monitor;
+            // The keyboard of a locked session follows to the lock surface of this monitor.
+            self.update_keyboard_focus();
         }
 
         if self.drag.is_some() {
@@ -107,27 +121,19 @@ impl Wirbel {
         }
     }
 
-    /// A press focuses and raises the window under the pointer. If a mouse bind applies, it
-    /// starts a drag instead of reaching the client.
+    /// A press focuses and raises the window under the pointer, or gives a layer surface that
+    /// wants it the keyboard. If a mouse bind applies, it starts a drag instead of reaching the
+    /// client. A press that ends a popup grab does all of that too, once the grab is over.
     pub fn on_pointer_button(&mut self, button: u32, state: ButtonState, time: InputTime) {
+        self.note_activity();
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
-        if state == ButtonState::Pressed
-            && !pointer.is_grabbed()
-            && let Some(window) = self.window_at(pointer.current_location())
-        {
-            self.set_focus(Some(window.clone()));
-            let modifiers = self
-                .seat
-                .get_keyboard()
-                .map(|keyboard| (&keyboard.modifier_state()).into());
-            let action =
-                modifiers.and_then(|modifiers| self.config.action_for_button(modifiers, button));
-            if let Some(action) = action {
-                self.start_mouse_drag(window, action, button, serial);
-            }
+        let pressed = state == ButtonState::Pressed;
+        let popup_grab = self.popup_grab.is_some();
+        if pressed && !pointer.is_grabbed() {
+            self.press(Some(button), serial);
         }
         pointer.button(
             self,
@@ -143,10 +149,46 @@ impl Wirbel {
             self.finish_drag();
             // A click grab leaves the focus on its client, wherever the pointer went meanwhile.
             self.update_pointer_focus();
+            if pressed && popup_grab {
+                // The client has this press already, so no bind can claim it.
+                self.end_popup_grab();
+                self.press(None, serial);
+            }
+        }
+    }
+
+    /// What a press does apart from reaching the client. `button` is the one binds may claim.
+    fn press(&mut self, button: Option<u32>, serial: Serial) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        match self.under(pointer.current_location()).map(|under| under.0) {
+            Some(Target::Window(window)) => {
+                self.set_focus(Some(window.clone()));
+                let modifiers = self
+                    .seat
+                    .get_keyboard()
+                    .map(|keyboard| (&keyboard.modifier_state()).into());
+                if let (Some(button), Some(modifiers)) = (button, modifiers)
+                    && let Some(action) = self.config.action_for_button(modifiers, button)
+                {
+                    self.start_mouse_drag(window, action, button, serial);
+                }
+            }
+            Some(Target::Layer(layer)) if layer.can_receive_keyboard_focus() => {
+                self.layer_focus = Some(layer);
+                self.update_keyboard_focus();
+            }
+            Some(Target::Lock) => {}
+            _ => {
+                self.layer_focus = None;
+                self.update_keyboard_focus();
+            }
         }
     }
 
     pub fn on_pointer_axis(&mut self, scroll: Scroll) {
+        self.note_activity();
         let mut frame = AxisFrame::new(scroll.time).source(scroll.source);
         for (axis, amount, discrete) in [
             (Axis::Horizontal, scroll.horizontal.0, scroll.horizontal.1),
