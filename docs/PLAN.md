@@ -58,6 +58,15 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
 - Fenster bekommen per `xdg-activation` nur den Fokus, wenn der Token von einem frischen Eingabe-Event
   des Clients mit der Tastatur stammt, sein Workspace kommt dann nach vorn. Sonst passiert nichts: Eine
   Glocke in kitty stiehlt keinen Fokus. `_NET_ACTIVE_WINDOW` folgt derselben Regel, aus X11 heraus.
+- Screenshots gehen mit grim und flameshot (`wlr-screencopy` und `ext-image-copy-capture`), Bildschirm
+  teilen über xdg-desktop-portal-wlr und PipeWire. Ein gesperrter Bildschirm zeigt auch in einer Aufnahme
+  nur die Sperre. Geteilt werden ganze Ausgänge, keine einzelnen Fenster: xdg-desktop-portal-wlr bietet das
+  nur mit `ext-foreign-toplevel-list` und Fenster-Quellen an, die fehlen.
+- Fensterlisten (`wlr-foreign-toplevel-management`) sehen alle Fenster, auch auf versteckten Workspaces, und
+  können sie fokussieren, schließen, maximieren und in den Vollbildmodus setzen. Minimieren tut nichts.
+- Zwischenablage-Manager lesen und setzen Clipboard und Primary über `wlr-data-control`, auch ohne Fenster.
+- Für Programme muss die Sitzung `XDG_SESSION_TYPE=wayland` und `XDG_CURRENT_DESKTOP` setzen: Chromium und
+  Electron teilen sonst nicht über PipeWire, das Portal findet sonst sein Backend nicht. Das ist Etappe 8.
 
 ## Stil
 Minimal heißt: keine Animationen, kein Blur, keine Fensterdeko außer Rahmen und Lücke, keine
@@ -120,11 +129,25 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
   Tooltips, die sich selbst platzieren. `settle_x11_windows` läuft nach jeder Loop-Iteration, weil der erste
   Buffer vor der Zuordnung zum X-Fenster ankommen kann. X11 kennt kein Ack: Ein Commit zählt in
   `floating_commit` nur, wenn seine Größe zum letzten Configure passt.
+- `src/handlers/screencopy.rs`: Eine Aufnahme liest nie, was zum Bildschirm ging: Ein Client auf dem Primary
+  Plane ist in keinem unserer Bilder, der Hardware-Cursor auch nicht, und nach der Kopie auf die andere GPU
+  käme man nicht mehr heran. `Capturer` zeichnet die Szene darum noch einmal in eine eigene Textur, auf der
+  Render-GPU, einmal mit und einmal ohne Cursor (`Kind::Cursor`). Die Textur bleibt, ein Damage-Tracker
+  zeichnet nur Änderungen. Das Backend ruft `Capturer::run` nach jedem Bild eines Ausgangs; wer wartet, liegt
+  bis dahin in `ScreencopyState::queue`. `copy` verlangt ein Bild, `copy_with_damage` und ext-Frames warten auf
+  eine Änderung seit dem letzten Blick dieses Clients (Zähler `generation` gegen `Seen`). Damit läuft ein
+  Stream bei stillem Bild nicht weiter. Beide Protokolle sind nötig: grim und ältere Clients kennen
+  `wlr-screencopy`, xdg-desktop-portal-wlr 0.8.4 braucht `ext-image-copy-capture`, weil es nur dort nach einem
+  Bild `pw_stream_trigger_process` ruft. Auf `wlr-screencopy` bleibt sein Stream nach einem Bild stehen. Nur
+  shm, das Zurücklesen läuft in der Hauptschleife: nested 1259x675 im Mittel 2,4 ms, p95 8,3 ms, bei
+  2560x1440 also etwa das Vierfache. Der Weg über dmabufs ist offen, siehe Etappe 9.
+- `src/handlers/foreign_toplevel.rs`: `refresh_foreign_toplevels` vergleicht nach jeder Loop-Iteration die Fenster
+  mit dem, was Clients zuletzt erfuhren, sonst muss niemand im Compositor davon wissen.
 - `src/handlers/`: Wayland-Protokolle. `layer_shell.rs`: ein Layer liegt bis zum ersten Commit in
   `unmapped_layers`, ein Commit ohne Buffer schickt ihn dorthin zurück, und der Client beginnt von
   vorn, wie das Protokoll es verlangt. `session_lock.rs`: `Phase` Unlocked, Locking (wartet auf ein
   präsentiertes leeres Bild je Ausgang), Locked. Der `locked`-Event geht erst danach raus, gesperrt
-  ist aber schon ab der Anfrage. `selection.rs`: Clipboard, primary selection, Drag and Drop.
+  ist aber schon ab der Anfrage. `selection.rs`: Clipboard, primary selection, Drag and Drop, `wlr-data-control`.
   `mod.rs`: der Rest, darunter `offer_dmabufs`. Idle: `ext-idle-notify` gehört mit dazu, ohne ihn
   hätte `idle-inhibit` keine Wirkung. Ein Inhibitor zählt nur, solange seine Surface sichtbar ist.
   Lebenslauf eines Toplevels: erster Commit platziert es,
@@ -200,6 +223,15 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
 - Die nested Maus liefert nur absolute Positionen. Relative Bewegung und Sperren prüft `on_pointer_delta`
   in `tests/headless.rs`, die echte Maus `docs/pointer-test.html` im TTY-Nachtest.
 - Prozesse immer per gemerkter PID beenden: `pgrep -f MUSTER` trifft auch die eigene Shell.
+- Portal-Tests nie auf einem normalen `dbus-run-session`, in keinem Stratum: Der aktiviert
+  `xdg-document-portal`, und der laufenden Sitzung ging dabei der Mount `$XDG_RUNTIME_DIR/doc` samt ihrem Portal
+  verloren (Session 07). `docs/tty-dbus.conf` hat keine Service-Verzeichnisse, `docs/tty-portals.sh` startet von
+  Hand. Mangos `start-portals` nie aufrufen: Es beendet Portale nach Muster.
+- Screenshare ohne Klick prüfen: Es gibt hier kein `pipewiresrc`. Ein kleiner Client (dbus-python aus Debian,
+  `CreateSession`, `SelectSources`, `Start`, `OpenPipeWireRemote`) reicht den Stream an ein `pw_stream`-Programm
+  weiter, Header und gcc liegen in Arch. `pw-top` zeigt, ob der Graph läuft. In Chromium kommt man nur
+  mit Klicks durch den Dialog. Nested liefert `wl_output` Flipped180: grim dreht das zurück, Chromium nicht, ein
+  Stream steht dort auf dem Kopf. Mit Transform Normal wie auf dem DRM-Backend war grim aufrecht.
 - Mit `WAYLAND_DISPLAY=wayland-N ./target/debug/wirbel pos` bzw. `move` lässt sich die Nested-Instanz
   von außen steuern, ohne die Maus des Nutzers zu bewegen. Der Socket steht im Log.
 
@@ -215,9 +247,13 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
    Multi-GPU (Monitor an RTX 4070S, iGPU AMD). Echter Test nur mit Nutzer, siehe unten.
 6. XWayland (Smithay xwm): Steam, Discord, Spiele; pointer-constraints, relative-pointer,
    tearing/direct scanout für Fullscreen-Spiele.
-7. Screenshots/Screenshare: wlr-screencopy, foreign-toplevel, xdg-desktop-portal, flameshot/grim.
+7. Screenshots/Screenshare: wlr-screencopy, ext-image-copy-capture, foreign-toplevel, wlr-data-control,
+   xdg-desktop-portal, flameshot/grim.
 8. Session: `wirbel-session`, Autostart, Eintrag für quickdots-Greeter, Doku, Migration von Mango.
 9. Härtung: Review, Absturzpfade, Leaks, Client-Fehlverhalten, Performance.
+
+Für Etappe 9 offen: Screencopy auf dmabufs, damit das Zurücklesen die Hauptschleife nicht anhält. Für Etappe 8:
+PipeWire, WirePlumber und Portale gehören in den Autostart. Portale laufen aus Arch, weil Void keine hat.
 
 Sessions dürfen Etappen teilen oder verschmelzen; der Manager führt die Reihenfolge in
 `chain/QUEUE.md`.

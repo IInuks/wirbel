@@ -72,13 +72,16 @@ strat void ./target/debug/wirbel --config /tmp/wirbel-nvidia.conf --timeout 20 -
 Erwartet: Bild mit kitty, Exit 0. Fühlt sich etwas ruckelig an (Zeiger, Scrollen in kitty), bitte
 notieren, und bei welcher GPU.
 
-## Nachtest nach Etappe 6
+## Nachtest nach Etappe 6 und 7
 
-`~/WM/docs/tty-run.sh nach` startet nur die Tests 11 bis 17 und schreibt nach
+`~/WM/docs/tty-run.sh nach` startet nur die Tests 11 bis 21 und schreibt nach
 `~/wirbel-test/ergebnis.txt`, dazu die wichtigen Log-Zeilen. Die Tests 1 bis 10 sind bestanden und
 müssen nicht wiederholt werden. Geprüft wird, was nested nicht geht: X11-Programme auf dem echten
 Schirm, Zeiger-Sperre und relative Bewegung mit der echten Maus (`docs/pointer-test.html`), Vollbild,
-Steam mit einem Spiel, `wirbel pos` mit Strg+C und `wirbel move`.
+Steam mit einem Spiel, `wirbel pos` mit Strg+C und `wirbel move`. Dazu Screenshots mit grim (Test 18) und
+flameshot (19), Bildschirm teilen in Chromium (20) und Discord (21). Für 20 und 21 muss Mango auf tty7 laufen,
+PipeWire kommt von dort, und Discord muss dort beendet sein. Die Portale laufen in einem eigenen D-Bus
+(`docs/tty-dbus.conf`) und berühren die von Mango nicht. Vor dem Test einmal bauen.
 
 ## Was du mitbringen sollst
 

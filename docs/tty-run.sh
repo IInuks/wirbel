@@ -1,6 +1,6 @@
 #!/bin/bash
 # Führt durch docs/TTY-TEST.md. Auf einem freien TTY starten: ~/WM/docs/tty-run.sh
-# Nur der Nachtest für XWayland, Spiele und Zeiger: ~/WM/docs/tty-run.sh nach
+# Nur der Nachtest für XWayland, Spiele, Zeiger, Screenshot und Screenshare: ~/WM/docs/tty-run.sh nach
 cd "$HOME/WM" || exit 1
 OUT=$HOME/wirbel-test; mkdir -p "$OUT"; R=$OUT/ergebnis.txt
 BIN=./target/debug/wirbel; CONF=docs/tty-test.conf
@@ -23,13 +23,17 @@ Notaus, wenn etwas haengt oder schwarz bleibt:
   3. Strg+Alt+F7 geht zu Mango, Strg+Alt+F3 zurueck hierher.
 Danach laeuft das Skript von selbst weiter.
 T
+RUN="strat void"
+# Test 18 und mehr: mit eigenem D-Bus, sonst sehen die Portale nichts. Siehe docs/tty-dbus.conf.
+RUNBUS="strat void dbus-run-session --config-file=$HOME/WM/docs/tty-dbus.conf --"
+PORTALS="$HOME/WM/docs/tty-portals.sh $HOME/WM/docs/tty-xdpw.conf"
 t() { # Nummer, erwartete Exit-Zahl, Anweisung, Argumente...
   n=$1; want=$2; say=$3; shift 3
   echo; echo "--- Test $n ---"; echo "$say"
   read -r -p "Enter = los, s = ueberspringen, q = Ende: " a
   [ "$a" = q ] && fini
   [ "$a" = s ] && { echo "Test $n uebersprungen" >> "$R"; return; }
-  strat void $BIN --config "$CONF" "$@"; got=$?
+  $RUN $BIN --config "$CONF" "$@"; got=$?
   stty sane 2>/dev/null
   cp ~/.local/state/wirbel/wirbel.log "$OUT/test$n.log" 2>/dev/null
   if [ "$got" = "$want" ]; then s=ok; else s="FALSCH (erwartet $want)"; fi
@@ -38,7 +42,7 @@ t() { # Nummer, erwartete Exit-Zahl, Anweisung, Argumente...
   echo "Test $n exit $got $s; ${note:-sah gut aus}" >> "$R"
 }
 fini() {
-  grep -hE 'direct scanout|explicit sync|Xwayland (is ready|died|went)|no dmabuf' "$OUT"/test1[1-7].log >> "$R" 2>/dev/null
+  grep -hE 'direct scanout|explicit sync|Xwayland (is ready|died|went)|no dmabuf|screen capture' "$OUT"/test[12][0-9].log >> "$R" 2>/dev/null
   echo; echo "Fertig. Ergebnis in $R"
   echo "Kernel-Log sichern (fragt evtl. nach deinem Passwort):"
   sudo dmesg | tail -n 200 > "$OUT/dmesg.txt"
@@ -74,4 +78,18 @@ t 15 0 "Vollbild, die NVIDIA rendert: Bild ok? Langsam ist hier normal, die Clie
 CONF=docs/tty-test.conf
 t 16 0 "Steam: Startet es, gehen Menues und Einstellungen? Starte ein Spiel mit Mausblick: Blick dreht sich endlos, Fenster ist Vollbild, Alt+Tab-Ersatz ueber deine Binds geht. Notiere die FPS. Endet nach 5 Minuten selbst, Strg+Alt+Shift+Ruecktaste bricht ab (dann steht hier 70, das ist ok)." --timeout 300 -c steam
 t 17 0 "Offen aus Test 1: Im kitty 'target/debug/wirbel pos' starten, Maus bewegen: Zahl laeuft. Strg+C: Befehl endet, Fenster bleibt offen. Dann 'target/debug/wirbel move 500 500': Zeiger springt. Endet nach 60 s selbst." --timeout 60 -c kitty
+
+# Screenshots und Screenshare aus Session 07. Nested ist das Bild gespiegelt und der Schirm klein,
+# hier zaehlt der echte Bildschirm. Die Bilder landen in $OUT, Claude schaut sie sich an.
+rm -f "$OUT"/shot-*.png
+[ -S "$XDG_RUNTIME_DIR/pipewire-0" ] || echo "PipeWire laeuft nicht. Es kommt aus der Mango-Sitzung auf tty7. Ohne sie gehen die Tests 20 und 21 nicht."
+SHOT="sleep 4; grim $OUT/shot-grim.png; grim -c -g '100,100 800x600' $OUT/shot-grim-teil.png; kitty --hold sh -c 'ls -l $OUT/shot-grim*.png; echo; echo Fertig wenn hier ZWEI Zeilen stehen'"
+t 18 0 "Screenshot mit grim, von selbst, du tippst nichts. Du siehst: Zuerst nur links ein kitty mit einer Eingabezeile. Nach 4 Sekunden geht rechts ein ZWEITES kitty auf, darin stehen zwei Zeilen mit shot-grim.png und shot-grim-teil.png und darunter 'Fertig wenn hier ZWEI Zeilen stehen'. Mehr passiert nicht. Endet nach 12 s selbst." --timeout 12 -c kitty -c "$SHOT"
+ls -l "$OUT"/shot-grim*.png >> "$R" 2>&1
+RUN=$RUNBUS
+t 19 0 "Flameshot. Du siehst: Ein kitty fuellt den Schirm, darin steht ein Text. Nach 3 Sekunden wird der ganze Schirm dunkler, mittig eine Hilfe-Box in Lila, links ein schmaler lila Reiter 'Tool Settings'. Ziehe mit gedrueckter linker Maustaste ein Rechteck: Es bleibt hell, drumherum dunkel, am Rand erscheinen runde Knoepfe. Druecke Strg+C: Das Dunkle verschwindet, du siehst wieder das kitty. Endet nach 45 s selbst, auch wenn du nichts tust." --timeout 45 -c "$PORTALS" -c "kitty sh -c 'echo Dieser Text kommt im Screenshot vor; sleep 60'" -c "sleep 2; XDG_CURRENT_DESKTOP=wlroots QT_QPA_PLATFORM=wayland flameshot gui"
+SHARE="chromium --user-data-dir=$OUT/chromium --no-first-run --no-default-browser-check --password-store=basic --ozone-platform=wayland --enable-features=WebRTCPipeWireCapturer file://$HOME/WM/docs/share-test.html"
+t 20 0 "Screenshare wie bei Discord. Du siehst: Chromium mit dunkelblauer Seite, oben links der Knopf 'Teilen starten', daneben 'Noch nichts geteilt.', darunter eine schwarze Flaeche. Mach das: 1. 'Teilen starten' klicken: Ein weisser Dialog 'Choose what to share' kommt. 2. Oben im Dialog den Reiter 'Entire Screen' klicken: Ein kleines Vorschaubild deines Schirms erscheint, Text 'Entire screen'. 3. Das Vorschaubild anklicken, dann unten rechts 'Share'. Danach: Die schwarze Flaeche zeigt deinen Schirm, darin wieder die Seite, immer kleiner ineinander wie ein Tunnel, AUFRECHT, nicht auf dem Kopf. Oben steht jetzt '2560 x 1440, Bild N', und N zaehlt hoch, solange sich etwas bewegt. Eine kleine Leiste 'is sharing your screen' mit 'Stop sharing' schwebt mittig, das ist normal. Bewege die Maus im Bild: Laeuft sie auch im Tunnel mit? Ruckelt deine echte Maus dabei? Notiere das. Endet nach 90 s selbst." --timeout 90 -c "$PORTALS" -c "sleep 2; XDG_SESSION_TYPE=wayland exec $SHARE"
+t 21 0 "Screenshare in Discord. Laeuft Discord noch in Mango, beende es dort vorher ganz, sonst kommt hier kein Fenster. Du siehst: Discord oeffnet sich, das dauert etwas. Gehe in einen Sprachkanal, klicke auf 'Bildschirm teilen', waehle deinen Bildschirm, starte den Stream. Ergebnis: In Discord erscheint die Vorschau deines Streams, und sie bewegt sich mit. Wenn du es nicht ausprobieren magst: s fuer ueberspringen. Endet nach 4 Minuten selbst, Strg+Alt+Shift+Ruecktaste bricht ab (dann steht hier 70, das ist ok)." --timeout 240 -c "$PORTALS" -c "sleep 2; XDG_SESSION_TYPE=wayland exec $HOME/.local/bin/discord --enable-features=WebRTCPipeWireCapturer --ozone-platform=wayland"
+RUN="strat void"
 fini
