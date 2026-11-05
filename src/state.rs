@@ -26,8 +26,7 @@ use smithay::{
     output::Output,
     reexports::{
         calloop::{
-            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken,
-            generic::Generic,
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
         },
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
@@ -68,7 +67,7 @@ use smithay::{
         xdg_activation::XdgActivationState,
         xwayland_shell::XWaylandShellState,
     },
-    xwayland::{X11Surface, X11Wm, xwm::WmWindowType},
+    xwayland::{X11Surface, X11Wm, XWayland, xwm::WmWindowType},
 };
 
 use crate::{
@@ -675,7 +674,11 @@ impl Wirbel {
             return;
         };
         let area = self.work_area(m);
-        let settled = window.toplevel().is_none_or(answered_last_size);
+        let settled = match window.x11_surface() {
+            // X has no way of saying that a commit answers a configure, only the size tells.
+            Some(surface) => surface.bbox().size == surface.last_configure().size,
+            None => window.toplevel().is_some_and(answered_last_size),
+        };
         let dragged = self
             .drag
             .as_ref()
@@ -1415,8 +1418,8 @@ pub struct XwaylandState {
     /// The display number. Known from the start: clients may connect before the server is up, and
     /// wait for it.
     pub display: Option<u32>,
-    /// The event source, which owns the server.
-    pub source: Option<RegistrationToken>,
+    /// Dropping this ends the server.
+    pub server: Option<XWayland>,
     /// When it was started, to give up on a server that keeps dying.
     pub starts: Vec<Instant>,
 }

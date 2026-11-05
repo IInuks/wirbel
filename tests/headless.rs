@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicU32, Ordering},
         mpsc,
     },
@@ -36,7 +36,7 @@ use smithay::{
 };
 use smithay::{
     reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback as server_feedback,
-    wayland::presentation::Refresh,
+    wayland::{pointer_constraints::with_pointer_constraint, presentation::Refresh},
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop,
@@ -140,7 +140,7 @@ use x11rb::{
         Event,
         xproto::{
             AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
-            EventMask, PropMode, WindowClass,
+            EventMask, GrabMode, GrabStatus, PropMode, WindowClass,
         },
     },
     rust_connection::RustConnection,
@@ -5958,14 +5958,17 @@ fn presentation_feedback_answers_with_the_frame_that_shows_the_surface() {
 
 /// A compositor with a running X server and an X client of it, or `None` on a machine without
 /// Xwayland, where there is nothing to test.
-fn with_x_server() -> Option<(Compositor, RustConnection, u32)> {
+fn with_x_server() -> Option<(Compositor, RustConnection, u32, MutexGuard<'static, ()>)> {
+    // A real session has one server. Several that come and go here trip over each other's sockets.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|err| err.into_inner());
     let compositor = Compositor::start();
     compositor.with(Wirbel::start_xwayland);
     let display = compositor.with(|state| state.xwayland.display)?;
     wait_for(|| compositor.with(|state| state.xwm.is_some()));
     let (connection, screen) = x11rb::connect(Some(&format!(":{display}"))).unwrap();
     let root = connection.setup().roots[screen].root;
-    Some((compositor, connection, root))
+    Some((compositor, connection, root, turn))
 }
 
 /// Opens an X11 window. With `override_redirect` it is a menu, without one a normal window.
@@ -6043,7 +6046,7 @@ fn kill_x_server(display: u32) {
 
 #[test]
 fn an_x11_window_is_tiled_gets_the_keyboard_and_closes() {
-    let Some((compositor, connection, root)) = with_x_server() else {
+    let Some((compositor, connection, root, _turn)) = with_x_server() else {
         return;
     };
     let window = x_window(&connection, root, false);
@@ -6077,7 +6080,7 @@ fn an_x11_window_is_tiled_gets_the_keyboard_and_closes() {
 
 #[test]
 fn x11_and_wayland_windows_share_a_workspace() {
-    let Some((compositor, connection, root)) = with_x_server() else {
+    let Some((compositor, connection, root, _turn)) = with_x_server() else {
         return;
     };
     let mut client = Client::connect(&compositor);
@@ -6102,7 +6105,7 @@ fn x11_and_wayland_windows_share_a_workspace() {
 
 #[test]
 fn an_x11_menu_stays_out_of_the_tiling() {
-    let Some((compositor, connection, root)) = with_x_server() else {
+    let Some((compositor, connection, root, _turn)) = with_x_server() else {
         return;
     };
     let mut client = Client::connect(&compositor);
@@ -6128,7 +6131,7 @@ fn an_x11_menu_stays_out_of_the_tiling() {
 
 #[test]
 fn an_x11_window_can_go_fullscreen() {
-    let Some((compositor, connection, root)) = with_x_server() else {
+    let Some((compositor, connection, root, _turn)) = with_x_server() else {
         return;
     };
     let window = x_window(&connection, root, false);
@@ -6160,9 +6163,61 @@ fn an_x11_window_can_go_fullscreen() {
     );
 }
 
+/// Games on X11 grab the pointer, and Xwayland turns that into a pointer constraint.
+#[test]
+fn an_x11_pointer_grab_confines_the_pointer() {
+    let Some((compositor, connection, root, _turn)) = with_x_server() else {
+        return;
+    };
+    let window = x_window(&connection, root, false);
+    wait_for(|| compositor.focused_rect().is_some());
+    compositor.pointer_at(100.0, 100.0);
+
+    let grab = |confine: u32| {
+        connection
+            .grab_pointer(
+                false,
+                window,
+                EventMask::POINTER_MOTION,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                confine,
+                0u32,
+                0u32,
+            )
+            .unwrap()
+            .reply()
+            .unwrap()
+            .status
+    };
+    wait_for(|| grab(window) == GrabStatus::SUCCESS);
+    let constrained = || {
+        compositor.with(|state| {
+            let pointer = state.seat.get_pointer().unwrap();
+            let Some(surface) = pointer.current_focus() else {
+                return false;
+            };
+            with_pointer_constraint(&surface, &pointer, |constraint| {
+                constraint.is_some_and(|constraint| constraint.is_active())
+            })
+        })
+    };
+    wait_for(constrained);
+    assert_eq!(compositor.pointer_location(), (100.0, 100.0));
+
+    let rect = compositor.focused_rect().unwrap();
+    compositor.pointer_delta(f64::from(WIDTH) * 3.0, 0.0);
+    let (x, _) = compositor.pointer_location();
+    assert!(x < f64::from(rect.x + rect.w), "pointer left: {x}");
+
+    connection.ungrab_pointer(0u32).unwrap();
+    connection.flush().unwrap();
+    wait_for(|| !constrained());
+}
+
 #[test]
 fn a_dialog_of_x11_floats_and_may_move() {
-    let Some((compositor, connection, root)) = with_x_server() else {
+    let Some((compositor, connection, root, _turn)) = with_x_server() else {
         return;
     };
     let main = x_window(&connection, root, false);
@@ -6211,7 +6266,7 @@ fn a_dialog_of_x11_floats_and_may_move() {
 
 #[test]
 fn a_dead_x_server_takes_its_windows_along_and_comes_back() {
-    let Some((compositor, connection, root)) = with_x_server() else {
+    let Some((compositor, connection, root, _turn)) = with_x_server() else {
         return;
     };
     x_window(&connection, root, false);

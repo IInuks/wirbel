@@ -72,6 +72,14 @@ strat void ./target/debug/wirbel --config /tmp/wirbel-nvidia.conf --timeout 20 -
 Erwartet: Bild mit kitty, Exit 0. Fühlt sich etwas ruckelig an (Zeiger, Scrollen in kitty), bitte
 notieren, und bei welcher GPU.
 
+## Nachtest nach Etappe 6
+
+`~/WM/docs/tty-run.sh nach` startet nur die Tests 11 bis 17 und schreibt nach
+`~/wirbel-test/ergebnis.txt`, dazu die wichtigen Log-Zeilen. Die Tests 1 bis 10 sind bestanden und
+müssen nicht wiederholt werden. Geprüft wird, was nested nicht geht: X11-Programme auf dem echten
+Schirm, Zeiger-Sperre und relative Bewegung mit der echten Maus (`docs/pointer-test.html`), Vollbild,
+Steam mit einem Spiel, `wirbel pos` mit Strg+C und `wirbel move`.
+
 ## Was du mitbringen sollst
 
 Nach einem Fehler sofort, denn der nächste Start verschiebt das Log nach `wirbel.log.old`:

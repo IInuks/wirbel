@@ -11,6 +11,8 @@ use std::{
 };
 
 const NAME: &str = "Xwayland";
+/// Inside a stratum. Plain `Xwayland` would find the shim again.
+const IN_STRATUM: &str = "/usr/bin/Xwayland";
 const CROSS: &str = "/bedrock/cross/bin/Xwayland";
 const STRATA: &str = "/bedrock/strata";
 const STRAT: &str = "/bedrock/bin/strat";
@@ -44,7 +46,8 @@ impl Binary {
     }
 
     /// Smithay only ever runs `Xwayland` from the `PATH`. A script of that name in a directory of
-    /// its own makes that this binary. Xwayland keeps running after the directory is gone.
+    /// its own makes that this binary. The shell reads the script after the spawn, so it has to
+    /// stay until the server is up or dead.
     pub fn shim(&self, directory: &Path) -> io::Result<Option<OsPath>> {
         if self.is_plain() {
             return Ok(None);
@@ -80,7 +83,11 @@ fn candidates(strata: &[String]) -> Vec<Binary> {
     let mut list = vec![Binary::of(&[NAME]), Binary::of(&[CROSS])];
     let mut strata: Vec<&str> = strata.iter().map(String::as_str).collect();
     strata.sort_by_key(|stratum| *stratum != "arch");
-    list.extend(strata.into_iter().map(|s| Binary::of(&[STRAT, s, NAME])));
+    list.extend(
+        strata
+            .into_iter()
+            .map(|s| Binary::of(&[STRAT, s, IN_STRATUM])),
+    );
     list
 }
 
@@ -125,8 +132,17 @@ mod tests {
         let list = candidates(&strata);
         assert!(list[0].is_plain());
         assert_eq!(list[1], Binary::of(&[CROSS]));
-        assert_eq!(list[2], Binary::of(&[STRAT, "arch", NAME]));
-        assert_eq!(list[3], Binary::of(&[STRAT, "debian", NAME]));
+        assert_eq!(list[2], Binary::of(&[STRAT, "arch", IN_STRATUM]));
+        assert_eq!(list[3], Binary::of(&[STRAT, "debian", IN_STRATUM]));
+    }
+
+    /// The shim stays on the `PATH`, so a plain name would land in it again, forever.
+    #[test]
+    fn every_candidate_but_the_first_names_its_binary_in_full() {
+        let list = candidates(&["arch".to_string()]);
+        for binary in &list[1..] {
+            assert!(binary.0.last().unwrap().starts_with('/'), "{binary:?}");
+        }
     }
 
     #[test]

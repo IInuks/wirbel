@@ -14,7 +14,10 @@ use std::{
 
 use smithay::{
     desktop::Window,
-    reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
+    reexports::{
+        calloop::{Interest, Mode, PostAction, generic::Generic},
+        wayland_server::{Client, protocol::wl_surface::WlSurface},
+    },
     utils::{Logical, Rectangle},
     wayland::{
         seat::WaylandFocus,
@@ -32,7 +35,7 @@ use smithay::{
         xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     },
     xwayland::{
-        X11Surface, X11Wm, XWayland, XWaylandEvent, XwmHandler,
+        X11Surface, X11Wm, XWayland, XwmHandler,
         xwm::{Reorder, ResizeEdge, XwmId},
     },
 };
@@ -87,38 +90,46 @@ impl Wirbel {
         }
     }
 
+    /// Smithay's event source for the server never reports a death during startup, and would spin
+    /// on the closed pipe. So this looks at the pipe itself.
     fn spawn_xwayland(&mut self, binary: &Binary) -> Result<(), Box<dyn std::error::Error>> {
         let directory = std::env::temp_dir().join(format!("wirbel-{}", std::process::id()));
         let path = binary.shim(&directory)?;
+        let shim = path.as_ref().map(|_| directory);
         let envs = path.iter().map(|path| ("PATH", path.0.clone()));
-        let spawned = XWayland::spawn(
+        let (server, client) = XWayland::spawn(
             &self.display_handle,
             None,
             envs,
             std::iter::empty::<&str>(),
             true,
             Stdio::null(),
-            Stdio::null(),
+            Stdio::inherit(),
             |_| {},
-        );
-        if path.is_some() {
-            std::fs::remove_dir_all(&directory)?;
-        }
-        let (server, client) = spawned?;
+        )?;
+        let pipe = server.poll_fd().try_clone_to_owned()?;
         self.xwayland.display = Some(server.display_number());
-        let source = self
-            .loop_handle
-            .insert_source(server, move |event, _, state| match event {
-                XWaylandEvent::Ready { x11_socket, .. } => {
-                    state.xwayland_ready(x11_socket, client.clone());
-                }
-                XWaylandEvent::Error => {
-                    tracing::error!("Xwayland died while starting");
-                    state.xwayland_gone();
-                }
-            })
+        self.xwayland.server = Some(server);
+        self.loop_handle
+            .insert_source(
+                Generic::new(pipe, Interest::READ, Mode::Level),
+                move |_, _, state| {
+                    if let Some(shim) = &shim {
+                        let _ = std::fs::remove_dir_all(shim);
+                    }
+                    let socket = state.xwayland.server.as_mut().map(XWayland::take_socket);
+                    match socket {
+                        Some(Ok(Some(socket))) => state.xwayland_ready(socket, client.clone()),
+                        // Readable and nothing to read: the other end is closed.
+                        _ => {
+                            tracing::error!("Xwayland died while starting");
+                            state.xwayland_gone();
+                        }
+                    }
+                    Ok(PostAction::Remove)
+                },
+            )
             .map_err(|err| err.error)?;
-        self.xwayland.source = Some(source);
         Ok(())
     }
 
@@ -150,9 +161,7 @@ impl Wirbel {
     fn xwayland_gone(&mut self) {
         self.xwm = None;
         self.xwayland.display = None;
-        if let Some(source) = self.xwayland.source.take() {
-            self.loop_handle.remove(source);
-        }
+        self.xwayland.server = None;
         let windows: Vec<Window> = self
             .monitors
             .iter()

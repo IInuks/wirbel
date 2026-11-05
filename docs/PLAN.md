@@ -48,6 +48,17 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
 - Fehlerhafte Zeilen: beim Start übersprungen und geloggt. Beim Neuladen verwirft ein einziger
   Fehler die ganze Datei, die laufende Config bleibt.
 
+- X11-Programme laufen über Xwayland, das mit dem Compositor startet. `DISPLAY` setzt wirbel nur für
+  eigene Kinder, `wirbel -c` wartet auf nichts, der Socket steht vor dem Server. X11-Fenster liegen in den
+  Workspaces wie alle anderen, Dialoge und Fenster fester Größe floaten, Floating-Fenster dürfen sich
+  selbst bewegen. Stirbt Xwayland, verschwinden seine Fenster und es startet neu, höchstens 3-mal pro
+  Minute. Option `xwayland`: `auto`, `off` oder ein Pfad. `wirbel check` zeigt, welches gefunden wurde.
+- Der Zeiger kann gesperrt oder eingesperrt werden, solange sein Fenster die Tastatur hat. `wirbel move`
+  gilt trotzdem: Der Zeiger bewegt sich, außerhalb der Surface endet die Sperre.
+- Fenster bekommen per `xdg-activation` nur den Fokus, wenn der Token von einem frischen Eingabe-Event
+  des Clients mit der Tastatur stammt, sein Workspace kommt dann nach vorn. Sonst passiert nichts: Eine
+  Glocke in kitty stiehlt keinen Fokus. `_NET_ACTIVE_WINDOW` folgt derselben Regel, aus X11 heraus.
+
 ## Stil
 Minimal heißt: keine Animationen, kein Blur, keine Fensterdeko außer Rahmen und Lücke, keine
 Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser Datei. Fenster malen
@@ -65,6 +76,13 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
   per dlopen, je nach Stratum) bis vor `Activate`. Karten nur lesend, ohne erzwungenen Probe, ein
   ungewollt zugefallener DRM-Master geht sofort zurück. Der Render-Test läuft auf Render-Nodes mit
   `MultiRenderer`, also genauso wie ein echtes Bild, bis auf den letzten Schritt zum Bildschirm.
+- `src/focus.rs`: `KeyboardFocus`, Wayland-Surface oder X11-Fenster. X11-Fenster müssen den Fokus auch auf
+  der X-Seite erfahren und haben anfangs noch keine Surface. Der Zeiger braucht das nicht, sein Ziel
+  bleibt die `WlSurface`.
+- `src/xwayland.rs`: findet das Binary: `PATH`, `/bedrock/cross/bin`, dann `strat STRATUM /usr/bin/Xwayland`,
+  jeder Kandidat muss `-version` schaffen. Smithay startet nur `Xwayland` aus dem `PATH`, ein anderes läuft
+  über ein Skript in einem eigenen Ordner, das bis zum Ready bleiben muss und den Namen nicht nochmal
+  per `PATH` auflösen darf.
 - `src/monitor.rs`: Mode-Wahl, Position, EDID-Name, frei von DRM-Typen. `src/cursor.rs`: Cursor-Thema,
   mit Adwaita und einem eingebauten Pfeil als Rückfall. Animierte Cursor zeigen ihr erstes Bild.
 - `src/layout/`: Dwindle-Baum und Geometrie, frei von Compositor-Typen. Die Split-Achse wird nicht
@@ -96,6 +114,12 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
   (`wirbel move` ginge sonst verloren). Wird ein Fenster oder Layer unsichtbar, zieht
   `dismiss_popups` seine Popups zurück, ein Fokuswechsel beendet den Grab. Popups von Fenstern
   bleiben in der `work_area`, Popups von Layern dürfen auf den ganzen Ausgang.
+- `src/handlers/xwayland.rs`: X11-Fenstermanager und Start von Xwayland. Die Startpipe liest wirbel selbst
+  (`take_socket`): Smithays Event-Quelle meldet einen Tod beim Start nicht und dreht auf der geschlossenen
+  Pipe. `retile` sagt X11-Fenstern Größe und Zustand (`configure_x11`), `overrides` hält Menüs und
+  Tooltips, die sich selbst platzieren. `settle_x11_windows` läuft nach jeder Loop-Iteration, weil der erste
+  Buffer vor der Zuordnung zum X-Fenster ankommen kann. X11 kennt kein Ack: Ein Commit zählt in
+  `floating_commit` nur, wenn seine Größe zum letzten Configure passt.
 - `src/handlers/`: Wayland-Protokolle. `layer_shell.rs`: ein Layer liegt bis zum ersten Commit in
   `unmapped_layers`, ein Commit ohne Buffer schickt ihn dorthin zurück, und der Client beginnt von
   vorn, wie das Protokoll es verlangt. `session_lock.rs`: `Phase` Unlocked, Locking (wartet auf ein
@@ -132,6 +156,14 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
   Eine `monitorrule` wird beim Erscheinen des Ausgangs gelesen; `reload` ändert laufende Modes nicht.
   Wird ein Mode abgelehnt, versucht das Backend den Standard-Mode. Gesperrt holt der VT-Wechsel die
   Ausgänge mit abgeschalteten Connectors zurück, damit kein altes Bild aufblitzt.
+- Nach einem Bild: `update_scanout_outputs` merkt, wo eine Surface zuletzt zu sehen war, darauf bauen
+  `presentation_feedback` und `send_dmabuf_feedback` auf (`src/render.rs`). Pro Ausgang gibt es Feedback
+  fürs Zeichnen und eins mit Scanout-Tranche, `render_frame` setzt passende Buffer selbst aufs Primary Plane.
+  Das Log meldet `direct scanout` bei jedem Wechsel. Direct Scanout setzt voraus, dass der Client auf der GPU
+  mit dem Monitor rendert. Mit AMD-Clients und Monitor an der NVIDIA kommt es nicht vor. Explicit Sync
+  (`offer_syncobj`) bietet das DRM-Backend auf der Render-GPU an, nested auf deren Render-Node.
+- Tearing fehlt: Smithay kann keine Async-Flips, `DrmSurface::page_flip` setzt kein `PAGE_FLIP_ASYNC`, und
+  `wp_tearing_control_v1` hat es auch nicht. Das Protokoll allein brächte nichts, also ist es nicht angeboten.
 - `src/backend/pacing.rs`: pro Ausgang höchstens ein Bild unterwegs, das nächste nach dem Vblank plus
   60 % Bilddauer für Clients (sofort bei einer Kopie auf eine andere GPU). Ändert sich nichts, ersetzt
   ein Timer den Vblank, damit Frame-Callbacks im Takt bleiben. `send_frame_callbacks` zählt für die
@@ -163,6 +195,11 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
   ergibt echte Clients. Klicks lassen sich nested nicht auslösen, ohne die Maus des Nutzers zu bewegen.
 - Das `[EGL] BAD_SURFACE`-Log nested stammt aus `buffer_age`: Nach dem Import eines neuen Buffers ist
   die Fensterfläche nicht aktuell, der Rahmen wird dann ganz neu gezeichnet. Harmlos.
+- Echte Shell in nested kitty: `kitty -o allow_remote_control=yes --listen-on unix:PFAD`, dann
+  `kitty @ --to unix:PFAD send-text`, `send-key ctrl+c`, `get-text`. Das geht in den PTY wie eine Taste.
+- Die nested Maus liefert nur absolute Positionen. Relative Bewegung und Sperren prüft `on_pointer_delta`
+  in `tests/headless.rs`, die echte Maus `docs/pointer-test.html` im TTY-Nachtest.
+- Prozesse immer per gemerkter PID beenden: `pgrep -f MUSTER` trifft auch die eigene Shell.
 - Mit `WAYLAND_DISPLAY=wayland-N ./target/debug/wirbel pos` bzw. `move` lässt sich die Nested-Instanz
   von außen steuern, ohne die Maus des Nutzers zu bewegen. Der Socket steht im Log.
 
@@ -192,6 +229,8 @@ Gestartet wird das DRM-Backend aber mit `strat void`: Nur Void hat die NVIDIA-Us
 `nvidia-drm_gbm.so`), in Arch fällt `renderD129` auf llvmpipe zurück. Die Arch-Binary läuft dort, weil sie
 höchstens glibc 2.39 verlangt und Void 2.41 hat; libdisplay-info ist darum nicht verlinkt, die
 Strata haben verschiedene Versionen. libseat und udev funktionieren in beiden. Clients kommen weiter
-aus Arch über `/bedrock/cross`, dort nur Mesa: Sie rendern auf der AMD-iGPU, wie unter Mango.
+aus Arch über `/bedrock/cross`, dort nur Mesa: Sie rendern auf der AMD-iGPU, wie unter Mango. Das gilt
+auch für Steam und Spiele, Arch hat keinen NVIDIA-Vulkan-Treiber (nur `radeon_icd`). Xwayland gibt es in Arch
+und Void: Mit `strat void` gestartet nimmt wirbel das aus Void, das auch die NVIDIA-Treiber sieht.
 GPUs: NVIDIA RTX 4070 SUPER (Treiber 595, open) und AMD iGPU; Monitor an card1 (DP-4, wechselt
 gelegentlich zu DP-3), 165 Hz (der Monitor kann 170, Mango nutzt 170).

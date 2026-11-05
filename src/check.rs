@@ -40,7 +40,7 @@ use smithay::{
 
 use crate::{
     backend::drm::{connector_name, mode_info, preferred_gpu},
-    config::Config,
+    config::{Config, Xwayland},
     cursor::Cursors,
     monitor::{self, ModeInfo},
     safety,
@@ -699,6 +699,23 @@ fn check_input(report: &mut Report, config: &Config) {
 }
 
 /// Runs all checks. Returns whether nothing stands in the way of the DRM backend.
+/// X11 programs are a nice thing to have, nothing here keeps the compositor from starting.
+fn check_xwayland(report: &mut Report, config: &Config) {
+    report.section("X11 programs");
+    let configured = match &config.xwayland {
+        Xwayland::Off => {
+            report.note("switched off in the configuration");
+            return;
+        }
+        Xwayland::Find => None,
+        Xwayland::At(path) => Some(path.as_str()),
+    };
+    match crate::xwayland::locate(configured) {
+        Some(binary) => report.fine(format!("Xwayland runs as {}", binary.0.join(" "))),
+        None => report.note("no working Xwayland: X11 programs will not start"),
+    }
+}
+
 pub fn run(config_path: Option<&Path>) -> bool {
     let mut report = Report::default();
     println!("wirbel check: looks only, nothing is activated");
@@ -707,6 +724,7 @@ pub fn run(config_path: Option<&Path>) -> bool {
     let cards = check_cards(&mut report, &config);
     check_render(&mut report, &config, &cards);
     check_input(&mut report, &config);
+    check_xwayland(&mut report, &config);
     if report.problems == 0 {
         println!("\nNo problems found.");
     } else {

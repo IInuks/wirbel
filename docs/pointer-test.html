@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Zeiger-Test</title>
+<style>
+  body { font: 24px sans-serif; margin: 3em; user-select: text; }
+  #state { font-weight: bold; }
+</style>
+<p>Hier klicken: Der Zeiger verschwindet, die Zahlen laufen beim Bewegen der Maus weiter, auch wenn sie
+am Bildschirmrand angekommen wäre. Esc gibt den Zeiger zurück.</p>
+<p>Zustand: <span id="state">frei</span></p>
+<p>Summe der Bewegung: <span id="sum">0 0</span></p>
+<p>Zum Kopieren: wirbel-zwischenablage</p>
+<script>
+  let x = 0, y = 0;
+  const show = () => { document.getElementById('sum').textContent = x + ' ' + y; };
+  document.body.addEventListener('click', () => document.body.requestPointerLock());
+  document.addEventListener('pointerlockchange', () => {
+    const locked = document.pointerLockElement !== null;
+    document.getElementById('state').textContent = locked ? 'gesperrt' : 'frei';
+  });
+  document.addEventListener('mousemove', (event) => {
+    if (document.pointerLockElement) {
+      x += event.movementX;
+      y += event.movementY;
+      show();
+    }
+  });
+</script>
