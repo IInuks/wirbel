@@ -1,5 +1,7 @@
 # wirbel auf einem freien TTY testen
 
+Am einfachsten: `~/WM/docs/tty-run.sh` auf dem TTY starten, das Skript führt durch alle Tests unten und schreibt das Ergebnis nach `~/wirbel-test/ergebnis.txt`.
+
 Dauert etwa 15 Minuten. Mango läuft auf tty7 weiter, mit **Strg+Alt+F7** kommst du jederzeit zurück.
 Der Monitor hängt an der NVIDIA-Karte, deren Treiber-Bibliotheken liegen nur im Void-Stratum. Darum
 wird in Arch gebaut, aber mit `strat void` gestartet.
