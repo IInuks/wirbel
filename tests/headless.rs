@@ -4,14 +4,16 @@
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     os::{fd::AsFd, unix::net::UnixStream},
     path::PathBuf,
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicU32, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use smithay::backend::input::{Axis, AxisSource};
@@ -53,7 +55,9 @@ use wayland_protocols::xdg::shell::client::{
     xdg_toplevel::{self, XdgToplevel},
     xdg_wm_base::{self, XdgWmBase},
 };
-use wirbel::{Wirbel, config::Config, input::Scroll, layout::Rect, workspace::Placement};
+use wirbel::{
+    Wirbel, config::Config, input::Scroll, ipc::Position, layout::Rect, workspace::Placement,
+};
 
 const WIDTH: i32 = 1000;
 const HEIGHT: i32 = 600;
@@ -2458,4 +2462,689 @@ fn stacking_order_survives_a_trip_through_a_hidden_workspace() {
     });
     assert_eq!(placements[0], Some(Placement::Tiled));
     assert!(matches!(placements[1], Some(Placement::Floating(_))));
+}
+
+// Control socket. These go through the real `wirbel` binary wherever a command line is involved.
+
+impl Compositor {
+    fn wayland_display(&self) -> &std::ffi::OsStr {
+        self.socket.file_name().unwrap()
+    }
+
+    fn ipc_path(&self) -> PathBuf {
+        wirbel::ipc::socket_path(self.wayland_display()).unwrap()
+    }
+
+    fn cli(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wirbel"));
+        command
+            .args(args)
+            .env("WAYLAND_DISPLAY", self.wayland_display());
+        command
+    }
+
+    /// Runs a command to its end and returns its standard output.
+    fn run(&self, args: &[&str]) -> String {
+        let output = self.cli(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// Runs a command that has to fail and returns its error message.
+    fn run_failing(&self, args: &[&str]) -> String {
+        let output = self.cli(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        String::from_utf8(output.stderr).unwrap()
+    }
+
+    fn pointer(&self) -> (f64, f64) {
+        self.with(|state| {
+            let location = state.seat.get_pointer().unwrap().current_location();
+            (location.x, location.y)
+        })
+    }
+
+    fn raw_ipc(&self) -> RawIpc {
+        let stream = UnixStream::connect(self.ipc_path()).unwrap();
+        stream.set_read_timeout(Some(ANSWER)).unwrap();
+        RawIpc {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+        }
+    }
+}
+
+/// How long a test waits for a line before it counts as missing.
+const ANSWER: Duration = Duration::from_secs(5);
+
+struct RawIpc {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl RawIpc {
+    fn send(&mut self, text: &str) {
+        self.stream.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn line(&mut self) -> String {
+        let mut line = String::new();
+        self.reader.read_line(&mut line).unwrap();
+        line.trim_end().to_string()
+    }
+
+    fn request(&mut self, text: &str) -> String {
+        self.send(text);
+        self.send("\n");
+        self.line()
+    }
+}
+
+/// A running `wirbel pos` with its output on a pipe.
+struct Watcher {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+}
+
+impl Watcher {
+    fn start(compositor: &Compositor, args: &[&str]) -> Self {
+        let mut child = compositor
+            .cli(&[&["pos"], args].concat())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let (tx, lines) = mpsc::channel();
+        thread::spawn(move || {
+            for line in stdout.lines() {
+                if tx.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { child, lines }
+    }
+
+    fn next(&self) -> String {
+        self.lines.recv_timeout(ANSWER).expect("no line from pos")
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn pos_prints_the_exact_position_and_output_once() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(123.25, 45.0625);
+    assert_eq!(compositor.run(&["pos", "--once"]), "123.25 45.0625 test\n");
+    assert_eq!(
+        compositor.run(&["pos", "--once", "--json"]),
+        "{\"x\":123.25,\"y\":45.0625,\"output\":\"test\"}\n"
+    );
+}
+
+#[test]
+fn pos_shows_a_change_at_once_and_only_a_change() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    compositor.pointer_at(10.0, 20.0);
+    let watcher = Watcher::start(&compositor, &[]);
+    assert_eq!(watcher.next(), "10.0 20.0 test");
+
+    compositor.pointer_at(11.5, 20.0);
+    assert_eq!(watcher.next(), "11.5 20.0 test");
+    // Things that re-evaluate the pointer without moving it print nothing.
+    compositor.pointer_at(11.5, 20.0);
+    client.open_window(GREEN);
+    client.close(0);
+    compositor.with(Wirbel::refresh_pointer_focus);
+    compositor.run(&["move", "11.5", "20"]);
+    compositor.run(&["move", "--rel", "0", "0"]);
+    compositor.pointer_at(12.0, 20.0);
+    assert_eq!(watcher.next(), "12.0 20.0 test");
+}
+
+#[test]
+fn pos_follows_every_way_the_pointer_can_move() {
+    let (compositor, mut client, a, _) = mango_like();
+    let second = compositor.add_output("second", (WIDTH, 0));
+    client.sync();
+    compositor.pointer_at(750.0, 300.0);
+    let watcher = Watcher::start(&compositor, &[]);
+    assert_eq!(watcher.next(), "750.0 300.0 test");
+
+    // A real device.
+    compositor.pointer_at(751.0, 300.0);
+    assert_eq!(watcher.next(), "751.0 300.0 test");
+    // `wirbel move`, absolute and relative, also from another connection.
+    compositor.run(&["move", "1500", "300.5"]);
+    assert_eq!(watcher.next(), "1500.0 300.5 second");
+    compositor.run(&["move", "--rel", "-750", "-0.5"]);
+    assert_eq!(watcher.next(), "750.0 300.0 test");
+    // A warp after a change of keyboard focus.
+    compositor.chord(ALT, KEY_LEFT);
+    client.sync();
+    assert!(client.activated(a));
+    assert_eq!(watcher.next(), "254.0 300.0 test");
+    // A warp to an empty output.
+    compositor.chord(&[KEY_LEFTALT, KEY_LEFTSHIFT], KEY_RIGHT);
+    assert_eq!(watcher.next(), "1500.0 300.0 second");
+    // The output under the pointer going away moves it, possibly in two steps.
+    compositor.with(move |state| state.remove_output(&second));
+    let mut line = watcher.next();
+    while line != "500.0 300.0 test" {
+        assert!(line.ends_with(" test"), "{line}");
+        line = watcher.next();
+    }
+}
+
+#[test]
+fn pos_notices_outputs_changing_under_a_resting_pointer() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(999.0, 300.0);
+    let watcher = Watcher::start(&compositor, &[]);
+    assert_eq!(watcher.next(), "999.0 300.0 test");
+
+    // Resizing the output away from under the pointer drags it along.
+    compositor.with(|state| {
+        let output = state.monitors[0].output.clone();
+        let mode = Mode {
+            size: (800, 400).into(),
+            refresh: 60_000,
+        };
+        output.change_current_state(Some(mode), None, None, None);
+        state.output_resized(&output);
+    });
+    assert_eq!(watcher.next(), "799.0 300.0 test");
+
+    // The position stays, but it is on no output, and then on a new one.
+    compositor.with(|state| {
+        let output = state.monitors[0].output.clone();
+        state.remove_output(&output);
+    });
+    assert_eq!(watcher.next(), "799.0 300.0 -");
+    compositor.add_output("new", (0, 0));
+    assert_eq!(watcher.next(), "799.0 300.0 new");
+}
+
+#[test]
+fn pos_as_json_streams_one_object_per_line() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(1.0, 2.0);
+    let watcher = Watcher::start(&compositor, &["--json"]);
+    assert_eq!(watcher.next(), r#"{"x":1.0,"y":2.0,"output":"test"}"#);
+    compositor.pointer_at(1.5, 2.0);
+    assert_eq!(watcher.next(), r#"{"x":1.5,"y":2.0,"output":"test"}"#);
+}
+
+#[test]
+fn watchers_are_independent_of_each_other() {
+    let compositor = Compositor::start();
+    let first = Watcher::start(&compositor, &[]);
+    first.next();
+    let second = Watcher::start(&compositor, &[]);
+    second.next();
+    drop(first);
+    compositor.pointer_at(5.0, 5.0);
+    assert_eq!(second.next(), "5.0 5.0 test");
+}
+
+#[test]
+fn pos_ends_quietly_when_its_reader_goes_away() {
+    let compositor = Compositor::start();
+    let mut child = compositor
+        .cli(&["pos"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    stdout.read_line(&mut String::new()).unwrap();
+    drop(stdout);
+    compositor.pointer_at(5.0, 5.0);
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(start.elapsed() < ANSWER, "pos kept running");
+        compositor.pointer_at(start.elapsed().as_secs_f64(), 5.0);
+    }
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn pos_reports_the_end_of_the_compositor() {
+    let compositor = Compositor::start();
+    let mut watcher = Watcher::start(&compositor, &[]);
+    watcher.next();
+    drop(compositor);
+    assert_eq!(watcher.child.wait().unwrap().code(), Some(1));
+}
+
+#[test]
+fn commands_explain_a_missing_compositor() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wirbel"))
+        .args(["move", "1", "2"])
+        .env("WAYLAND_DISPLAY", "wayland-nobody")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("wirbel move: no wirbel on wayland-nobody"),
+        "{stderr}"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wirbel"))
+        .args(["pos", "--once"])
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("WAYLAND_DISPLAY"));
+}
+
+#[test]
+fn bad_command_lines_are_refused() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(7.0, 8.0);
+    for args in [
+        &["move"][..],
+        &["move", "1"],
+        &["move", "1", "2", "3"],
+        &["move", "a", "2"],
+        &["move", "--rel", "1"],
+        &["move", "1", "--rel", "2"],
+        &["move", "1", "2", "--rel"],
+        &["pos", "--nope"],
+        &["pos", "extra"],
+    ] {
+        assert!(compositor.run_failing(args).contains("usage:"), "{args:?}");
+    }
+    for args in [&["move", "NaN", "2"][..], &["move", "--rel", "1", "inf"]] {
+        assert!(compositor.run_failing(args).contains("finite"), "{args:?}");
+    }
+    assert_eq!(compositor.pointer(), (7.0, 8.0));
+}
+
+#[test]
+fn move_reaches_clients_as_ordinary_motion() {
+    let (compositor, mut client, a, b) = two_windows();
+    let rect_a = compositor.frames()[0];
+    let rect_b = compositor.frames()[1];
+    compositor.run(&["move", "100.5", "200.25"]);
+    client.sync();
+    assert_eq!(compositor.pointer(), (100.5, 200.25));
+    let (x, y) = (100.5 - f64::from(rect_a.x), 200.25 - f64::from(rect_a.y));
+    assert_eq!(client.take_input(), [Input::PointerEnter(a, x, y)]);
+
+    compositor.run(&["move", "--rel", "1", "0"]);
+    client.sync();
+    assert_eq!(client.take_input(), [Input::PointerMotion(x + 1.0, y)]);
+
+    compositor.run(&["move", "800", "200"]);
+    client.sync();
+    let (x, y) = (800.0 - f64::from(rect_b.x), 200.0 - f64::from(rect_b.y));
+    assert_eq!(
+        client.take_input(),
+        [Input::PointerLeave(a), Input::PointerEnter(b, x, y)]
+    );
+
+    // And a click lands where the pointer went.
+    compositor.click();
+    client.sync();
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::Button(BTN_LEFT, wl_pointer::ButtonState::Pressed))
+    );
+}
+
+#[test]
+fn move_focuses_like_a_mouse_under_sloppy_focus() {
+    let (compositor, mut client, a, b) = mango_like();
+    compositor.pointer_at(750.0, 300.0);
+    client.sync();
+    assert!(client.activated(b));
+    compositor.run(&["move", "100", "300"]);
+    client.sync();
+    assert!(client.activated(a));
+    assert!(!client.activated(b));
+}
+
+#[test]
+fn move_is_clamped_to_the_output() {
+    let compositor = Compositor::start();
+    for (target, expected) in [
+        (["move", "-5", "-5"], (0.0, 0.0)),
+        (["move", "1000", "600"], (999.0, 599.0)),
+        (["move", "1e300", "100.5"], (999.0, 100.5)),
+        (["move", "100.5", "-1e300"], (100.5, 0.0)),
+        (["move", "999.75", "599.5"], (999.75, 599.5)),
+    ] {
+        compositor.run(&target);
+        assert_eq!(compositor.pointer(), expected, "{target:?}");
+    }
+
+    compositor.run(&["move", "10", "10"]);
+    compositor.run(&["move", "--rel", "-100", "-100"]);
+    assert_eq!(compositor.pointer(), (0.0, 0.0));
+    compositor.run(&["move", "--rel", "5000", "50"]);
+    assert_eq!(compositor.pointer(), (999.0, 50.0));
+}
+
+#[test]
+fn move_crosses_outputs_and_stays_on_the_visible_area() {
+    // Two outputs of the same size, the second one lower: below the first is nothing to be on.
+    let compositor = Compositor::start();
+    compositor.add_output("lower", (WIDTH, 300));
+
+    compositor.run(&["move", "1500", "500"]);
+    assert_eq!(compositor.pointer(), (1500.0, 500.0));
+    assert_eq!(compositor.with(|state| state.active_monitor), 1);
+    assert_eq!(compositor.run(&["pos", "--once"]), "1500.0 500.0 lower\n");
+
+    // Into the corners that belong to no output.
+    compositor.run(&["move", "1500", "100"]);
+    assert_eq!(compositor.pointer(), (1500.0, 300.0));
+    compositor.run(&["move", "500", "800"]);
+    assert_eq!(compositor.pointer(), (500.0, 599.0));
+    assert_eq!(compositor.with(|state| state.active_monitor), 0);
+    // Relative across the seam, and past the far end.
+    compositor.run(&["move", "999", "400"]);
+    compositor.run(&["move", "--rel", "1.5", "0"]);
+    assert_eq!(compositor.pointer(), (1000.5, 400.0));
+    assert_eq!(compositor.with(|state| state.active_monitor), 1);
+    compositor.run(&["move", "--rel", "5000", "0"]);
+    assert_eq!(compositor.pointer(), (1999.0, 400.0));
+}
+
+#[test]
+fn device_motion_is_clamped_like_move() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(-50.0, 2000.0);
+    assert_eq!(compositor.pointer(), (0.0, 599.0));
+}
+
+#[test]
+fn move_during_a_drag_carries_the_window_along() {
+    let (compositor, mut client, _, dialog) = floating_dialog();
+    compositor.pointer_at(400.0, 300.0);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    let watcher = Watcher::start(&compositor, &[]);
+    assert_eq!(watcher.next(), "400.0 300.0 test");
+    client.sync();
+    client.take_input();
+
+    compositor.run(&["move", "500", "350"]);
+    assert_eq!(watcher.next(), "500.0 350.0 test");
+    assert_eq!(
+        compositor.focused_rect(),
+        Some(Rect::new(450, 250, 300, 200))
+    );
+    compositor.run(&["move", "--rel", "10", "10"]);
+    assert_eq!(watcher.next(), "510.0 360.0 test");
+    assert_eq!(
+        compositor.focused_rect(),
+        Some(Rect::new(460, 260, 300, 200))
+    );
+    // The clamp holds as well.
+    compositor.run(&["move", "5000", "360"]);
+    assert_eq!(watcher.next(), "999.0 360.0 test");
+    assert_eq!(
+        compositor.focused_rect(),
+        Some(Rect::new(949, 260, 300, 200))
+    );
+    compositor.run(&["move", "510", "360"]);
+    assert_eq!(watcher.next(), "510.0 360.0 test");
+
+    // Clients stay out of it until the drag ends, there.
+    client.sync();
+    assert_eq!(client.take_input(), []);
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    compositor.key(KEY_LEFTMETA, KeyState::Released);
+    assert!(!compositor.with(|state| state.drag.is_some()));
+    assert_eq!(
+        compositor.focused_rect(),
+        Some(Rect::new(460, 260, 300, 200))
+    );
+    client.sync();
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::PointerEnter(dialog, 50.0, 100.0))
+    );
+}
+
+#[test]
+fn move_during_a_resize_drag_resizes() {
+    let (compositor, mut client, _, dialog) = floating_dialog();
+    compositor.pointer_at(600.0, 350.0);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.button(BTN_RIGHT, ButtonState::Pressed);
+    compositor.run(&["move", "--rel", "40", "20"]);
+    client.sync();
+    assert_eq!(client.size(dialog), (340, 220));
+    compositor.button(BTN_RIGHT, ButtonState::Released);
+    compositor.key(KEY_LEFTMETA, KeyState::Released);
+    client.sync();
+    assert!(!compositor.with(|state| state.drag.is_some()));
+}
+
+#[test]
+fn move_can_drop_a_tile_on_another_output() {
+    let (compositor, _second) = two_outputs();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    compositor.pointer_at(500.0, 300.0);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    compositor.run(&["move", "1500", "300"]);
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    compositor.key(KEY_LEFTMETA, KeyState::Released);
+    assert_eq!(
+        compositor.with(|state| state.monitors[1].workspace().windows().len()),
+        1
+    );
+    assert_eq!(
+        compositor.with(|state| state.monitors[0].workspace().windows().len()),
+        0
+    );
+}
+
+#[test]
+fn move_with_a_button_held_on_a_client_stays_with_that_client() {
+    let (compositor, mut client, a, b) = mango_like();
+    compositor.pointer_at(100.0, 300.0);
+    client.sync();
+    assert!(client.activated(a));
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    client.sync();
+    client.take_input();
+
+    let rect_a = compositor.frames()[0];
+    compositor.run(&["move", "800", "300"]);
+    client.sync();
+    assert_eq!(compositor.pointer(), (800.0, 300.0));
+    assert_eq!(
+        client.take_input(),
+        [Input::PointerMotion(
+            800.0 - f64::from(rect_a.x),
+            300.0 - f64::from(rect_a.y)
+        )]
+    );
+    assert!(client.activated(a), "focus changed under a held button");
+    assert!(!client.activated(b));
+
+    // Letting go hands the pointer to the window it is on by now, without any further motion.
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    client.sync();
+    let input = client.take_input();
+    assert!(input.contains(&Input::PointerLeave(a)), "{input:?}");
+    assert!(
+        input
+            .iter()
+            .any(|input| matches!(input, Input::PointerEnter(window, ..) if *window == b)),
+        "{input:?}"
+    );
+}
+
+#[test]
+fn warps_still_wait_for_a_drag_to_end() {
+    let (compositor, _client, _, _) = floating_dialog();
+    compositor.pointer_at(400.0, 300.0);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    compositor.with(|state| state.warp_pointer((10.0, 10.0).into()));
+    assert_eq!(compositor.pointer(), (400.0, 300.0));
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    compositor.key(KEY_LEFTMETA, KeyState::Released);
+}
+
+#[test]
+fn move_without_any_output_fails_and_leaves_the_pointer() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(10.0, 10.0);
+    compositor.with(|state| {
+        let output = state.monitors[0].output.clone();
+        state.remove_output(&output);
+    });
+    assert!(
+        compositor
+            .run_failing(&["move", "1", "2"])
+            .contains("no output")
+    );
+    assert_eq!(compositor.pointer(), (10.0, 10.0));
+    assert_eq!(compositor.run(&["pos", "--once"]), "10.0 10.0 -\n");
+    assert_eq!(
+        compositor.run(&["pos", "--once", "--json"]),
+        "{\"x\":10.0,\"y\":10.0,\"output\":null}\n"
+    );
+}
+
+#[test]
+fn the_socket_answers_garbage_and_goes_on() {
+    let compositor = Compositor::start();
+    let mut ipc = compositor.raw_ipc();
+    assert_eq!(ipc.request("dance"), "error unknown request");
+    assert_eq!(ipc.request(""), "error unknown request");
+    assert_eq!(ipc.request("move 1"), "error expected two numbers");
+    assert_eq!(
+        ipc.request("move nan 2"),
+        "error coordinates must be finite"
+    );
+    assert_eq!(ipc.request("\u{fffd}\u{0}"), "error unknown request");
+    assert_eq!(ipc.request("move 3 4"), "ok");
+    assert_eq!(ipc.request("position"), "position 3.0 4.0 test");
+
+    // Several requests in one write, and one spread over two.
+    ipc.send("position\nmove 5 ");
+    assert_eq!(ipc.line(), "position 3.0 4.0 test");
+    ipc.send("6\n");
+    assert_eq!(ipc.line(), "ok");
+    assert_eq!(compositor.pointer(), (5.0, 6.0));
+}
+
+#[test]
+fn an_endless_request_costs_the_sender_its_connection_only() {
+    let compositor = Compositor::start();
+    let mut flood = compositor.raw_ipc();
+    flood.stream.set_nonblocking(true).unwrap();
+    let chunk = [b'x'; 4096];
+    let start = Instant::now();
+    while flood.stream.write(&chunk).is_ok_and(|written| written > 0) {
+        assert!(start.elapsed() < ANSWER, "the connection was not closed");
+        compositor.with(|_| ());
+    }
+    assert_eq!(compositor.raw_ipc().request("move 1 2"), "ok");
+}
+
+#[test]
+fn a_client_flooding_requests_without_reading_is_dropped() {
+    let compositor = Compositor::start();
+    let mut flood = compositor.raw_ipc();
+    flood.stream.set_nonblocking(true).unwrap();
+    let start = Instant::now();
+    while flood
+        .stream
+        .write(b"position\n")
+        .is_ok_and(|written| written > 0)
+    {
+        assert!(
+            start.elapsed() < ANSWER * 6,
+            "the connection was not closed"
+        );
+    }
+    assert_eq!(
+        compositor.raw_ipc().request("position"),
+        "position 0.0 0.0 test"
+    );
+    let open = compositor.with(|state| state.ipc.client_count());
+    assert!(open <= 2, "{open} clients still open");
+}
+
+#[test]
+fn a_watcher_that_stops_reading_gets_the_latest_position_later() {
+    let compositor = Compositor::start();
+    let mut watcher = compositor.raw_ipc();
+    assert_eq!(watcher.request("watch"), "position 0.0 0.0 test");
+
+    // Far more than the socket buffer holds. The compositor must not wait for the reader.
+    let total = 300_000;
+    let start = Instant::now();
+    compositor.with(move |state| {
+        for step in 0..total {
+            let x = 1.0 + f64::from(step) * 0.001;
+            state.on_pointer_motion((x, 5.0).into(), InputTime::now());
+        }
+        state.on_pointer_motion((77.25, 5.0).into(), InputTime::now());
+    });
+    assert!(start.elapsed() < Duration::from_secs(60));
+
+    // Everything that arrives is a whole line, and the last one is where the pointer ended up,
+    // although nothing moved after the reader came back.
+    let mut lines = 0;
+    let mut previous = 0.0;
+    loop {
+        let line = watcher.line();
+        let position = Position::parse(&line).unwrap_or_else(|| panic!("torn line: {line:?}"));
+        lines += 1;
+        if position.x == 77.25 {
+            break;
+        }
+        assert!(position.x > previous, "{line}");
+        previous = position.x;
+    }
+    assert!(
+        lines < total,
+        "nothing was dropped, the buffer is too large for this test"
+    );
+
+    compositor.pointer_at(78.0, 5.0);
+    assert_eq!(watcher.line(), "position 78.0 5.0 test");
+}
+
+#[test]
+fn a_spawned_client_finds_the_compositor_it_runs_in() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(21.0, 22.0);
+    let path = scratch_path("spawned-pos");
+    let binary = env!("CARGO_BIN_EXE_wirbel");
+    let command = format!("{binary} pos --once > {path:?}.tmp; mv {path:?}.tmp {path:?}");
+    compositor.with(move |state| state.spawn(&command));
+    let start = Instant::now();
+    while !path.exists() {
+        assert!(
+            start.elapsed() < ANSWER,
+            "the spawned command never finished"
+        );
+        compositor.with(|_| ());
+    }
+    assert_eq!(fs::read_to_string(&path).unwrap(), "21.0 22.0 test\n");
+    fs::remove_file(path).unwrap();
 }

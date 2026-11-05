@@ -8,7 +8,7 @@ use smithay::{
     },
     input::{
         keyboard::FilterResult,
-        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent},
     },
     utils::{Logical, Point, SERIAL_COUNTER},
 };
@@ -91,22 +91,10 @@ impl Wirbel {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
+        let location = self.move_pointer(location, time);
         if let Some(monitor) = self.monitor_at(location) {
             self.active_monitor = monitor;
         }
-        let under = self.surface_under(location);
-        let serial = SERIAL_COUNTER.next_serial();
-        pointer.motion(
-            self,
-            under,
-            &MotionEvent {
-                location,
-                serial,
-                time,
-            },
-        );
-        pointer.frame(self);
-        self.needs_redraw = true;
 
         if self.drag.is_some() {
             self.drag_motion(location);
@@ -151,8 +139,10 @@ impl Wirbel {
             },
         );
         pointer.frame(self);
-        if self.drag.is_some() && !pointer.is_grabbed() {
+        if !pointer.is_grabbed() {
             self.finish_drag();
+            // A click grab leaves the focus on its client, wherever the pointer went meanwhile.
+            self.update_pointer_focus();
         }
     }
 

@@ -1,16 +1,29 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    process,
 };
 
 use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
 use wirbel::{Wirbel, backend, config::Config};
 
 const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]...
+       wirbel pos [--once] [--json]
+       wirbel move [--rel] X Y
 
       --config FILE      read this file instead of ~/.config/wirbel/config
   -c, --command COMMAND  run a shell command inside the compositor (repeatable)
-  -h, --help             show this help";
+  -h, --help             show this help
+
+pos prints the pointer position in one line that follows the pointer, until Ctrl+C.
+      --once             print it once and exit
+      --json             print one JSON object per line
+
+move sets the pointer, clamped to the outputs. It works like moving the mouse: a window being
+dragged follows it.
+      --rel              X and Y are relative to the current position
+
+Both talk to the compositor of WAYLAND_DISPLAY.";
 
 /// Whatever is wrong with the file, the compositor has to come up.
 fn load_config(path: Option<&Path>) -> Config {
@@ -32,13 +45,28 @@ fn load_config(path: Option<&Path>) -> Config {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = env::args().skip(1).peekable();
+    if let Some(command @ ("pos" | "move")) = args.peek().map(String::as_str) {
+        let command = command.to_string();
+        args.next();
+        let args: Vec<String> = args.collect();
+        let result = match command.as_str() {
+            "pos" => wirbel::cli::pos(&args),
+            _ => wirbel::cli::move_pointer(&args),
+        };
+        if let Err(err) = result {
+            eprintln!("wirbel {command}: {err}");
+            process::exit(1);
+        }
+        return Ok(());
+    }
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("wirbel=info,warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let mut commands = Vec::new();
     let mut config_path = None;
-    let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-c" | "--command" => commands.push(args.next().ok_or(USAGE)?),

@@ -37,6 +37,7 @@ use smithay::{
 use crate::{
     config::Config,
     grabs::Drag,
+    ipc::{Ipc, Position},
     layout::Rect,
     workspace::{Frame, FullKind, Monitor, Placement, Workspace},
 };
@@ -109,6 +110,7 @@ pub struct Wirbel {
     /// The window drag in progress.
     pub drag: Option<Drag>,
     pub cursor_status: CursorImageStatus,
+    pub ipc: Ipc,
 
     pub needs_redraw: bool,
     /// Asks the backend for a new frame. Set by the backend.
@@ -132,9 +134,12 @@ impl Wirbel {
         }
         seat.add_pointer();
 
+        let socket_name = Self::listen(display, event_loop)?;
+        let ipc = Ipc::new(event_loop.handle(), &socket_name);
+
         Ok(Self {
             start_time: Instant::now(),
-            socket_name: Self::listen(display, event_loop)?,
+            socket_name,
             loop_signal: event_loop.get_signal(),
 
             compositor_state: CompositorState::new::<Self>(&dh),
@@ -159,6 +164,7 @@ impl Wirbel {
             swallowed_keys: Vec::new(),
             drag: None,
             cursor_status: CursorImageStatus::default_named(),
+            ipc,
 
             needs_redraw: true,
             redraw: Box::new(|| {}),
@@ -278,6 +284,12 @@ impl Wirbel {
         let Some(index) = self.monitor_of_output(output) else {
             return;
         };
+        let location = self
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location());
+        let pointer_lost =
+            location.is_some_and(|location| self.monitor_at(location) == Some(index));
         self.space.unmap_output(output);
         let target = self
             .monitors
@@ -321,15 +333,9 @@ impl Wirbel {
             let candidate = self.active_workspace().and_then(Workspace::focus_candidate);
             self.set_focus(candidate);
         }
-        if let Some(area) = self.monitor_area(self.active_monitor) {
-            let location = self
-                .seat
-                .get_pointer()
-                .map(|pointer| pointer.current_location());
-            if location.is_none_or(|location| !area.contains(location.x, location.y)) {
-                let (x, y) = area.center();
-                self.warp_pointer((f64::from(x), f64::from(y)).into());
-            }
+        if pointer_lost && let Some(area) = self.monitor_area(self.active_monitor) {
+            let (x, y) = area.center();
+            self.move_pointer((f64::from(x), f64::from(y)).into(), InputTime::now());
         }
     }
 
@@ -723,45 +729,79 @@ impl Wirbel {
             .map(|(surface, offset)| (surface, (offset + location).to_f64()))
     }
 
-    /// Moves the pointer without any device moving it.
-    pub fn warp_pointer(&mut self, location: Point<f64, Logical>) {
-        let Some(pointer) = self.seat.get_pointer() else {
-            return;
-        };
-        if pointer.is_grabbed() {
-            return;
+    /// The nearest point to `location` on any output. Without outputs, `location` itself.
+    pub fn clamp_to_outputs(&self, location: Point<f64, Logical>) -> Point<f64, Logical> {
+        let areas = (0..self.monitors.len()).filter_map(|index| self.monitor_area(index));
+        if areas
+            .clone()
+            .any(|area| area.contains(location.x, location.y))
+        {
+            return location;
         }
-        let under = self.surface_under(location);
-        pointer.motion(
-            self,
-            under,
-            &MotionEvent {
-                location,
-                serial: SERIAL_COUNTER.next_serial(),
-                time: InputTime::now(),
-            },
-        );
-        pointer.frame(self);
-        self.needs_redraw = true;
+        let distance = |(x, y): &(f64, f64)| (x - location.x).powi(2) + (y - location.y).powi(2);
+        areas
+            .map(|area| area.closest_point(location.x, location.y))
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+            .map_or(location, Into::into)
     }
 
-    /// Re-evaluates what is under the pointer, for when windows moved instead of the pointer.
-    pub fn refresh_pointer_focus(&mut self) {
+    /// The one place that moves the pointer, whatever the reason. Anything else that changes its
+    /// position has to come through here, or `wirbel pos` misses it. Returns where it ended up.
+    pub fn move_pointer(
+        &mut self,
+        location: Point<f64, Logical>,
+        time: InputTime,
+    ) -> Point<f64, Logical> {
+        let location = self.clamp_to_outputs(location);
         let Some(pointer) = self.seat.get_pointer() else {
-            return;
+            return location;
         };
-        let location = pointer.current_location();
         let under = self.surface_under(location);
-        pointer.motion(
-            self,
-            under,
-            &MotionEvent {
-                location,
-                serial: SERIAL_COUNTER.next_serial(),
-                time: InputTime::now(),
-            },
-        );
+        let serial = SERIAL_COUNTER.next_serial();
+        let event = MotionEvent {
+            location,
+            serial,
+            time,
+        };
+        pointer.motion(self, under, &event);
         pointer.frame(self);
+        self.needs_redraw = true;
+        let position = self.pointer_position();
+        self.ipc.publish(&position);
+        location
+    }
+
+    /// Where the pointer is, as `wirbel pos` shows it.
+    pub fn pointer_position(&self) -> Position {
+        let location = self
+            .seat
+            .get_pointer()
+            .map_or_else(Point::default, |pointer| pointer.current_location());
+        Position {
+            x: location.x,
+            y: location.y,
+            output: self
+                .monitor_at(location)
+                .map(|index| self.monitors[index].output.name()),
+        }
+    }
+
+    /// Moves the pointer on the compositor's own behalf. A grab keeps it where it is.
+    pub fn warp_pointer(&mut self, location: Point<f64, Logical>) {
+        let grabbed = self
+            .seat
+            .get_pointer()
+            .is_none_or(|pointer| pointer.is_grabbed());
+        if !grabbed {
+            self.move_pointer(location, InputTime::now());
+        }
+    }
+
+    /// Re-evaluates what is under the pointer, for when windows or outputs changed around it.
+    pub fn refresh_pointer_focus(&mut self) {
+        if let Some(pointer) = self.seat.get_pointer() {
+            self.move_pointer(pointer.current_location(), InputTime::now());
+        }
     }
 
     /// Like `refresh_pointer_focus`, but stays silent if the pointer is still on the same surface.

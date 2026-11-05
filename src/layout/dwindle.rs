@@ -29,6 +29,21 @@ impl Rect {
             && y < f64::from(self.y + self.h)
     }
 
+    /// The point of the rectangle nearest to the given one. A point inside stays as it is, a point
+    /// beyond an edge lands on the last whole pixel there.
+    pub fn closest_point(self, x: f64, y: f64) -> (f64, f64) {
+        let axis = |value: f64, start: i32, length: i32| {
+            if value < f64::from(start) {
+                f64::from(start)
+            } else if value >= f64::from(start + length) {
+                f64::from(start + length - 1)
+            } else {
+                value
+            }
+        };
+        (axis(x, self.x, self.w), axis(y, self.y, self.h))
+    }
+
     pub fn expand(self, by: i32) -> Self {
         Self::new(self.x - by, self.y - by, self.w + 2 * by, self.h + 2 * by)
     }
@@ -427,6 +442,17 @@ mod tests {
 
     fn overlaps(a: Rect, b: Rect) -> bool {
         a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+    }
+
+    #[test]
+    fn closest_point_keeps_points_inside_and_pulls_others_to_the_edge() {
+        let rect = Rect::new(10, 20, 100, 50);
+        assert_eq!(rect.closest_point(10.0, 20.0), (10.0, 20.0));
+        assert_eq!(rect.closest_point(109.75, 69.5), (109.75, 69.5));
+        assert_eq!(rect.closest_point(110.0, 70.0), (109.0, 69.0));
+        assert_eq!(rect.closest_point(9.5, 30.25), (10.0, 30.25));
+        assert_eq!(rect.closest_point(50.5, 1e300), (50.5, 69.0));
+        assert_eq!(rect.closest_point(-1e300, -1.0), (10.0, 20.0));
     }
 
     #[test]

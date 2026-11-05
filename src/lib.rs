@@ -2,10 +2,12 @@
 
 pub mod actions;
 pub mod backend;
+pub mod cli;
 pub mod config;
 pub mod grabs;
 mod handlers;
 pub mod input;
+pub mod ipc;
 pub mod layout;
 pub mod render;
 pub mod state;
