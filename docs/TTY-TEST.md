@@ -1,6 +1,6 @@
 # wirbel auf einem freien TTY testen
 
-Am einfachsten: `~/WM/docs/tty-run.sh` auf dem TTY starten, das Skript führt durch alle Tests unten und schreibt das Ergebnis nach `~/wirbel-test/ergebnis.txt`.
+Am einfachsten: `~/WM/docs/tty-run.sh` auf dem TTY starten, das Skript führt durch alle Tests unten und schreibt das Ergebnis nach `~/wirbel-test/ergebnis.txt`. Gestartet wird der Release-Build, das Skript lehnt einen veralteten ab. Jeder Test läuft mit `--stats` auf einem eigenen D-Bus ohne Dienste.
 
 Dauert etwa 15 Minuten. Mango läuft auf tty7 weiter, mit **Strg+Alt+F7** kommst du jederzeit zurück.
 Der Monitor hängt an der NVIDIA-Karte, deren Treiber-Bibliotheken liegen nur im Void-Stratum. Darum
@@ -26,8 +26,8 @@ wechseln (Strg+Alt+F4). Danach die Logs mitbringen, siehe unten.
 
 ```sh
 cd ~/WM
-strat -r arch env PATH=$HOME/.cargo/bin:$PATH cargo build
-strat void ./target/debug/wirbel check
+strat -r arch env PATH=$HOME/.cargo/bin:$PATH cargo build --release
+strat void ./target/release/wirbel check
 ```
 
 Am Ende muss `No problems found.` stehen. Dann **Strg+Alt+F3** und einloggen. Passiert nichts, in
@@ -36,8 +36,8 @@ geht vom TTY mit Strg+Alt+F7 oder `sudo chvt 7`. Auf dem TTY:
 
 ```sh
 cd ~/WM
-alias w='strat void ./target/debug/wirbel --config docs/tty-test.conf'
-strat void ./target/debug/wirbel check
+alias w='strat void ./target/release/wirbel --config docs/tty-test.conf'
+strat void ./target/release/wirbel check
 ```
 
 Bei `Session` muss jetzt `type tty` und `active yes` stehen, keine Zeile mit `FAIL`. Stimmt das nicht:
@@ -66,7 +66,7 @@ bei Mango. Jetzt rendert die NVIDIA selbst:
 ```sh
 cp docs/tty-test.conf /tmp/wirbel-nvidia.conf
 echo 'render_gpu = card1' >> /tmp/wirbel-nvidia.conf
-strat void ./target/debug/wirbel --config /tmp/wirbel-nvidia.conf --timeout 20 -c kitty
+strat void ./target/release/wirbel --config /tmp/wirbel-nvidia.conf --timeout 20 -c kitty
 ```
 
 Erwartet: Bild mit kitty, Exit 0. Fühlt sich etwas ruckelig an (Zeiger, Scrollen in kitty), bitte
@@ -83,6 +83,15 @@ flameshot (19), Bildschirm teilen in Chromium (20) und Discord (21). Für 20 und
 PipeWire kommt von dort, und Discord muss dort beendet sein. Die Portale laufen in einem eigenen D-Bus
 (`docs/tty-dbus.conf`) und berühren die von Mango nicht. Vor dem Test einmal bauen.
 
+## Abschlusstest
+
+`~/WM/docs/tty-run.sh ende` startet nur die Tests 22 bis 26, etwa 8 Minuten, Mango muss nicht beendet werden. Geprüft
+wird, was nach dem Nachtest repariert oder gefunden wurde: 170 Hz als Alltags-Mode (22), die Blase von Chromium,
+wenn ein zweites Fenster dazukommt (23), Scrollen in einer langen Seite (24) und in Steam (25), jeweils mit
+Messwerten, dazu die NVIDIA als Render-GPU mit Voids Treiber im Client (26). Die Messwerte landen in
+`~/wirbel-test/stats.txt`, die Bedeutung steht oben in `src/stats.rs`. Bei `input` und `late` zeigt sich, ob
+wirbel selbst stockt, bei `scroll`, ob es der Client ist.
+
 ## Was du mitbringen sollst
 
 Nach einem Fehler sofort, denn der nächste Start verschiebt das Log nach `wirbel.log.old`:
@@ -90,7 +99,7 @@ Nach einem Fehler sofort, denn der nächste Start verschiebt das Log nach `wirbe
 ```sh
 mkdir -p ~/wirbel-test
 cp ~/.local/state/wirbel/wirbel.log* ~/wirbel-test/
-strat void ./target/debug/wirbel check > ~/wirbel-test/check.txt 2>&1
+strat void ./target/release/wirbel check > ~/wirbel-test/check.txt 2>&1
 sudo dmesg | tail -n 200 > ~/wirbel-test/dmesg.txt
 ```
 

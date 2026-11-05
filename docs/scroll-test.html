@@ -1,0 +1,12 @@
+<!doctype html><meta charset="utf-8"><title>Scrollen</title><body style="font:18px sans-serif;margin:32px">
+<h1>Mit dem Mausrad scrollen</h1>
+<div id="rows"></div>
+<script>
+const rows = document.getElementById("rows");
+for (let i = 0; i < 4000; i++) {
+  const row = document.createElement("p");
+  row.style.background = `hsl(${i % 360} 60% 80%)`;
+  row.textContent = `Zeile ${i}: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor.`;
+  rows.append(row);
+}
+</script>

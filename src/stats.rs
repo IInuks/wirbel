@@ -25,9 +25,6 @@ impl Series {
 
     /// `name n=... mean=... p50=... p99=... max=...` in milliseconds, then forgets the samples.
     fn take(&mut self, name: &str) -> Option<String> {
-        if self.0.is_empty() {
-            return None;
-        }
         let text = Summary::of(&mut self.0).map(|summary| format!("{name} {summary}"));
         self.0.clear();
         text

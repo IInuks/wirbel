@@ -10,7 +10,9 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
   das aber nur mit einem VT auf stdin, sonst Exit 1). Echter Start und Testablauf: `docs/TTY-TEST.md`.
 - `wirbel check [CONFIG]` prüft Session, Karten, Ausgänge, Rendern auf beiden GPUs und Eingabe, ohne
   etwas zu übernehmen. Darf immer laufen, auch im laufenden Mango. libseat wird dabei nicht gerufen,
-  denn schon das Öffnen eines Sitzes aktiviert die Session und übernimmt sie.
+  denn schon das Öffnen eines Sitzes aktiviert die Session und übernimmt sie. Es misst auch, wie lange
+  ein Bild in Monitorgröße die Hauptschleife aufhält, mit und ohne Kopie auf die andere GPU.
+- `--stats` loggt alle 5 s, wo die Zeit bleibt. Die Größen stehen oben in `src/stats.rs`.
 - Notausgänge: `--timeout SEK` beendet sauber, und nach 5 s Hänger mit Gewalt (Exit 71).
   Strg+Alt+Shift+Rücktaste beendet sofort (Exit 70), auch gesperrt oder bei hängender Hauptschleife.
   Strg+Alt+Fn wechselt das VT, auch gesperrt, die Sperre bleibt. SIGTERM und SIGINT beenden sauber.
@@ -60,8 +62,7 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
   Glocke in kitty stiehlt keinen Fokus. `_NET_ACTIVE_WINDOW` folgt derselben Regel, aus X11 heraus.
 - Screenshots gehen mit grim und flameshot (`wlr-screencopy` und `ext-image-copy-capture`), Bildschirm
   teilen über xdg-desktop-portal-wlr und PipeWire. Ein gesperrter Bildschirm zeigt auch in einer Aufnahme
-  nur die Sperre. Geteilt werden ganze Ausgänge, keine einzelnen Fenster: xdg-desktop-portal-wlr bietet das
-  nur mit `ext-foreign-toplevel-list` und Fenster-Quellen an, die fehlen.
+  nur die Sperre. Geteilt werden ganze Ausgänge, keine einzelnen Fenster, siehe "Fenster teilen".
 - Fensterlisten (`wlr-foreign-toplevel-management`) sehen alle Fenster, auch auf versteckten Workspaces, und
   können sie fokussieren, schließen, maximieren und in den Vollbildmodus setzen. Minimieren tut nichts.
 - Zwischenablage-Manager lesen und setzen Clipboard und Primary über `wlr-data-control`, auch ohne Fenster.
@@ -72,6 +73,8 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
 Minimal heißt: keine Animationen, kein Blur, keine Fensterdeko außer Rahmen und Lücke, keine
 Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser Datei. Fenster malen
 keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serverseitig.
+Mangos Extras kommen nicht: Kein Scratchpad, kein Overlay, kein Minimieren, kein Global. Das hat der Nutzer
+am 5.11.2026 entschieden, auch bei der Migration von Mango nicht nachbauen.
 
 ## Aufbau
 - `src/safety.rs`: das Sicherheitsnetz, unabhängig vom Backend und von der Hauptschleife. Eigene
@@ -143,6 +146,11 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
   2560x1440 also etwa das Vierfache. Der Weg über dmabufs ist offen, siehe Etappe 9.
 - `src/handlers/foreign_toplevel.rs`: `refresh_foreign_toplevels` vergleicht nach jeder Loop-Iteration die Fenster
   mit dem, was Clients zuletzt erfuhren, sonst muss niemand im Compositor davon wissen.
+- `src/stats.rs`: `--stats`. Aus liest es keine Uhr. `check` nutzt `Summary` für die Messung der GPU-Kopie.
+- `apply_subsurface_positions` (`src/handlers/compositor.rs`): Smithay hält `wl_subsurface.set_position` im Pending-
+  Zustand des Kindes, das Protokoll bindet die Position aber an den Commit des Elternteils. Chromium verschiebt
+  seine Blasen (Subsurfaces, keine Popups) ohne Commit der Blase. Der Aufruf steht vor `on_commit_buffer_handler`,
+  denn der rechnet die Views des ganzen Baums neu.
 - `src/handlers/`: Wayland-Protokolle. `layer_shell.rs`: ein Layer liegt bis zum ersten Commit in
   `unmapped_layers`, ein Commit ohne Buffer schickt ihn dorthin zurück, und der Client beginnt von
   vorn, wie das Protokoll es verlangt. `session_lock.rs`: `Phase` Unlocked, Locking (wartet auf ein
@@ -215,7 +223,9 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
   sie die Benachrichtigungen) und mit Attrappen für `mmsg` und `mpvpaper` vorn im `PATH`. Beenden
   über die eigenen PIDs samt Kindern.
 - Für Sperre und Popups reicht eine kleine QML-Datei mit `WlSessionLock` bzw. `PopupWindow`, das
-  ergibt echte Clients. Klicks lassen sich nested nicht auslösen, ohne die Maus des Nutzers zu bewegen.
+  ergibt echte Clients. Klicks lassen sich nested nicht auslösen, ohne die Maus des Nutzers zu bewegen. Für echte
+  Clients taugt eine vorübergehende, nicht committete IPC-Anfrage, die `on_pointer_button`, `on_pointer_axis`,
+  `on_key` und `on_pointer_delta` ruft. Mit `WAYLAND_DEBUG=1` am Client sieht man, was ankommt.
 - Das `[EGL] BAD_SURFACE`-Log nested stammt aus `buffer_age`: Nach dem Import eines neuen Buffers ist
   die Fensterfläche nicht aktuell, der Rahmen wird dann ganz neu gezeichnet. Harmlos.
 - Echte Shell in nested kitty: `kitty -o allow_remote_control=yes --listen-on unix:PFAD`, dann
@@ -226,7 +236,13 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
 - Portal-Tests nie auf einem normalen `dbus-run-session`, in keinem Stratum: Der aktiviert
   `xdg-document-portal`, und der laufenden Sitzung ging dabei der Mount `$XDG_RUNTIME_DIR/doc` samt ihrem Portal
   verloren (Session 07). `docs/tty-dbus.conf` hat keine Service-Verzeichnisse, `docs/tty-portals.sh` startet von
-  Hand. Mangos `start-portals` nie aufrufen: Es beendet Portale nach Muster.
+  Hand und weigert sich auf jedem anderen Bus. Mangos `start-portals` nie aufrufen: Es beendet Portale nach Muster.
+- Eine zweite `xdg-document-portal`-Instanz im selben `$XDG_RUNTIME_DIR` beendet die erste, auf welchem Bus auch
+  immer, und nimmt beim Ende den Mount mit. Bedrock zeigt jedem Bus über `/usr/local/share/dbus-1/services` die
+  Dienste aller Strata. Kein Bus schützt nicht: Ohne `DBUS_SESSION_BUS_ADDRESS` und mit `DISPLAY` startet GIO
+  `dbus-launch --autolaunch`, also einen normalen Bus. Darum läuft im TTY-Test jedes Programm auf dem privaten Bus,
+  auch Steam. Das nachzustellen geht gefahrlos mit eigenem `HOME` und `XDG_RUNTIME_DIR`, kurzer Pfad wegen
+  `AF_UNIX`.
 - Screenshare ohne Klick prüfen: Es gibt hier kein `pipewiresrc`. Ein kleiner Client (dbus-python aus Debian,
   `CreateSession`, `SelectSources`, `Start`, `OpenPipeWireRemote`) reicht den Stream an ein `pw_stream`-Programm
   weiter, Header und gcc liegen in Arch. `pw-top` zeigt, ob der Graph läuft. In Chromium kommt man nur
@@ -253,20 +269,54 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
 9. Härtung: Review, Absturzpfade, Leaks, Client-Fehlverhalten, Performance.
 
 Für Etappe 9 offen: Screencopy auf dmabufs, damit das Zurücklesen die Hauptschleife nicht anhält. Für Etappe 8:
-PipeWire, WirePlumber und Portale gehören in den Autostart. Portale laufen aus Arch, weil Void keine hat.
+PipeWire, WirePlumber und Portale gehören in den Autostart. Portale laufen aus Arch, weil Void keine hat. Die
+Sitzung braucht einen eigenen D-Bus, ohne den startet GIO einen, siehe die Hinweise zu Portal-Tests.
+
+## Leistung (gemessen, Session 08)
+Der unoptimierte Debug-Build war nicht die Ursache fürs Stocken. Nested mit Chromium oder glxgears und kitty:
+`render` im Mittel 0,25 ms ohne Optimierung und 0,06 bis 0,11 ms mit, die Nachbereitung nach jeder Iteration unter
+0,03 ms. Die Kopie AMD nach NVIDIA läuft im Treiber und kostet in beiden Builds dasselbe: 2560x1440 ganz im
+Mittel 2,2 ms, p99 5,7 bis 8,6 ms, ein Streifen von 200 Zeilen 0,5 ms, p50 0,3 ms. Das lief neben Mango, das dieselbe
+iGPU nutzt, und ohne Spiel. p99 liegt damit über einem Bild bei 165 Hz (6,06 ms) und 170 Hz (5,88 ms), einzelne
+Vblanks können also ausfallen. Echtes Scrollen in Chromium: Das Rad bis zum Commit des Clients p50 7 bis 10 ms,
+einmalig 1,6 s beim ersten Scrollen einer langen Seite, das liegt am Client, `render` blieb dabei klein. X11 und
+Wayland sind gleich. Steam erreicht unter wirbel und unter Mango denselben Punkt nach 3 s. Spielstarts in Test 16
+enthielten ein Shader-Update von Steam und `pv-locale-gen`. Auf dem echten Ausgang gemessen ist noch nichts:
+Tests 24 und 25 des Abschlusstests liefern `input`, `gap` und `late`, nested gibt es die nicht, der Host taktet.
+
+## Fenster teilen (Empfehlung, Session 08)
+Im Dialog von Chromium ging in Test 20 nur "Entire Screen". Jeder Klick auf "Window" loggt `wlroots: No supported
+targets specified`: xdg-desktop-portal-wlr 0.8.4 maskiert den Wunsch mit seinen `screencast_source_types`, und
+"Window" setzt es nur mit `ext-foreign-toplevel-list` und `ext_foreign_toplevel_image_capture_source_manager`. Der
+Reiter "Chrome Tab" gehört Chromium selbst, nicht dem Compositor, dort lag nur die Testseite offen. Unser Fehler ist das
+also nicht, sondern ein fehlendes Feature.
+Empfehlung: Vorerst nicht bauen, erst nach Etappe 9 auf Wunsch des Nutzers. Discord und Chromium teilen den ganzen
+Schirm, das reicht für den Umstieg von Mango. Smithay hat beide Protokolle (`foreign_toplevel_list`,
+`image_capture_source`), der Bau ist also machbar, aber mehr als die Globals: `Capturer` müsste ein einzelnes Fenster
+zeichnen, auch auf einem versteckten Workspace, und dessen Frame-Callbacks müssten weiterlaufen, sonst steht der
+Stream. Dazu braucht xdpw einen Wähler (`chooser_type=simple` oder `dmenu`), `none` nimmt nur den ersten Ausgang,
+und der gehört dann in die Session von Etappe 8.
 
 Sessions dürfen Etappen teilen oder verschmelzen; der Manager führt die Reihenfolge in
 `chain/QUEUE.md`.
 
 ## System
 Bedrock Linux: Init Void (runit, elogind, KEIN systemd), Strata Arch/Debian. Bauen im Arch-Stratum,
-das die Wayland-Dev-Libs hat: `strat -r arch env PATH=$HOME/.cargo/bin:$PATH cargo build`.
+das die Wayland-Dev-Libs hat: `strat -r arch env PATH=$HOME/.cargo/bin:$PATH cargo build --release`.
+Release ist der Alltags-Build und der des TTY-Tests, `target/release/wirbel`. Auch `cargo build` ist optimiert, aber
+langsamer als Release.
 Gestartet wird das DRM-Backend aber mit `strat void`: Nur Void hat die NVIDIA-Userspace-Treiber (EGL,
 `nvidia-drm_gbm.so`), in Arch fällt `renderD129` auf llvmpipe zurück. Die Arch-Binary läuft dort, weil sie
 höchstens glibc 2.39 verlangt und Void 2.41 hat; libdisplay-info ist darum nicht verlinkt, die
 Strata haben verschiedene Versionen. libseat und udev funktionieren in beiden. Clients kommen weiter
 aus Arch über `/bedrock/cross`, dort nur Mesa: Sie rendern auf der AMD-iGPU, wie unter Mango. Das gilt
-auch für Steam und Spiele, Arch hat keinen NVIDIA-Vulkan-Treiber (nur `radeon_icd`). Xwayland gibt es in Arch
-und Void: Mit `strat void` gestartet nimmt wirbel das aus Void, das auch die NVIDIA-Treiber sieht.
+auch für Steam und Spiele, Arch hat keinen NVIDIA-Vulkan-Treiber (nur `radeon_icd`). Steam selbst läuft aus Void
+und sieht den NVIDIA-Treiber. `docs/arch-nvidia.sh` installiert den Treiber in Arch, aber nur in der Version des
+geladenen Moduls. Die fehlt in Arch derzeit: Modul und Void 595.112.07, Repos 615.78.08, Archiv im 595-Zweig bis
+595.71.05. Das Skript bricht deshalb ab, ohne etwas zu ändern, und nennt die Wege. `glxgears` stammt aus Debian und
+hat dort nur Mesa: Bei `render_gpu=card1` sucht es `nouveau`, scheitert und fällt auf zink, das war Test 15. Dasselbe
+Binary mit Voids Bibliotheken und `__GLX_VENDOR_LIBRARY_NAME=nvidia` lief nested fehlerfrei auf der RTX. Xwayland gibt
+es in Arch und Void: Mit `strat void` gestartet nimmt wirbel das aus Void, das auch die NVIDIA-Treiber sieht.
 GPUs: NVIDIA RTX 4070 SUPER (Treiber 595, open) und AMD iGPU; Monitor an card1 (DP-4, wechselt
-gelegentlich zu DP-3), 165 Hz (der Monitor kann 170, Mango nutzt 170).
+gelegentlich zu DP-3). Alltag sind 170 Hz wie unter Mango, das hat der Nutzer entschieden, wirbel nimmt sie ohne
+Regel selbst. Getestet ist auf dem TTY bisher nur 165 Hz, 170 Hz kommt im Abschlusstest.
