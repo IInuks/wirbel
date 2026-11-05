@@ -6,7 +6,19 @@ per Befehl überall hinbewegen. Vorgaben des Nutzers (5.11.2026): Smithay, allta
 Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes `awww`.
 
 ## Bedienung
-- `wirbel` startet den Compositor (Backend automatisch: im Wayland/X11-Fenster nested, sonst DRM).
+- `wirbel` startet den Compositor (Backend automatisch: im Wayland/X11-Fenster nested, sonst DRM,
+  das aber nur mit einem VT auf stdin, sonst Exit 1). Echter Start und Testablauf: `docs/TTY-TEST.md`.
+- `wirbel check [CONFIG]` prüft Session, Karten, Ausgänge, Rendern auf beiden GPUs und Eingabe, ohne
+  etwas zu übernehmen. Darf immer laufen, auch im laufenden Mango. libseat wird dabei nicht gerufen,
+  denn schon das Öffnen eines Sitzes aktiviert die Session und übernimmt sie.
+- Notausgänge: `--timeout SEK` beendet sauber, und nach 5 s Hänger mit Gewalt (Exit 71).
+  Strg+Alt+Shift+Rücktaste beendet sofort (Exit 70), auch gesperrt oder bei hängender Hauptschleife.
+  Strg+Alt+Fn wechselt das VT, auch gesperrt, die Sperre bleibt. SIGTERM und SIGINT beenden sauber.
+  Eine Panik loggt mit Backtrace, stellt den TTY wieder her (Exit 101). `--panic-after SEK` und
+  `--hang-after SEK` lösen das zum Ausprobieren aus.
+- Log: auf dem VT `~/.local/state/wirbel/wirbel.log` (das vorige wird `.old`), sonst stderr, mit
+  `--log DATEI` immer dorthin. stderr und damit die Meldungen von Treibern und Clients folgen in die
+  Datei.
 - `wirbel pos` zeigt die Mausposition in EINER Zeile, die sich bei jeder Bewegung sofort
   aktualisiert (`\r`, kein Scrollen), bis Ctrl+C. Push über IPC-Abo, kein Polling. Globale
   Layout-Koordinaten mit Nachkommastellen (exakt), dazu Ausgang (`-`, wenn es keinen gibt).
@@ -42,6 +54,19 @@ Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser 
 keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serverseitig.
 
 ## Aufbau
+- `src/safety.rs`: das Sicherheitsnetz, unabhängig vom Backend und von der Hauptschleife. Eigene
+  Threads: `Watchdog` (Deadline, Signale, meldet eine stehende Schleife) und `watch_keyboards` (liest
+  die Notaus-Taste selbst aus `/dev/input`, ohne Grab, nur mit Gruppe `input`; Tasten anderer VTs werden
+  verworfen). `on_key` prüft die Taste zusätzlich, nested läuft nur das, außer mit
+  `WIRBEL_EMERGENCY_DEVICES=PFAD:PFAD` (für Tests). Alles endet in `hard_exit`: `_exit` ohne Destruktoren,
+  der Kernel schließt die Geräte und elogind gibt den VT zurück, `restore_terminal` tut das vorab per
+  ioctl selbst. Einen in einem Treiber-ioctl hängenden Prozess kann auch das nicht beenden.
+- `src/check.rs`: `wirbel check`. Geht den Weg von libseats logind-Backend (libelogind oder libsystemd
+  per dlopen, je nach Stratum) bis vor `Activate`. Karten nur lesend, ohne erzwungenen Probe, ein
+  ungewollt zugefallener DRM-Master geht sofort zurück. Der Render-Test läuft auf Render-Nodes mit
+  `MultiRenderer`, also genauso wie ein echtes Bild, bis auf den letzten Schritt zum Bildschirm.
+- `src/monitor.rs`: Mode-Wahl, Position, EDID-Name, frei von DRM-Typen. `src/cursor.rs`: Cursor-Thema,
+  mit Adwaita und einem eingebauten Pfeil als Rückfall. Animierte Cursor zeigen ihr erstes Bild.
 - `src/layout/`: Dwindle-Baum und Geometrie, frei von Compositor-Typen. Die Split-Achse wird nicht
   gespeichert, sondern folgt aus der Form der Fläche.
 - `src/workspace.rs`: `Monitor` (ein Ausgang mit 9 Workspaces) und `Workspace` (Dwindle-Baum,
@@ -95,13 +120,23 @@ keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serv
   Fullscreen liegt über Top, nicht über Overlay. `layer_tiers` liefert diese Ordnung, auch für
   `under`. Gesperrt zeichnet die Szene nur Cursor und Lock-Surface. Backends setzen `state.redraw`
   und zeichnen nur auf Anforderung.
-- `src/backend/`: bisher nur `winit` (nested), mit einem Ausgang. `add_output`, `remove_output` und
-  `output_resized` sind die Schnittstelle für weitere Backends; ein Ausgang liegt dort, wo
-  `current_location` sagt. `wirbel -c BEFEHL` startet Clients beim Start. Ein Backend, das dmabufs
-  kann, setzt `import_dmabuf` und ruft `offer_dmabufs`. `send_frame_callbacks` ruft es nach dem
-  Präsentieren eines Bildes auf: Das bestätigt auch die Sperre, also darf es nur für ein Bild
-  geschehen, das nach Beginn der Sperre gezeichnet wurde (beim DRM-Backend auf ein schon
-  eingereihtes Bild achten).
+- `src/backend/winit.rs`: nested, ein Ausgang. `add_output`, `remove_output` und `output_resized` sind
+  die Schnittstelle für Backends; ein Ausgang liegt dort, wo `current_location` sagt. `wirbel -c BEFEHL`
+  startet Clients beim Start. Ein Backend, das dmabufs kann, setzt `import_dmabuf` und ruft
+  `offer_dmabufs`. Hooks in `Wirbel`, die es setzen kann: `redraw`, `change_vt` (macht Strg+Alt+Fn erst
+  aktiv), `early_import`, `led_update`, `cursors`.
+- `src/backend/drm.rs`: libseat, udev, GBM, libinput, alle GPUs des Sitzes. Eine GPU rendert (`render_gpu`,
+  sonst die Boot-GPU, hier die AMD-iGPU, wie wlroots), `MultiRenderer` kopiert auf die anderen. Der
+  gemeinsame Zustand liegt in `Rc<RefCell<Drm>>`, nie über einen Aufruf hinweg geborgt, der wieder
+  einen Hook auslöst. NVIDIA: keine Overlay-Planes. Kein Ausgang beim Start: Exit 1 statt Schwarzbild.
+  Eine `monitorrule` wird beim Erscheinen des Ausgangs gelesen; `reload` ändert laufende Modes nicht.
+  Wird ein Mode abgelehnt, versucht das Backend den Standard-Mode. Gesperrt holt der VT-Wechsel die
+  Ausgänge mit abgeschalteten Connectors zurück, damit kein altes Bild aufblitzt.
+- `src/backend/pacing.rs`: pro Ausgang höchstens ein Bild unterwegs, das nächste nach dem Vblank plus
+  60 % Bilddauer für Clients (sofort bei einer Kopie auf eine andere GPU). Ändert sich nichts, ersetzt
+  ein Timer den Vblank, damit Frame-Callbacks im Takt bleiben. `send_frame_callbacks` zählt für die
+  Sperre; das DRM-Backend ruft stattdessen `send_frames` und nur für ein unter der Sperre gezeichnetes
+  Bild `lock_frame_presented`, ein vorher eingereihtes Bild zählt nicht.
 - `tests/headless.rs`: Compositor ohne Backend, echter Wayland-Client über den Socket, Eingaben
   injiziert, Pixel per Pixman geprüft, `wirbel pos`/`move` als echtes Binary. Hier gehören neue
   Verhaltenstests hin. Socket-Nummern werden im parallelen Lauf wiederverwendet: Ein Test darf nicht
@@ -153,7 +188,10 @@ Sessions dürfen Etappen teilen oder verschmelzen; der Manager führt die Reihen
 ## System
 Bedrock Linux: Init Void (runit, elogind, KEIN systemd), Strata Arch/Debian. Bauen im Arch-Stratum,
 das die Wayland-Dev-Libs hat: `strat -r arch env PATH=$HOME/.cargo/bin:$PATH cargo build`.
+Gestartet wird das DRM-Backend aber mit `strat void`: Nur Void hat die NVIDIA-Userspace-Treiber (EGL,
+`nvidia-drm_gbm.so`), in Arch fällt `renderD129` auf llvmpipe zurück. Die Arch-Binary läuft dort, weil sie
+höchstens glibc 2.39 verlangt und Void 2.41 hat; libdisplay-info ist darum nicht verlinkt, die
+Strata haben verschiedene Versionen. libseat und udev funktionieren in beiden. Clients kommen weiter
+aus Arch über `/bedrock/cross`, dort nur Mesa: Sie rendern auf der AMD-iGPU, wie unter Mango.
 GPUs: NVIDIA RTX 4070 SUPER (Treiber 595, open) und AMD iGPU; Monitor an card1 (DP-4, wechselt
-gelegentlich zu DP-3), 165 Hz. Sitzungsnahe Tools können cross-stratum zicken, vor allem
-elogind/libseat: prüfen, ob Arch-libseat aus der Session funktioniert oder der Build/Start im
-Void-Stratum liegen muss.
+gelegentlich zu DP-3), 165 Hz (der Monitor kann 170, Mango nutzt 170).

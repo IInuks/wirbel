@@ -261,6 +261,10 @@ fn check_session(report: &mut Report) {
     } else {
         report.note("no seatd running, libseat goes on to logind");
     }
+    match env::var_os("XDG_RUNTIME_DIR").filter(|dir| Path::new(dir).is_dir()) {
+        Some(_) => report.fine("XDG_RUNTIME_DIR is there, for the Wayland socket"),
+        None => report.fail("XDG_RUNTIME_DIR is missing, there would be no Wayland socket"),
+    }
     let Some(login) = Login::open() else {
         report.fail("neither libelogind nor libsystemd can be loaded here");
         return;

@@ -88,7 +88,7 @@ impl Cursors {
         format!("cursor from {source}, size {}", self.size)
     }
 
-    fn from_theme(&self, names: &[&str], pixels: u32) -> Option<CursorImage> {
+    fn themed(&self, names: &[&str], pixels: u32) -> Option<CursorImage> {
         let path = self
             .themes
             .iter()
@@ -141,7 +141,7 @@ impl Cursors {
         names.extend_from_slice(alternatives);
         names.push("default");
         names.push("left_ptr");
-        let image = self.from_theme(&names, pixels).unwrap_or_else(|| {
+        let image = self.themed(&names, pixels).unwrap_or_else(|| {
             tracing::warn!(
                 theme = self.name,
                 name,

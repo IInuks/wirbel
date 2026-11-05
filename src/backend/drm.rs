@@ -504,6 +504,13 @@ impl Drm {
             }
             // Whatever happened to the connectors in the meantime.
             self.device_changed(state, node);
+            // The damage tracker must not assume that the screen still shows the last frame.
+            if let Some(device) = self.devices.get_mut(&node) {
+                for surface in device.surfaces.values_mut() {
+                    surface.drm_output.reset_buffers();
+                    surface.pacing.reset();
+                }
+            }
         }
     }
 }
@@ -649,7 +656,7 @@ fn classify(err: SwapBuffersError) -> Rendered {
 }
 
 fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc::Handle) {
-    let (output, outcome, locked) = {
+    let (output, outcome) = {
         let mut guard = drm.borrow_mut();
         let this = &mut *guard;
         if !this.session.is_active() {
@@ -709,20 +716,16 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
         };
         match outcome {
             Rendered::Queued => surface.pacing.queued(locked),
-            Rendered::Unchanged | Rendered::Retry => surface.pacing.unchanged(false),
+            Rendered::Unchanged => surface.pacing.unchanged(locked),
+            Rendered::Retry => surface.pacing.unchanged(false),
             Rendered::Reset | Rendered::Fatal => surface.pacing.reset(),
         }
-        (output, outcome, locked)
+        (output, outcome)
     };
 
     match outcome {
         Rendered::Queued => {}
-        Rendered::Unchanged => {
-            if let Some(surface) = drm.borrow_mut().surface_mut(node, crtc) {
-                surface.pacing.unchanged(locked);
-            }
-            estimate_vblank(drm, node, crtc, &output);
-        }
+        Rendered::Unchanged => estimate_vblank(drm, node, crtc, &output),
         Rendered::Retry => {
             // This frame is lost, so it has to happen again.
             state.needs_redraw = true;
