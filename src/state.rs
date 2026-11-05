@@ -615,7 +615,7 @@ impl Wirbel {
             .collect();
         for window in &hidden {
             self.space.unmap_elem(window);
-            self.dismiss_popups(window);
+            self.dismiss_window_popups(window);
         }
 
         for frame in &frames {
@@ -782,22 +782,24 @@ impl Wirbel {
         }
     }
 
-    /// Withdraws the popups of `window`, which the user can no longer see.
-    pub fn dismiss_popups(&mut self, window: &Window) {
-        let Some(toplevel) = window.toplevel() else {
-            return;
-        };
-        let surface = toplevel.wl_surface().clone();
+    /// Withdraws the popups of a window or layer surface the user can no longer see.
+    pub fn dismiss_popups(&mut self, surface: &WlSurface) {
         if self
             .popup_grab
             .as_ref()
-            .is_some_and(|(_, root)| *root == surface)
+            .is_some_and(|(_, root)| root == surface)
         {
             self.end_popup_grab();
         }
-        for (popup, _) in PopupManager::popups_for_surface(&surface) {
+        for (popup, _) in PopupManager::popups_for_surface(surface) {
             // Fails only for a surface that is gone along with its popups.
-            let _ = PopupManager::dismiss_popup(&surface, &popup);
+            let _ = PopupManager::dismiss_popup(surface, &popup);
+        }
+    }
+
+    fn dismiss_window_popups(&mut self, window: &Window) {
+        if let Some(toplevel) = window.toplevel() {
+            self.dismiss_popups(toplevel.wl_surface());
         }
     }
 
@@ -916,7 +918,7 @@ impl Wirbel {
 
     /// Forgets a window that is gone, or unmapped itself, and moves focus to its neighbour.
     pub fn remove_window(&mut self, window: &Window) {
-        self.dismiss_popups(window);
+        self.dismiss_window_popups(window);
         self.awaiting_buffer.retain(|other| other != window);
         let next = self.workspace_of_mut(window).and_then(|workspace| {
             workspace.take(window);

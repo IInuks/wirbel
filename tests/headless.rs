@@ -1407,6 +1407,17 @@ fn offers_the_globals_kitty_needs() {
         "wl_seat",
         "wl_output",
         "xdg_wm_base",
+        "zwlr_layer_shell_v1",
+        "zxdg_decoration_manager_v1",
+        "zxdg_output_manager_v1",
+        "wl_data_device_manager",
+        "zwp_primary_selection_device_manager_v1",
+        "wp_cursor_shape_manager_v1",
+        "wp_viewporter",
+        "wp_fractional_scale_manager_v1",
+        "ext_session_lock_manager_v1",
+        "zwp_idle_inhibit_manager_v1",
+        "ext_idle_notifier_v1",
     ] {
         assert!(
             names.iter().any(|global| global == name),
@@ -4377,6 +4388,28 @@ fn a_popup_of_a_lower_layer_opens_above_the_windows() {
             .take_input()
             .contains(&Input::PointerEnter(popup.input, 50.0, 50.0))
     );
+}
+
+#[test]
+fn unmapping_a_panel_withdraws_its_popups_and_their_grab() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let bar = client.open_bar(30, BAR);
+    compositor.pointer_at(500.0, 10.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    client.sync();
+    let serial = client.state.button_serial;
+    let _popup = client.open_layer_popup(bar, (100, 100), (100, 100), POPUP, Some(serial));
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    assert!(compositor.with(|state| state.popup_grab.is_some()));
+
+    let surface = client.state.layers[bar].surface.clone();
+    surface.attach(None, 0, 0);
+    surface.commit();
+    client.sync();
+    assert_eq!(client.state.popups_done, 1);
+    assert!(compositor.with(|state| state.popup_grab.is_none()));
+    assert!(compositor.with(|state| !state.seat.get_pointer().unwrap().is_grabbed()));
 }
 
 #[test]

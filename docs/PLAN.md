@@ -22,6 +22,10 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
   Befehl wird nie abgelehnt, solange ein Ausgang existiert; nur `warp_cursor` wartet einen Grab ab.
 - `wirbel pos` und `wirbel move` sprechen den Compositor von `WAYLAND_DISPLAY` an, aus Programmen
   in wirbel also von selbst den richtigen. Ohne Compositor: Exit 1 und Meldung auf stderr.
+- Gesperrt (`ext-session-lock`) gibt es nur noch die Lock-Surfaces: Der Bildschirm zeigt nichts sonst,
+  Tasten und Zeiger erreichen nur sie, keine Binds, keine Fokuswechsel. `wirbel pos` und `wirbel move`
+  bleiben erlaubt, der Zeiger bewegt sich, sieht aber nur die Lock-Surface. Stirbt der Locker, bleibt
+  gesperrt, bis ein neuer Locker übernimmt; nested beendet nur das Schließen des Fensters die Sitzung.
 - Config: `~/.config/wirbel/config` (oder `wirbel --config DATEI`), einfaches Textformat, Neuladen
   per Keybind ohne Neustart. Standard-Belegung an `~/.config/mango/config.conf` angelehnt
   (Super+Return kitty, Super+W schließen, Super+1..9 Workspaces, Alt+Pfeile Fokus,
@@ -34,14 +38,16 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
 
 ## Stil
 Minimal heißt: keine Animationen, kein Blur, keine Fensterdeko außer Rahmen und Lücke, keine
-Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser Datei.
+Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser Datei. Fenster malen
+keine eigene Deko: Egal was sie verlangen, `xdg-decoration` antwortet immer serverseitig.
 
 ## Aufbau
 - `src/layout/`: Dwindle-Baum und Geometrie, frei von Compositor-Typen. Die Split-Achse wird nicht
   gespeichert, sondern folgt aus der Form der Fläche.
 - `src/workspace.rs`: `Monitor` (ein Ausgang mit 9 Workspaces) und `Workspace` (Dwindle-Baum,
   Floating-Stapel, Fullscreen/Maximize, gemerkter Fokus). `Workspace::frames` berechnet, was wo
-  sichtbar ist. Fenster haben keinen eigenen Status außerhalb dieser Struktur.
+  sichtbar ist: Fullscreen bekommt den ganzen Ausgang, alles andere `work_area`, den Teil ohne
+  Exclusive Zones. Fenster haben keinen eigenen Status außerhalb dieser Struktur.
 - `src/state.rs`: `Wirbel`, zentraler Zustand. `monitors` hält alle Fenster, `space` nur die
   sichtbaren. `retile()` leitet den ganzen Bildschirm aus `monitors` ab: blendet ein und aus, setzt
   die Stapelreihenfolge, schickt Configures. Nach jeder Änderung an Workspaces aufrufen.
@@ -50,10 +56,29 @@ Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser 
 - `src/ipc.rs`: Steuer-Socket `$XDG_RUNTIME_DIR/wirbel-<WAYLAND_DISPLAY>.sock`, Zeilenprotokoll
   (oben in der Datei beschrieben), läuft nicht blockierend in der Event-Loop. `src/cli.rs`: die
   Befehle `wirbel pos` und `wirbel move`.
+- `Wirbel::under` (`src/state.rs`) ist die eine Antwort auf "was liegt an diesem Punkt", gesperrt nur
+  Lock-Surfaces. `surface_under` und `window_at` lesen daraus, Hover, Klick, sloppy focus und
+  `wirbel move` stimmen also von selbst.
+- `Wirbel::keyboard_target` ist die eine Antwort auf "wer bekommt die Tastatur": Lock-Surface, dann
+  Layer mit `exclusive` (Top/Overlay), dann per Klick gewählter Layer (`on_demand`), dann das
+  fokussierte Fenster. Wer an der Antwort etwas ändert, ruft `update_keyboard_focus`. Sloppy focus
+  nimmt einem Layer die Tastatur nicht, ein Klick woanders schon.
 - `src/grabs.rs`: Fenster ziehen. Der Pointer-Grab hält nur Clients fern, die Logik läuft danach in
   `on_pointer_motion`/`on_pointer_button`, denn Code im Grab darf den Pointer nicht anfassen und
   `retile` tut das.
-- `src/handlers/`: Wayland-Protokolle. Lebenslauf eines Toplevels: erster Commit platziert es,
+- Popup-Grabs: `popup_grab` hält Smithays Grab. `reap_popup_grab` läuft nach jeder Loop-Iteration und
+  beendet einen Grab, dessen Popups weg sind, bevor Smithays Grab die nächste Bewegung schluckt
+  (`wirbel move` ginge sonst verloren). Wird ein Fenster oder Layer unsichtbar, zieht
+  `dismiss_popups` seine Popups zurück, ein Fokuswechsel beendet den Grab. Popups von Fenstern
+  bleiben in der `work_area`, Popups von Layern dürfen auf den ganzen Ausgang.
+- `src/handlers/`: Wayland-Protokolle. `layer_shell.rs`: ein Layer liegt bis zum ersten Commit in
+  `unmapped_layers`, ein Commit ohne Buffer schickt ihn dorthin zurück, und der Client beginnt von
+  vorn, wie das Protokoll es verlangt. `session_lock.rs`: `Phase` Unlocked, Locking (wartet auf ein
+  präsentiertes leeres Bild je Ausgang), Locked. Der `locked`-Event geht erst danach raus, gesperrt
+  ist aber schon ab der Anfrage. `selection.rs`: Clipboard, primary selection, Drag and Drop.
+  `mod.rs`: der Rest, darunter `offer_dmabufs`. Idle: `ext-idle-notify` gehört mit dazu, ohne ihn
+  hätte `idle-inhibit` keine Wirkung. Ein Inhibitor zählt nur, solange seine Surface sichtbar ist.
+  Lebenslauf eines Toplevels: erster Commit platziert es,
   erster Buffer fokussiert, Commit ohne Buffer entfernt es wieder (`toplevel_commit`). Dialoge
   (Parent gesetzt) und Fenster fester Größe floaten von selbst.
 - `Wirbel::move_pointer` (`src/state.rs`) ist der einzige Aufrufer von `pointer.motion`: klemmt an
@@ -65,12 +90,18 @@ Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser 
 - `src/input.rs`: Backends rufen `on_key`, `on_pointer_motion`, `on_pointer_button`,
   `on_pointer_axis`; dort speisen auch Tests Eingaben ein. Keybinds greifen im Filter von
   `keyboard.input`, gebundene Tasten erreichen Clients weder beim Drücken noch beim Loslassen.
-- `src/render.rs`: Szene unabhängig vom Backend (`scene_elements`), von vorn nach hinten: Cursor,
-  dann je Fenster es selbst und sein Rahmen. Backends setzen `state.redraw` und zeichnen nur auf
-  Anforderung.
+- `src/render.rs`: Szene unabhängig vom Backend (`scene_elements`), von vorn nach hinten: Cursor und
+  DnD-Icon, Overlay, Top, Popups aller Layer darunter, Fenster mit Rahmen, Bottom, Background.
+  Fullscreen liegt über Top, nicht über Overlay. `layer_tiers` liefert diese Ordnung, auch für
+  `under`. Gesperrt zeichnet die Szene nur Cursor und Lock-Surface. Backends setzen `state.redraw`
+  und zeichnen nur auf Anforderung.
 - `src/backend/`: bisher nur `winit` (nested), mit einem Ausgang. `add_output`, `remove_output` und
   `output_resized` sind die Schnittstelle für weitere Backends; ein Ausgang liegt dort, wo
-  `current_location` sagt. `wirbel -c BEFEHL` startet Clients beim Start.
+  `current_location` sagt. `wirbel -c BEFEHL` startet Clients beim Start. Ein Backend, das dmabufs
+  kann, setzt `import_dmabuf` und ruft `offer_dmabufs`. `send_frame_callbacks` ruft es nach dem
+  Präsentieren eines Bildes auf: Das bestätigt auch die Sperre, also darf es nur für ein Bild
+  geschehen, das nach Beginn der Sperre gezeichnet wurde (beim DRM-Backend auf ein schon
+  eingereihtes Bild achten).
 - `tests/headless.rs`: Compositor ohne Backend, echter Wayland-Client über den Socket, Eingaben
   injiziert, Pixel per Pixman geprüft, `wirbel pos`/`move` als echtes Binary. Hier gehören neue
   Verhaltenstests hin. Socket-Nummern werden im parallelen Lauf wiederverwendet: Ein Test darf nicht
@@ -87,6 +118,16 @@ Skriptsprache. Workspaces 1–9 je Ausgang. Keine Features ohne Bezug zu dieser 
   nicht als Tasten. Binds testet man so: `bind = NONE, 1, reload` und `bind = NONE, 2, AKTION`, die
   Aktion in der Datei ändern, dann `wtype abc`. Vorher per `mmsg get focusing-client` prüfen, dass
   das Nested-Fenster den Host-Fokus hat.
+- Echte Layer-Clients sauber trennen: `awww-daemon` nur mit `WAYLAND_DISPLAY=wayland-N` und eigenem
+  `XDG_CACHE_HOME` starten, dann bekommt er einen eigenen Socket. Die Quickshell-Bar aus einer Kopie
+  des Ordners starten, mit eigenem `HOME` und `XDG_RUNTIME_DIR` (kurzer Pfad, sonst passt der
+  IPC-Socket nicht), `WAYLAND_DISPLAY` als absolutem Pfad, unter `dbus-run-session` (sonst übernimmt
+  sie die Benachrichtigungen) und mit Attrappen für `mmsg` und `mpvpaper` vorn im `PATH`. Beenden
+  über die eigenen PIDs samt Kindern.
+- Für Sperre und Popups reicht eine kleine QML-Datei mit `WlSessionLock` bzw. `PopupWindow`, das
+  ergibt echte Clients. Klicks lassen sich nested nicht auslösen, ohne die Maus des Nutzers zu bewegen.
+- Das `[EGL] BAD_SURFACE`-Log nested stammt aus `buffer_age`: Nach dem Import eines neuen Buffers ist
+  die Fensterfläche nicht aktuell, der Rahmen wird dann ganz neu gezeichnet. Harmlos.
 - Mit `WAYLAND_DISPLAY=wayland-N ./target/debug/wirbel pos` bzw. `move` lässt sich die Nested-Instanz
   von außen steuern, ohne die Maus des Nutzers zu bewegen. Der Socket steht im Log.
 

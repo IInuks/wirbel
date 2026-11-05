@@ -99,6 +99,7 @@ impl Wirbel {
         if has_buffer(surface) {
             shown.0.store(true, Ordering::Relaxed);
         } else if shown.0.swap(false, Ordering::Relaxed) {
+            self.dismiss_popups(surface);
             layer_map_for_output(&output).unmap_layer(&layer);
             self.unmapped_layers.push((layer, output));
             self.layers_changed();
@@ -122,13 +123,12 @@ impl Wirbel {
 
     /// Tells the layer surfaces of a lost output that they are gone.
     pub(crate) fn close_layers(&mut self, output: &Output) {
-        let mut map = layer_map_for_output(output);
-        let layers: Vec<_> = map.layers().cloned().collect();
+        let layers: Vec<_> = layer_map_for_output(output).layers().cloned().collect();
         for layer in layers {
+            self.dismiss_popups(layer.wl_surface());
             layer.layer_surface().send_close();
-            map.unmap_layer(&layer);
+            layer_map_for_output(output).unmap_layer(&layer);
         }
-        drop(map);
         self.unmapped_layers.retain(|(layer, other)| {
             if other == output {
                 layer.layer_surface().send_close();
