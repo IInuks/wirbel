@@ -1,7 +1,9 @@
 //! Wayland protocol handlers.
 
 mod compositor;
+mod foreign_toplevel;
 mod layer_shell;
+mod screencopy;
 mod selection;
 mod session_lock;
 mod xdg_activation;
@@ -14,9 +16,13 @@ use smithay::{
         Seat, SeatHandler, SeatState, keyboard::LedState, pointer::CursorImageStatus,
         pointer::PointerHandle, tablet::TabletSeatHandler,
     },
+    output::Output,
     reexports::{
         wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
-        wayland_server::{Resource, protocol::wl_surface::WlSurface},
+        wayland_server::{
+            Resource,
+            protocol::{wl_output::WlOutput, wl_surface::WlSurface},
+        },
     },
     wayland::{
         compositor::with_states,
@@ -35,6 +41,8 @@ use smithay::{
 
 use crate::{Wirbel, focus::KeyboardFocus, state::apply_output_scale};
 
+pub use foreign_toplevel::ForeignToplevelState;
+pub use screencopy::{Capturer, ScreencopyState};
 pub use session_lock::SessionLock;
 
 impl SeatHandler for Wirbel {
@@ -70,7 +78,11 @@ impl TabletSeatHandler for Wirbel {
     type ToolFocus = WlSurface;
 }
 
-impl OutputHandler for Wirbel {}
+impl OutputHandler for Wirbel {
+    fn output_bound(&mut self, output: Output, wl_output: WlOutput) {
+        self.foreign_output_bound(&output, &wl_output);
+    }
+}
 
 impl PointerConstraintsHandler for Wirbel {
     fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {

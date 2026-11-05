@@ -2,6 +2,7 @@
 //! injected where a backend would deliver it, output is rendered with pixman.
 
 use std::{
+    cell::RefCell,
     env,
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
@@ -64,6 +65,15 @@ use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1::{self, ExtIdleNotificationV1},
     ext_idle_notifier_v1::ExtIdleNotifierV1,
 };
+use wayland_protocols::ext::image_capture_source::v1::client::{
+    ext_image_capture_source_v1::ExtImageCaptureSourceV1,
+    ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
+};
+use wayland_protocols::ext::image_copy_capture::v1::client::{
+    ext_image_copy_capture_frame_v1::{self, ExtImageCopyCaptureFrameV1},
+    ext_image_copy_capture_manager_v1::{ExtImageCopyCaptureManagerV1, Options},
+    ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
+};
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1::ExtSessionLockManagerV1,
     ext_session_lock_surface_v1::{self, ExtSessionLockSurfaceV1},
@@ -125,13 +135,27 @@ use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1,
     zxdg_output_v1::{self, ZxdgOutputV1},
 };
+use wayland_protocols_wlr::data_control::v1::client::{
+    zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
+    zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
+    zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
+    zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
+};
+use wayland_protocols_wlr::foreign_toplevel::v1::client::{
+    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
+    zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
 };
+use wayland_protocols_wlr::screencopy::v1::client::{
+    zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
+    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+};
 use wirbel::{
-    Wirbel, config::Config, focus::KeyboardFocus, input::Scroll, ipc::Position, layout::Rect,
-    workspace::Placement,
+    Wirbel, config::Config, focus::KeyboardFocus, handlers::Capturer, input::Scroll, ipc::Position,
+    layout::Rect, workspace::Placement,
 };
 use x11rb::{
     COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT,
@@ -149,6 +173,7 @@ use x11rb::{
 
 const WIDTH: i32 = 1000;
 const HEIGHT: i32 = 600;
+const CONTROL_TEXT: &[u8] = b"from the clipboard manager";
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 
@@ -306,6 +331,19 @@ impl Compositor {
         self.screenshot_of(0)
     }
 
+    /// What a backend does for screen captures after it drew `monitor`.
+    fn run_captures(&self, monitor: usize) {
+        thread_local! {
+            static CAPTURER: RefCell<Capturer<Image<'static, 'static>>> = RefCell::default();
+        }
+        self.with(move |state| {
+            state.space.refresh();
+            let output = state.monitors[monitor].output.clone();
+            let mut renderer = PixmanRenderer::new().unwrap();
+            CAPTURER.with_borrow_mut(|capturer| capturer.run(state, &mut renderer, &output));
+        });
+    }
+
     /// What the backend does after it presented a frame on every output.
     fn present(&self) {
         self.with(|state| {
@@ -457,6 +495,39 @@ struct ClientState {
     presented: Vec<bool>,
     /// The latest activation token.
     activation_token: Option<String>,
+    copy: CopyState,
+    foreign: Vec<ForeignToplevel>,
+    control_offers: Vec<(ZwlrDataControlOfferV1, Vec<String>)>,
+    control_selection: Option<ZwlrDataControlOfferV1>,
+    control_primary: Option<ZwlrDataControlOfferV1>,
+    control_cancelled: bool,
+}
+
+/// What a capture frame or session said, for either of the two protocols.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CopyState {
+    /// Size of the buffer to bring.
+    size: Option<(u32, u32)>,
+    stride: u32,
+    formats: Vec<u32>,
+    /// All buffer events are through.
+    described: bool,
+    damage: Vec<(i32, i32, i32, i32)>,
+    ready: bool,
+    failed: bool,
+    stopped: bool,
+}
+
+#[derive(Debug)]
+struct ForeignToplevel {
+    handle: ZwlrForeignToplevelHandleV1,
+    title: String,
+    app_id: String,
+    states: Vec<u32>,
+    outputs: i32,
+    parent: bool,
+    done: u32,
+    closed: bool,
 }
 
 /// First index of surfaces in `Input` events that are no windows.
@@ -842,6 +913,41 @@ impl Client {
         let popup = xdg_surface.get_popup(None, &positioner, &self.handle, ());
         self.state.layers[index].layer.get_popup(&popup);
         self.finish_popup(surface, xdg_surface, popup, size, color, grab)
+    }
+
+    /// A buffer of plain memory for a capture, and the file it lives in.
+    fn capture_buffer(&mut self, width: i32, height: i32) -> (WlBuffer, fs::File) {
+        static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
+        let path = env::temp_dir().join(format!(
+            "wirbel-capture-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        file.set_len((width * height * 4) as u64).unwrap();
+        let pool = self
+            .shm
+            .create_pool(file.as_fd(), width * height * 4, &self.handle, ());
+        let format = Format::Xrgb8888;
+        let buffer = pool.create_buffer(0, width, height, width * 4, format, &self.handle, ());
+        pool.destroy();
+        (buffer, file)
+    }
+
+    /// Checks the buffer events of a new `wlr-screencopy` frame and returns the size they name.
+    fn describe_frame(&mut self) -> (i32, i32) {
+        self.sync();
+        assert!(self.state.copy.described, "no buffer_done");
+        let (width, height) = self.state.copy.size.expect("no buffer event");
+        assert_eq!(self.state.copy.formats, [Format::Xrgb8888 as u32]);
+        assert_eq!(self.state.copy.stride, width * 4);
+        (width as i32, height as i32)
     }
 
     fn xdg_surface(&self, index: usize) -> XdgSurface {
@@ -1432,6 +1538,218 @@ delegate_noop!(ClientState: ignore ZwpPointerConstraintsV1);
 delegate_noop!(ClientState: ignore ZwpRelativePointerManagerV1);
 delegate_noop!(ClientState: ignore WpPresentation);
 delegate_noop!(ClientState: ignore XdgActivationV1);
+delegate_noop!(ClientState: ignore ZwlrScreencopyManagerV1);
+delegate_noop!(ClientState: ignore ExtImageCopyCaptureManagerV1);
+delegate_noop!(ClientState: ignore ExtOutputImageCaptureSourceManagerV1);
+delegate_noop!(ClientState: ignore ExtImageCaptureSourceV1);
+delegate_noop!(ClientState: ignore ZwlrDataControlManagerV1);
+
+impl Dispatch<ZwlrScreencopyFrameV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwlrScreencopyFrameV1,
+        event: zwlr_screencopy_frame_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwlr_screencopy_frame_v1::Event;
+        match event {
+            Event::Buffer {
+                format,
+                width,
+                height,
+                stride,
+            } => {
+                state.copy.size = Some((width, height));
+                state.copy.stride = stride;
+                if let WEnum::Value(format) = format {
+                    state.copy.formats.push(format as u32);
+                }
+            }
+            Event::BufferDone => state.copy.described = true,
+            Event::Damage {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let rect = (x as i32, y as i32, width as i32, height as i32);
+                state.copy.damage.push(rect);
+            }
+            Event::Ready { .. } => state.copy.ready = true,
+            Event::Failed => state.copy.failed = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ExtImageCopyCaptureSessionV1,
+        event: ext_image_copy_capture_session_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use ext_image_copy_capture_session_v1::Event;
+        match event {
+            Event::BufferSize { width, height } => state.copy.size = Some((width, height)),
+            Event::ShmFormat {
+                format: WEnum::Value(format),
+            } => state.copy.formats.push(format as u32),
+            Event::Done => state.copy.described = true,
+            Event::Stopped => state.copy.stopped = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ExtImageCopyCaptureFrameV1,
+        event: ext_image_copy_capture_frame_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use ext_image_copy_capture_frame_v1::Event;
+        match event {
+            Event::Damage {
+                x,
+                y,
+                width,
+                height,
+            } => state.copy.damage.push((x, y, width, height)),
+            Event::Ready => state.copy.ready = true,
+            Event::Failed { .. } => state.copy.failed = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwlrForeignToplevelManagerV1,
+        event: zwlr_foreign_toplevel_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } = event {
+            state.foreign.push(ForeignToplevel {
+                handle: toplevel,
+                title: String::new(),
+                app_id: String::new(),
+                states: Vec::new(),
+                outputs: 0,
+                parent: false,
+                done: 0,
+                closed: false,
+            });
+        }
+    }
+
+    event_created_child!(ClientState, ZwlrForeignToplevelManagerV1, [
+        zwlr_foreign_toplevel_manager_v1::EVT_TOPLEVEL_OPCODE => (ZwlrForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        handle: &ZwlrForeignToplevelHandleV1,
+        event: zwlr_foreign_toplevel_handle_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwlr_foreign_toplevel_handle_v1::Event;
+        let entry = state
+            .foreign
+            .iter_mut()
+            .find(|entry| entry.handle == *handle);
+        let entry = entry.expect("event for an unknown toplevel");
+        match event {
+            Event::Title { title } => entry.title = title,
+            Event::AppId { app_id } => entry.app_id = app_id,
+            Event::OutputEnter { .. } => entry.outputs += 1,
+            Event::OutputLeave { .. } => entry.outputs -= 1,
+            Event::State { state } => {
+                let states = state.chunks_exact(4);
+                entry.states = states
+                    .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+                    .collect();
+            }
+            Event::Parent { parent } => entry.parent = parent.is_some(),
+            Event::Done => entry.done += 1,
+            Event::Closed => entry.closed = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwlrDataControlDeviceV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwlrDataControlDeviceV1,
+        event: zwlr_data_control_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwlr_data_control_device_v1::Event;
+        match event {
+            Event::DataOffer { id } => state.control_offers.push((id, Vec::new())),
+            Event::Selection { id } => state.control_selection = id,
+            Event::PrimarySelection { id } => state.control_primary = id,
+            _ => {}
+        }
+    }
+
+    event_created_child!(ClientState, ZwlrDataControlDeviceV1, [
+        zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ZwlrDataControlOfferV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrDataControlOfferV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        offer: &ZwlrDataControlOfferV1,
+        event: zwlr_data_control_offer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event
+            && let Some(entry) = state.control_offers.iter_mut().find(|(o, _)| o == offer)
+        {
+            entry.1.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<ZwlrDataControlSourceV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwlrDataControlSourceV1,
+        event: zwlr_data_control_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_data_control_source_v1::Event::Send { fd, .. } => {
+                fs::File::from(fd).write_all(CONTROL_TEXT).unwrap();
+            }
+            zwlr_data_control_source_v1::Event::Cancelled => state.control_cancelled = true,
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<ZwpLockedPointerV1, ()> for ClientState {
     fn event(
@@ -6280,4 +6598,562 @@ fn a_dead_x_server_takes_its_windows_along_and_comes_back() {
     let root = connection.setup().roots[screen].root;
     x_window(&connection, root, false);
     wait_for(|| compositor.focused_rect().is_some());
+}
+
+/// The XRGB pixel at (x, y) of a captured image `width` wide.
+fn captured_pixel(file: &fs::File, width: i32, x: i32, y: i32) -> u32 {
+    use std::os::unix::fs::FileExt;
+    let mut pixel = [0; 4];
+    file.read_exact_at(&mut pixel, ((y * width + x) * 4) as u64)
+        .unwrap();
+    u32::from_le_bytes(pixel) & 0xff_ffff
+}
+
+/// Captures all of the first output by `wlr-screencopy` and returns the image.
+fn screencopy(compositor: &Compositor, client: &mut Client, cursor: i32) -> fs::File {
+    let manager: ZwlrScreencopyManagerV1 = client.bind(1..=3);
+    let output: WlOutput = client.bind(1..=4);
+    let frame = manager.capture_output(cursor, &output, &client.handle, ());
+    let (width, height) = client.describe_frame();
+    assert_eq!((width, height), (WIDTH, HEIGHT));
+    let (buffer, file) = client.capture_buffer(width, height);
+    client.state.copy = CopyState::default();
+    frame.copy(&buffer);
+    client.sync();
+    assert!(!client.state.copy.ready, "answered before the next frame");
+    compositor.run_captures(0);
+    client.sync();
+    assert!(client.state.copy.ready, "no ready");
+    assert!(!client.state.copy.failed);
+    frame.destroy();
+    file
+}
+
+#[test]
+fn screencopy_shows_what_is_on_the_output() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let image = screencopy(&compositor, &mut client, 0);
+    let rgb = RED & 0xff_ffff;
+    assert_eq!(captured_pixel(&image, WIDTH, WIDTH / 2, HEIGHT / 2), rgb);
+    let shot = compositor.screenshot();
+    for (x, y) in [(0, 0), (20, 20), (WIDTH - 1, HEIGHT - 1)] {
+        assert_eq!(
+            captured_pixel(&image, WIDTH, x, y),
+            shot.at(x, y) & 0xff_ffff,
+            "at {x},{y}"
+        );
+    }
+}
+
+#[test]
+fn screencopy_of_a_region_is_that_part_and_stays_on_the_output() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.open_window(GREEN);
+    let manager: ZwlrScreencopyManagerV1 = client.bind(1..=3);
+    let output: WlOutput = client.bind(1..=4);
+
+    // Straddles the line between the two windows, and sticks out at the bottom.
+    let (x, y) = (WIDTH / 2 - 50, HEIGHT - 100);
+    let frame = manager.capture_output_region(0, &output, x, y, 100, 300, &client.handle, ());
+    let (width, height) = client.describe_frame();
+    assert_eq!((width, height), (100, 100));
+    let (buffer, file) = client.capture_buffer(width, height);
+    client.state.copy = CopyState::default();
+    frame.copy(&buffer);
+    client.sync();
+    compositor.run_captures(0);
+    client.sync();
+    assert!(client.state.copy.ready);
+    let shot = compositor.screenshot();
+    for (px, py) in [(5, 5), (95, 5), (50, 50), (5, 40)] {
+        assert_eq!(
+            captured_pixel(&file, width, px, py),
+            shot.at(x + px, y + py) & 0xff_ffff,
+            "at {px},{py}"
+        );
+    }
+
+    client.state.copy = CopyState::default();
+    let _outside = manager.capture_output_region(0, &output, WIDTH, 0, 10, 10, &client.handle, ());
+    client.sync();
+    assert!(client.state.copy.failed, "a region off the output");
+}
+
+#[test]
+fn screencopy_draws_the_cursor_only_on_request() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    compositor.pointer_at(400.0, 300.0);
+    client.sync();
+    let pointer = client._pointer.clone();
+    let cursor = client.compositor.create_surface(&client.handle, ());
+    let _buffer = client.fill(&cursor, 8, 8, BLUE);
+    pointer.set_cursor(client.state.enter_serial, Some(&cursor), 0, 0);
+    client.sync();
+
+    let with = screencopy(&compositor, &mut client, 1);
+    assert_eq!(captured_pixel(&with, WIDTH, 403, 303), BLUE & 0xff_ffff);
+    client.state.copy = CopyState::default();
+    let without = screencopy(&compositor, &mut client, 0);
+    assert_eq!(captured_pixel(&without, WIDTH, 403, 303), RED & 0xff_ffff);
+}
+
+#[test]
+fn copy_with_damage_waits_for_a_change() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let window = client.open_window(RED);
+    let manager: ZwlrScreencopyManagerV1 = client.bind(1..=3);
+    let output: WlOutput = client.bind(1..=4);
+    let (buffer, file) = client.capture_buffer(WIDTH, HEIGHT);
+
+    let frame = manager.capture_output(0, &output, &client.handle, ());
+    client.sync();
+    frame.copy_with_damage(&buffer);
+    client.sync();
+    compositor.run_captures(0);
+    client.sync();
+    assert!(
+        client.state.copy.ready,
+        "the first frame has to come at once"
+    );
+    frame.destroy();
+
+    client.state.copy = CopyState::default();
+    let frame = manager.capture_output(0, &output, &client.handle, ());
+    client.sync();
+    frame.copy_with_damage(&buffer);
+    client.sync();
+    compositor.run_captures(0);
+    compositor.run_captures(0);
+    client.sync();
+    assert!(!client.state.copy.ready, "nothing changed");
+
+    client.draw(window, GREEN);
+    compositor.run_captures(0);
+    client.sync();
+    assert!(client.state.copy.ready, "a change has to end the wait");
+    assert_eq!(client.state.copy.damage, [(0, 0, WIDTH, HEIGHT)]);
+    let rgb = GREEN & 0xff_ffff;
+    assert_eq!(captured_pixel(&file, WIDTH, WIDTH / 2, HEIGHT / 2), rgb);
+}
+
+#[test]
+fn a_capture_of_a_locked_session_shows_only_the_lock() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let output: WlOutput = client.bind(1..=4);
+    let lock = client.lock();
+    let _surface = client.lock_surface(&lock, &output, BLUE);
+    let image = screencopy(&compositor, &mut client, 0);
+    let rgb = BLUE & 0xff_ffff;
+    assert_eq!(captured_pixel(&image, WIDTH, WIDTH / 2, HEIGHT / 2), rgb);
+    assert_eq!(captured_pixel(&image, WIDTH, 30, 30), rgb);
+}
+
+#[test]
+fn a_capture_of_an_output_that_goes_away_fails() {
+    let compositor = Compositor::start();
+    let second = compositor.add_output("second", (WIDTH, 0));
+    let mut client = Client::connect(&compositor);
+    let manager: ZwlrScreencopyManagerV1 = client.bind(1..=3);
+    let globals = client.globals.contents().clone_list();
+    let outputs = globals
+        .iter()
+        .filter(|global| global.interface == "wl_output");
+    let names: Vec<u32> = outputs.map(|global| global.name).collect();
+    let wl_output: WlOutput = client
+        .globals
+        .registry()
+        .bind(names[1], 4, &client.handle, ());
+    let frame = manager.capture_output(0, &wl_output, &client.handle, ());
+    client.sync();
+    let (buffer, _file) = client.capture_buffer(WIDTH, HEIGHT);
+    frame.copy(&buffer);
+    client.sync();
+    compositor.with(move |state| state.remove_output(&second));
+    client.sync();
+    assert!(client.state.copy.failed);
+}
+
+#[test]
+fn a_buffer_of_the_wrong_size_is_a_protocol_error() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let manager: ZwlrScreencopyManagerV1 = client.bind(1..=3);
+    let output: WlOutput = client.bind(1..=4);
+    let frame = manager.capture_output(0, &output, &client.handle, ());
+    client.sync();
+    let (buffer, _file) = client.capture_buffer(10, 10);
+    frame.copy(&buffer);
+    assert!(client.queue.roundtrip(&mut client.state).is_err());
+    compositor.run_captures(0);
+}
+
+#[test]
+fn image_copy_capture_gives_frames_as_the_output_changes() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let window = client.open_window(RED);
+    let sources: ExtOutputImageCaptureSourceManagerV1 = client.bind(1..=1);
+    let manager: ExtImageCopyCaptureManagerV1 = client.bind(1..=1);
+    let output: WlOutput = client.bind(1..=4);
+    let source = sources.create_source(&output, &client.handle, ());
+    let session = manager.create_session(&source, Options::empty(), &client.handle, ());
+    client.sync();
+    assert!(client.state.copy.described);
+    assert_eq!(client.state.copy.size, Some((WIDTH as u32, HEIGHT as u32)));
+    assert_eq!(client.state.copy.formats, [Format::Xrgb8888 as u32]);
+
+    let (buffer, file) = client.capture_buffer(WIDTH, HEIGHT);
+    let frame = session.create_frame(&client.handle, ());
+    frame.attach_buffer(&buffer);
+    frame.damage_buffer(0, 0, WIDTH, HEIGHT);
+    frame.capture();
+    client.sync();
+    compositor.run_captures(0);
+    client.sync();
+    assert!(
+        client.state.copy.ready,
+        "the first frame has to come at once"
+    );
+    let rgb = RED & 0xff_ffff;
+    assert_eq!(captured_pixel(&file, WIDTH, WIDTH / 2, HEIGHT / 2), rgb);
+    frame.destroy();
+
+    client.state.copy.ready = false;
+    let frame = session.create_frame(&client.handle, ());
+    frame.attach_buffer(&buffer);
+    frame.damage_buffer(0, 0, WIDTH, HEIGHT);
+    frame.capture();
+    client.sync();
+    compositor.run_captures(0);
+    client.sync();
+    assert!(!client.state.copy.ready, "nothing changed");
+    client.draw(window, GREEN);
+    compositor.run_captures(0);
+    client.sync();
+    assert!(client.state.copy.ready, "a change has to end the wait");
+    let rgb = GREEN & 0xff_ffff;
+    assert_eq!(captured_pixel(&file, WIDTH, WIDTH / 2, HEIGHT / 2), rgb);
+}
+
+#[test]
+fn image_copy_capture_learns_a_new_mode_and_ends_with_the_output() {
+    let compositor = Compositor::start();
+    let second = compositor.add_output("second", (WIDTH, 0));
+    let mut client = Client::connect(&compositor);
+    let sources: ExtOutputImageCaptureSourceManagerV1 = client.bind(1..=1);
+    let manager: ExtImageCopyCaptureManagerV1 = client.bind(1..=1);
+    let globals = client.globals.contents().clone_list();
+    let outputs = globals
+        .iter()
+        .filter(|global| global.interface == "wl_output");
+    let names: Vec<u32> = outputs.map(|global| global.name).collect();
+    let wl_output: WlOutput = client
+        .globals
+        .registry()
+        .bind(names[1], 4, &client.handle, ());
+    let source = sources.create_source(&wl_output, &client.handle, ());
+    let _session = manager.create_session(&source, Options::empty(), &client.handle, ());
+    client.sync();
+
+    let changed = second.clone();
+    compositor.with(move |state| {
+        let mode = Mode {
+            size: (800, 500).into(),
+            refresh: 60_000,
+        };
+        changed.change_current_state(Some(mode), None, None, None);
+        state.output_resized(&changed);
+    });
+    client.sync();
+    assert_eq!(client.state.copy.size, Some((800, 500)));
+
+    compositor.with(move |state| state.remove_output(&second));
+    client.sync();
+    assert!(client.state.copy.stopped);
+}
+
+fn foreign_manager(client: &mut Client) -> ZwlrForeignToplevelManagerV1 {
+    let manager = client.bind(1..=3);
+    client.sync();
+    manager
+}
+
+#[test]
+fn window_lists_see_windows_come_change_and_go() {
+    use zwlr_foreign_toplevel_handle_v1::State as ForeignState;
+    let compositor = Compositor::start();
+    let mut list = Client::connect(&compositor);
+    let _manager = foreign_manager(&mut list);
+    let _output: WlOutput = list.bind(1..=4);
+    list.sync();
+
+    let mut client = Client::connect(&compositor);
+    let a = client.open_unmapped_window_with(|toplevel| {
+        toplevel.set_title("first".into());
+        toplevel.set_app_id("app.one".into());
+    });
+    list.sync();
+    assert!(list.state.foreign.is_empty(), "listed before it shows");
+    client.draw(a, RED);
+    list.sync();
+    assert_eq!(list.state.foreign.len(), 1);
+    let entry = &list.state.foreign[0];
+    assert_eq!(
+        (entry.title.as_str(), entry.app_id.as_str()),
+        ("first", "app.one")
+    );
+    assert_eq!(entry.states, [ForeignState::Activated as u32]);
+    assert_eq!(entry.outputs, 1);
+    assert_eq!(entry.done, 1);
+
+    client.toplevel(a).set_title("renamed".into());
+    client.sync();
+    list.sync();
+    assert_eq!(list.state.foreign[0].title, "renamed");
+    assert_eq!(list.state.foreign[0].done, 2);
+
+    let b = client.open_window(GREEN);
+    list.sync();
+    assert_eq!(list.state.foreign.len(), 2);
+    assert_eq!(list.state.foreign[0].states, Vec::<u32>::new());
+    assert_eq!(
+        list.state.foreign[1].states,
+        [ForeignState::Activated as u32]
+    );
+
+    client.close(b);
+    list.sync();
+    assert!(list.state.foreign[1].closed);
+    assert!(!list.state.foreign[0].closed);
+    list.state.foreign[1].handle.destroy();
+    list.sync();
+}
+
+#[test]
+fn a_late_window_list_gets_all_windows_and_its_requests_work() {
+    use zwlr_foreign_toplevel_handle_v1::State as ForeignState;
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let b = client.open_window(GREEN);
+
+    let mut list = Client::connect(&compositor);
+    let _output: WlOutput = list.bind(1..=4);
+    list.sync();
+    let _manager = foreign_manager(&mut list);
+    compositor.with(|_| {});
+    list.sync();
+    assert_eq!(list.state.foreign.len(), 2);
+    assert!(list.state.foreign.iter().all(|entry| entry.outputs == 1));
+    assert!(list.state.foreign.iter().all(|entry| entry.done >= 1));
+
+    let first = list.state.foreign[0].handle.clone();
+    let seat = list.seat();
+    first.activate(&seat);
+    list.sync();
+    client.sync();
+    assert!(client.activated(a));
+    assert!(!client.activated(b));
+    list.sync();
+    assert_eq!(
+        list.state.foreign[0].states,
+        [ForeignState::Activated as u32]
+    );
+
+    first.set_maximized();
+    list.sync();
+    client.sync();
+    assert!(client.has_state(a, xdg_toplevel::State::Maximized));
+    list.sync();
+    assert!(
+        list.state.foreign[0]
+            .states
+            .contains(&(ForeignState::Maximized as u32))
+    );
+
+    first.set_fullscreen(None);
+    list.sync();
+    client.sync();
+    assert!(client.has_state(a, xdg_toplevel::State::Fullscreen));
+    first.unset_fullscreen();
+    list.sync();
+    client.sync();
+    assert!(!client.has_state(a, xdg_toplevel::State::Fullscreen));
+
+    first.close();
+    list.sync();
+    client.sync();
+    assert!(client.state.closed.contains(&a));
+}
+
+#[test]
+fn a_window_on_another_workspace_stays_in_the_list_and_activating_brings_it_up() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let mut list = Client::connect(&compositor);
+    let _manager = foreign_manager(&mut list);
+    compositor.with(|_| {});
+    list.sync();
+
+    compositor.with(|state| state.show_workspace(1));
+    let b = client.open_window(GREEN);
+    list.sync();
+    assert_eq!(list.state.foreign.len(), 2);
+    let first = list.state.foreign[0].handle.clone();
+    let seat = list.seat();
+    first.activate(&seat);
+    list.sync();
+    assert_eq!(compositor.active_workspace(), 0);
+    client.sync();
+    assert!(!client.activated(b));
+}
+
+#[test]
+fn a_parent_is_named_to_the_window_list() {
+    let compositor = Compositor::start();
+    let mut list = Client::connect(&compositor);
+    let _manager = foreign_manager(&mut list);
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let parent = client.toplevel(a);
+    let dialog = client.open_unmapped_window_with(|toplevel| toplevel.set_parent(Some(&parent)));
+    client.draw_sized(dialog, (100, 100), GREEN);
+    list.sync();
+    assert_eq!(list.state.foreign.len(), 2);
+    let child = list.state.foreign.iter().find(|entry| entry.parent);
+    assert!(child.is_some(), "no parent event");
+}
+
+/// A clipboard manager: a client without any window.
+struct Manager {
+    client: Client,
+    _device: ZwlrDataControlDeviceV1,
+    control: ZwlrDataControlManagerV1,
+}
+
+impl Manager {
+    fn connect(compositor: &Compositor) -> Self {
+        let mut client = Client::connect(compositor);
+        let control: ZwlrDataControlManagerV1 = client.bind(1..=2);
+        let seat = client.seat();
+        let device = control.get_data_device(&seat, &client.handle, ());
+        client.sync();
+        Self {
+            client,
+            _device: device,
+            control,
+        }
+    }
+}
+
+#[test]
+fn a_clipboard_manager_reads_the_clipboard_without_the_keyboard() {
+    let compositor = Compositor::start();
+    let mut manager = Manager::connect(&compositor);
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let devices: WlDataDeviceManager = client.bind(1..=3);
+    let seat = client.seat();
+    let device = devices.get_data_device(&seat, &client.handle, ());
+    let source = devices.create_data_source(&client.handle, ());
+    source.offer("text/plain".into());
+    compositor.tap_key(KEY_A);
+    client.sync();
+    device.set_selection(Some(&source), client.state.key_serial);
+    client.sync();
+
+    manager.client.sync();
+    let offer = manager
+        .client
+        .state
+        .control_selection
+        .clone()
+        .expect("the manager saw no selection");
+    let types = manager.client.state.control_offers.iter();
+    let types = types.into_iter().find(|(other, _)| *other == offer);
+    assert_eq!(types.unwrap().1, ["text/plain"]);
+    let text = exchange(&mut client, &mut manager.client, |_, fd| {
+        offer.receive("text/plain".into(), fd);
+    });
+    assert_eq!(text, CLIPBOARD_TEXT);
+}
+
+#[test]
+fn a_clipboard_manager_sets_the_clipboard_for_the_window_with_the_keyboard() {
+    let compositor = Compositor::start();
+    let mut manager = Manager::connect(&compositor);
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let devices: WlDataDeviceManager = client.bind(1..=3);
+    let seat = client.seat();
+    let _device = devices.get_data_device(&seat, &client.handle, ());
+    client.sync();
+
+    let source = manager
+        .control
+        .create_data_source(&manager.client.handle, ());
+    source.offer("text/plain".into());
+    manager._device.set_selection(Some(&source));
+    manager.client.sync();
+    client.sync();
+    let offer = client.state.selection.clone().expect("no offer");
+    let text = exchange(&mut manager.client, &mut client, |_, fd| {
+        offer.receive("text/plain".into(), fd);
+    });
+    assert_eq!(text, CONTROL_TEXT);
+}
+
+#[test]
+fn a_clipboard_manager_also_gets_the_primary_selection() {
+    let compositor = Compositor::start();
+    let mut manager = Manager::connect(&compositor);
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let devices: ZwpPrimarySelectionDeviceManagerV1 = client.bind(1..=1);
+    let seat = client.seat();
+    let device = devices.get_device(&seat, &client.handle, ());
+    let source = devices.create_source(&client.handle, ());
+    source.offer("text/plain".into());
+    compositor.tap_key(KEY_A);
+    client.sync();
+    device.set_selection(Some(&source), client.state.key_serial);
+    client.sync();
+    manager.client.sync();
+    assert!(manager.client.state.control_primary.is_some());
+}
+
+#[test]
+fn a_clipboard_manager_is_cancelled_when_a_window_copies() {
+    let compositor = Compositor::start();
+    let mut manager = Manager::connect(&compositor);
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    let source = manager
+        .control
+        .create_data_source(&manager.client.handle, ());
+    source.offer("text/plain".into());
+    manager._device.set_selection(Some(&source));
+    manager.client.sync();
+
+    let devices: WlDataDeviceManager = client.bind(1..=3);
+    let seat = client.seat();
+    let device = devices.get_data_device(&seat, &client.handle, ());
+    let other = devices.create_data_source(&client.handle, ());
+    other.offer("text/plain".into());
+    compositor.tap_key(KEY_A);
+    client.sync();
+    device.set_selection(Some(&other), client.state.key_serial);
+    client.sync();
+    manager.client.sync();
+    assert!(manager.client.state.control_cancelled);
 }

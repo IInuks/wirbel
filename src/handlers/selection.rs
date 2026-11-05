@@ -14,6 +14,7 @@ use smithay::{
         SelectionHandler, SelectionSource, SelectionTarget,
         data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler},
         primary_selection::{PrimarySelectionHandler, PrimarySelectionState},
+        wlr_data_control::{DataControlHandler, DataControlState},
     },
 };
 
@@ -62,6 +63,13 @@ impl DataDeviceHandler for Wirbel {
 impl PrimarySelectionHandler for Wirbel {
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
         &mut self.primary_selection_state
+    }
+}
+
+// Clipboard managers. Reads and writes the same selection as the two above.
+impl DataControlHandler for Wirbel {
+    fn data_control_state(&mut self) -> &mut DataControlState {
+        &mut self.data_control_state
     }
 }
 

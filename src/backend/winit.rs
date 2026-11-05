@@ -6,7 +6,11 @@ use smithay::{
     backend::{
         drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
-        renderer::{ImportDma, damage::OutputDamageTracker, gles::GlesRenderer},
+        renderer::{
+            ImportDma,
+            damage::OutputDamageTracker,
+            gles::{GlesRenderer, GlesTexture},
+        },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     input::pointer::CursorImageStatus,
@@ -20,13 +24,14 @@ use smithay::{
     wayland::presentation::Refresh,
 };
 
-use crate::Wirbel;
+use crate::{Wirbel, handlers::Capturer};
 
 const REFRESH_MHZ: i32 = 60_000;
 
 struct Nested {
     backend: WinitGraphicsBackend<GlesRenderer>,
     damage_tracker: OutputDamageTracker,
+    capturer: Capturer<GlesTexture>,
     output: Output,
     /// Whether a frame went out yet. The surface has no buffer age before that.
     presented: bool,
@@ -69,6 +74,7 @@ pub fn init(
 
     let nested = Rc::new(RefCell::new(Nested {
         damage_tracker: OutputDamageTracker::from_output(&output),
+        capturer: Capturer::default(),
         backend,
         output,
         presented: false,
@@ -210,5 +216,7 @@ impl Nested {
             wp_presentation_feedback::Kind::empty(),
         );
         state.send_frame_callbacks(&self.output);
+        self.capturer
+            .run(state, self.backend.renderer(), &self.output);
     }
 }

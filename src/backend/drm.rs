@@ -39,7 +39,7 @@ use smithay::{
             ImportDma, ImportMemWl,
             damage::Error as DamageError,
             element::RenderElementStates,
-            gles::GlesRenderer,
+            gles::{GlesRenderer, GlesTexture},
             multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
         },
         session::{
@@ -79,6 +79,7 @@ use crate::{
     Wirbel,
     backend::pacing::{Pacing, Presented},
     cursor::Cursors,
+    handlers::Capturer,
     monitor::{self, ModeInfo},
     render::SceneElement,
     safety::SessionActive,
@@ -133,6 +134,8 @@ struct Drm {
     /// Set by the first GPU that manages to render.
     render_gpu: Option<DrmNode>,
     devices: HashMap<DrmNode, Device>,
+    /// Always on the render GPU, whichever GPU the output hangs on.
+    capturer: Capturer<GlesTexture>,
     keyboards: Vec<input::Device>,
     handle: LoopHandle<'static, Wirbel>,
 }
@@ -853,6 +856,11 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
             Rendered::Retry => surface.pacing.unchanged(false),
             Rendered::Reset | Rendered::Fatal => surface.pacing.reset(),
         }
+        if !matches!(outcome, Rendered::Reset | Rendered::Fatal)
+            && let Ok(mut renderer) = this.gpus.single_renderer(&render_gpu)
+        {
+            this.capturer.run(state, &mut renderer, &output);
+        }
         (output, outcome)
     };
 
@@ -1026,6 +1034,7 @@ pub fn init(
         gpus,
         render_gpu: None,
         devices: HashMap::new(),
+        capturer: Capturer::default(),
         keyboards: Vec::new(),
         handle: event_loop.handle(),
     }));

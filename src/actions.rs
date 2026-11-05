@@ -14,13 +14,8 @@ impl Wirbel {
         match action {
             Action::Spawn(command) => self.spawn(&command),
             Action::Close => {
-                if let Some(toplevel) = self.focused.as_ref().and_then(Window::toplevel) {
-                    toplevel.send_close();
-                }
-                if let Some(surface) = self.focused.as_ref().and_then(Window::x11_surface)
-                    && let Err(err) = surface.close()
-                {
-                    tracing::warn!(%err, "failed to close an X11 window");
+                if let Some(window) = &self.focused {
+                    self.close_window(window);
                 }
             }
             Action::Quit => self.loop_signal.stop(),

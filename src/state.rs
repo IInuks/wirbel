@@ -52,7 +52,10 @@ use smithay::{
         presentation::PresentationState,
         relative_pointer::RelativePointerManagerState,
         seat::WaylandFocus,
-        selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
+        selection::{
+            data_device::DataDeviceState, primary_selection::PrimarySelectionState,
+            wlr_data_control::DataControlState,
+        },
         session_lock::SessionLockManagerState,
         shell::{
             wlr_layer::{KeyboardInteractivity, Layer, WlrLayerShellState},
@@ -75,7 +78,7 @@ use crate::{
     cursor::Cursors,
     focus::KeyboardFocus,
     grabs::Drag,
-    handlers::SessionLock,
+    handlers::{ForeignToplevelState, ScreencopyState, SessionLock},
     ipc::{Ipc, Position},
     layout::Rect,
     render::{LayerEntry, LayerPart, LayerTiers},
@@ -159,6 +162,9 @@ pub struct Wirbel {
     pub seat: Seat<Self>,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    pub data_control_state: DataControlState,
+    pub screencopy: ScreencopyState,
+    pub foreign_toplevels: ForeignToplevelState,
     pub cursor_shape_state: CursorShapeManagerState,
     pub viewporter_state: ViewporterState,
     pub fractional_scale_state: FractionalScaleManagerState,
@@ -256,6 +262,7 @@ impl Wirbel {
         let socket_name = Self::listen(display, event_loop)?;
         let ipc = Ipc::new(event_loop.handle(), &socket_name);
         let clock = Clock::<Monotonic>::new();
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
 
         Ok(Self {
             start_time: Instant::now(),
@@ -273,7 +280,14 @@ impl Wirbel {
             seat_state,
             seat,
             data_device_state: DataDeviceState::new::<Self>(&dh),
-            primary_selection_state: PrimarySelectionState::new::<Self>(&dh),
+            data_control_state: DataControlState::new::<Self, _>(
+                &dh,
+                Some(&primary_selection_state),
+                |_| true,
+            ),
+            primary_selection_state,
+            screencopy: ScreencopyState::new(&dh),
+            foreign_toplevels: ForeignToplevelState::new(&dh),
             cursor_shape_state: CursorShapeManagerState::new::<Self>(&dh),
             viewporter_state: ViewporterState::new::<Self>(&dh),
             fractional_scale_state: FractionalScaleManagerState::new::<Self>(&dh),
@@ -364,6 +378,7 @@ impl Wirbel {
         self.settle_x11_windows();
         self.lock_refresh();
         self.update_idle_inhibit();
+        self.refresh_foreign_toplevels();
         if std::mem::take(&mut self.needs_redraw) {
             (self.redraw)();
         }
@@ -455,6 +470,7 @@ impl Wirbel {
             location.is_some_and(|location| self.monitor_at(location) == Some(index));
         self.close_layers(output);
         self.lock_remove_output(output);
+        self.screencopy.output_removed(output);
         self.space.unmap_output(output);
         let target = self
             .monitors
@@ -506,6 +522,7 @@ impl Wirbel {
 
     /// To be called by the backend after the size or the scale of `output` changed.
     pub fn output_resized(&mut self, output: &Output) {
+        self.screencopy.output_changed(output);
         layer_map_for_output(output).arrange();
         self.lock_configure_output(output);
         if let Some(index) = self.monitor_of_output(output)
