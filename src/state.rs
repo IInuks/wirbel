@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     ffi::OsString,
     path::PathBuf,
     process::{Command, Stdio},
@@ -25,7 +26,8 @@ use smithay::{
     output::Output,
     reexports::{
         calloop::{
-            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken,
+            generic::Generic,
         },
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
@@ -34,7 +36,7 @@ use smithay::{
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{Logical, Point, SERIAL_COUNTER},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER},
     wayland::{
         compositor::{
             CompositorClientState, CompositorState, SurfaceData, get_parent, send_surface_state,
@@ -42,10 +44,15 @@ use smithay::{
         },
         cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufState,
+        drm_syncobj::DrmSyncobjState,
         fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         idle_inhibit::IdleInhibitManagerState,
         idle_notify::IdleNotifierState,
         output::OutputManagerState,
+        pointer_constraints::{PointerConstraintsState, with_pointer_constraint},
+        presentation::PresentationState,
+        relative_pointer::RelativePointerManagerState,
+        seat::WaylandFocus,
         selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
         session_lock::SessionLockManagerState,
         shell::{
@@ -58,12 +65,16 @@ use smithay::{
         shm::ShmState,
         socket::ListeningSocketSource,
         viewporter::ViewporterState,
+        xdg_activation::XdgActivationState,
+        xwayland_shell::XWaylandShellState,
     },
+    xwayland::{X11Surface, X11Wm, xwm::WmWindowType},
 };
 
 use crate::{
     config::Config,
     cursor::Cursors,
+    focus::KeyboardFocus,
     grabs::Drag,
     handlers::SessionLock,
     ipc::{Ipc, Position},
@@ -92,6 +103,25 @@ fn wants_to_float(toplevel: &ToplevelSurface) -> bool {
         (current.min_size, current.max_size)
     });
     toplevel.parent().is_some() || (min.w > 0 && min.h > 0 && min == max)
+}
+
+/// The same for an X11 window, which has some more ways of saying so.
+fn x11_wants_to_float(window: &X11Surface) -> bool {
+    let fixed = match (window.min_size(), window.max_size()) {
+        (Some(min), Some(max)) => min.w > 0 && min.h > 0 && min == max,
+        _ => false,
+    };
+    let floating_type = matches!(
+        window.window_type(),
+        Some(
+            WmWindowType::Dialog
+                | WmWindowType::Menu
+                | WmWindowType::Splash
+                | WmWindowType::Toolbar
+                | WmWindowType::Utility
+        )
+    );
+    fixed || floating_type || window.is_transient_for().is_some() || window.is_modal()
 }
 
 /// Whether the client has caught up with the size last asked of it. Until then, the size of what
@@ -136,6 +166,18 @@ pub struct Wirbel {
     pub session_lock_state: SessionLockManagerState,
     pub idle_inhibit_state: IdleInhibitManagerState,
     pub idle_notifier_state: IdleNotifierState<Self>,
+    pub activation_state: XdgActivationState,
+    pub constraints_state: PointerConstraintsState,
+    pub relative_pointer_state: RelativePointerManagerState,
+    pub presentation_state: PresentationState,
+    /// Only where the GPU driver can do it, set up by `offer_syncobj`.
+    pub syncobj_state: Option<DrmSyncobjState>,
+    pub xwayland_shell_state: XWaylandShellState,
+    /// The X11 window manager, once Xwayland is up.
+    pub xwm: Option<X11Wm>,
+    /// What keeps Xwayland going, see `handlers::xwayland`.
+    pub xwayland: XwaylandState,
+    pub clock: Clock<Monotonic>,
 
     pub config: Config,
     /// Where `reload` reads the configuration from.
@@ -152,6 +194,8 @@ pub struct Wirbel {
     pub unconfigured: Vec<Window>,
     /// Placed windows waiting for their first buffer. They get focus when it arrives.
     pub awaiting_buffer: Vec<Window>,
+    /// X11 menus and tooltips: they place themselves, above all windows, and take no focus.
+    pub overrides: Vec<Window>,
     pub focused: Option<Window>,
     /// Layer surfaces between their creation or unmap and the commit that maps them.
     pub unmapped_layers: Vec<(LayerSurface, Output)>,
@@ -212,6 +256,7 @@ impl Wirbel {
 
         let socket_name = Self::listen(display, event_loop)?;
         let ipc = Ipc::new(event_loop.handle(), &socket_name);
+        let clock = Clock::<Monotonic>::new();
 
         Ok(Self {
             start_time: Instant::now(),
@@ -236,6 +281,15 @@ impl Wirbel {
             session_lock_state: SessionLockManagerState::new::<Self, _>(&dh, |_| true),
             idle_inhibit_state: IdleInhibitManagerState::new::<Self>(&dh),
             idle_notifier_state: IdleNotifierState::new(&dh, event_loop.handle()),
+            activation_state: XdgActivationState::new::<Self>(&dh),
+            constraints_state: PointerConstraintsState::new::<Self>(&dh),
+            relative_pointer_state: RelativePointerManagerState::new::<Self>(&dh),
+            presentation_state: PresentationState::new::<Self>(&dh, clock.id() as u32),
+            syncobj_state: None,
+            xwayland_shell_state: XWaylandShellState::new::<Self>(&dh),
+            xwm: None,
+            xwayland: XwaylandState::default(),
+            clock,
 
             config,
             config_path: None,
@@ -246,6 +300,7 @@ impl Wirbel {
             active_monitor: 0,
             unconfigured: Vec::new(),
             awaiting_buffer: Vec::new(),
+            overrides: Vec::new(),
             focused: None,
             unmapped_layers: Vec::new(),
             layer_focus: None,
@@ -307,6 +362,7 @@ impl Wirbel {
         self.space.refresh();
         self.popups.cleanup();
         self.reap_popup_grab();
+        self.settle_x11_windows();
         self.lock_refresh();
         self.update_idle_inhibit();
         if std::mem::take(&mut self.needs_redraw) {
@@ -319,13 +375,17 @@ impl Wirbel {
 
     /// Runs a shell command as a client of this compositor.
     pub fn spawn(&self, command: &str) {
-        let child = Command::new("sh")
+        let mut child = Command::new("sh");
+        child
             .args(["-c", command])
             .env("WAYLAND_DISPLAY", &self.socket_name)
-            // A client without Wayland support must not end up on the host's X server.
-            .env_remove("DISPLAY")
-            .stdin(Stdio::null())
-            .spawn();
+            .stdin(Stdio::null());
+        // Without Xwayland, a client must not end up on the host's X server.
+        match self.xwayland.display {
+            Some(display) => child.env("DISPLAY", format!(":{display}")),
+            None => child.env_remove("DISPLAY"),
+        };
+        let child = child.spawn();
         match child {
             Ok(mut child) => {
                 // Reap it when it exits, the compositor has no use for the status.
@@ -525,11 +585,17 @@ impl Wirbel {
             .iter()
             .flat_map(|monitor| &monitor.workspaces)
             .flat_map(Workspace::windows)
-            .find(|window| {
-                window
-                    .toplevel()
-                    .is_some_and(|toplevel| toplevel.wl_surface() == surface)
-            })
+            .find(|window| window.wl_surface().as_deref() == Some(surface))
+    }
+
+    /// The window of an X11 surface, managed or not.
+    pub fn find_x11(&self, surface: &X11Surface) -> Option<Window> {
+        self.monitors
+            .iter()
+            .flat_map(|monitor| &monitor.workspaces)
+            .flat_map(Workspace::windows)
+            .chain(self.overrides.iter().cloned())
+            .find(|window| window.x11_surface() == Some(surface))
     }
 
     /// Whether `window` is on the shown workspace of a connected monitor. A window hidden behind
@@ -555,16 +621,46 @@ impl Wirbel {
                 None
             }
         });
-        let floats = wants_to_float(&toplevel);
-        let Some(monitor) = self.monitors.get_mut(self.active_monitor) else {
-            return false;
-        };
-        let workspace = monitor.workspace_mut();
-        let placement = if floats {
+        let placement = if wants_to_float(&toplevel) {
             Placement::Floating(Rect::new(0, 0, 0, 0))
         } else {
             Placement::Tiled
         };
+        self.place(window, placement, requested)
+    }
+
+    /// `place_new_window` for a window of the X server. Its size is known from the start, and one
+    /// that names a place for itself gets it.
+    pub fn place_x11_window(&mut self, window: Window) -> bool {
+        let Some(surface) = window.x11_surface().cloned() else {
+            return true;
+        };
+        let requested = if surface.is_fullscreen() {
+            Some(FullKind::Fullscreen)
+        } else if surface.is_maximized() {
+            Some(FullKind::Maximized)
+        } else {
+            None
+        };
+        let placement = if x11_wants_to_float(&surface) {
+            let wanted = surface.last_configure();
+            let placed = wanted.loc != Point::default() && wanted.size.w > 0 && wanted.size.h > 0;
+            Placement::Floating(if placed {
+                Rect::new(wanted.loc.x, wanted.loc.y, wanted.size.w, wanted.size.h)
+            } else {
+                Rect::new(0, 0, 0, 0)
+            })
+        } else {
+            Placement::Tiled
+        };
+        self.place(window, placement, requested)
+    }
+
+    fn place(&mut self, window: Window, placement: Placement, requested: Option<FullKind>) -> bool {
+        let Some(monitor) = self.monitors.get_mut(self.active_monitor) else {
+            return false;
+        };
+        let workspace = monitor.workspace_mut();
         workspace.put(window.clone(), placement);
         // Whoever covers the workspace would hide the newcomer.
         workspace.full = requested.map(|kind| (window.clone(), kind));
@@ -575,14 +671,11 @@ impl Wirbel {
 
     /// Follows the size a floating window gave itself, and places it once it has one.
     pub fn floating_commit(&mut self, window: &Window) {
-        let Some(toplevel) = window.toplevel().cloned() else {
-            return;
-        };
         let (Some((m, w)), geometry) = (self.locate(window), window.geometry().size) else {
             return;
         };
         let area = self.work_area(m);
-        let settled = answered_last_size(&toplevel);
+        let settled = window.toplevel().is_none_or(answered_last_size);
         let dragged = self
             .drag
             .as_ref()
@@ -631,11 +724,17 @@ impl Wirbel {
             .space
             .elements()
             .filter(|window| !frames.iter().any(|frame| frame.window == **window))
+            .filter(|window| !self.overrides.contains(window))
             .cloned()
             .collect();
         for window in &hidden {
             self.space.unmap_elem(window);
             self.dismiss_window_popups(window);
+            if let Some(surface) = window.x11_surface()
+                && let Err(err) = surface.set_hidden(true)
+            {
+                tracing::debug!(%err, "failed to tell an X11 window that it is hidden");
+            }
         }
 
         for frame in &frames {
@@ -672,9 +771,26 @@ impl Wirbel {
                 });
                 toplevel.send_pending_configure();
             }
+            if let Some(surface) = frame.window.x11_surface() {
+                configure_x11(surface, frame);
+            }
             // Mapping again also moves the window to the top, which yields the frame order.
             self.space
                 .map_element(frame.window.clone(), (frame.inner.x, frame.inner.y), false);
+        }
+        for window in &self.overrides {
+            if let Some(surface) = window.x11_surface() {
+                self.space
+                    .map_element(window.clone(), surface.last_configure().loc, false);
+            }
+        }
+
+        if let Some(xwm) = self.xwm.as_mut() {
+            let stack = frames.iter().rev();
+            let order = stack.filter_map(|frame| frame.window.x11_surface());
+            if let Err(err) = xwm.update_stacking_order_upwards(order) {
+                tracing::warn!(%err, "failed to update the X11 stacking order");
+            }
         }
 
         self.frames = frames;
@@ -687,11 +803,10 @@ impl Wirbel {
     pub(crate) fn update_surface_scales(&self) {
         let mut roots: Vec<(WlSurface, Output)> = Vec::new();
         for frame in &self.frames {
-            if let (Some(toplevel), Some((m, _))) =
-                (frame.window.toplevel(), self.locate(&frame.window))
+            if let (Some(root), Some((m, _))) =
+                (frame.window.wl_surface(), self.locate(&frame.window))
             {
-                let root = toplevel.wl_surface().clone();
-                roots.push((root, self.monitors[m].output.clone()));
+                roots.push((root.into_owned(), self.monitors[m].output.clone()));
             }
         }
         for monitor in self.monitors.iter().filter(|monitor| monitor.connected) {
@@ -760,11 +875,12 @@ impl Wirbel {
 
     /// Who should have the keyboard: the lock screen rules everything, then a layer surface that
     /// claims the keyboard, then one that was clicked, then the focused window.
-    fn keyboard_target(&self) -> Option<WlSurface> {
+    fn keyboard_target(&self) -> Option<KeyboardFocus> {
         if self.lock.is_active() {
-            return self
+            let surface = self
                 .lock
                 .surface_for_input(self.monitors.get(self.active_monitor));
+            return surface.map(KeyboardFocus::Surface);
         }
         let active = self.monitors.get(self.active_monitor).into_iter();
         let monitors = active.chain(&self.monitors);
@@ -777,7 +893,7 @@ impl Wirbel {
                         && has_buffer(surface.wl_surface())
                 });
                 if let Some(surface) = exclusive {
-                    return Some(surface.wl_surface().clone());
+                    return Some(surface.wl_surface().clone().into());
                 }
             }
         }
@@ -786,9 +902,13 @@ impl Wirbel {
                 && layer.can_receive_keyboard_focus()
                 && has_buffer(layer.wl_surface())
         });
-        layer.map(|layer| layer.wl_surface().clone()).or_else(|| {
-            let toplevel = self.focused.as_ref()?.toplevel()?;
-            Some(toplevel.wl_surface().clone())
+        let layer = layer.map(|layer| layer.wl_surface().clone().into());
+        layer.or_else(|| {
+            let window = self.focused.as_ref()?;
+            match window.x11_surface() {
+                Some(surface) => Some(KeyboardFocus::X11(Box::new(surface.clone()))),
+                None => Some(window.toplevel()?.wl_surface().clone().into()),
+            }
         })
     }
 
@@ -800,6 +920,7 @@ impl Wirbel {
         {
             keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
         }
+        self.update_pointer_constraint();
     }
 
     /// Withdraws the popups of a window or layer surface the user can no longer see.
@@ -906,6 +1027,12 @@ impl Wirbel {
             }
             restack |= raise && workspace.raise(window);
             self.active_monitor = m;
+            if raise
+                && let (Some(xwm), Some(surface)) = (self.xwm.as_mut(), window.x11_surface())
+                && let Err(err) = xwm.raise_window(surface)
+            {
+                tracing::warn!(%err, "failed to raise an X11 window");
+            }
         }
 
         if self.focused == window {
@@ -1114,7 +1241,50 @@ impl Wirbel {
         self.needs_redraw = true;
         let position = self.pointer_position();
         self.ipc.publish(&position);
+        self.update_pointer_constraint();
         location
+    }
+
+    /// A constraint holds while the pointer is inside its region and its window has the keyboard:
+    /// a window the user is not working with does not get to catch the pointer.
+    pub fn update_pointer_constraint(&mut self) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let Some(surface) = pointer.current_focus() else {
+            return;
+        };
+        let root_of = |mut surface: WlSurface| {
+            while let Some(parent) = get_parent(&surface) {
+                surface = parent;
+            }
+            surface
+        };
+        let focused = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .and_then(|focus| focus.wl_surface().map(Cow::into_owned))
+            .map(root_of);
+        let wanted = focused == Some(root_of(surface.clone()));
+        let location = pointer.current_location();
+        let origin = self.surface_under(location).map(|under| under.1);
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            let Some(constraint) = constraint else {
+                return;
+            };
+            let inside = origin.is_some_and(|origin| {
+                let local = (location - origin).to_i32_floor();
+                constraint
+                    .region()
+                    .is_none_or(|region| region.contains(local))
+            });
+            if wanted && inside {
+                constraint.activate();
+            } else if constraint.is_active() && !wanted {
+                constraint.deactivate();
+            }
+        });
     }
 
     /// Where the pointer is, as `wirbel pos` shows it.
@@ -1166,6 +1336,43 @@ impl Wirbel {
     }
 }
 
+/// Tells an X11 window about its frame, as far as anything changed. A floating window has the last
+/// word on its size, like all clients, so what it is told may differ from what it shows so far.
+fn configure_x11(surface: &X11Surface, frame: &Frame) {
+    let (w, h) = frame.request.size.unwrap_or((frame.inner.w, frame.inner.h));
+    let extents = surface.frame_extents();
+    let rect = Rectangle::new(
+        (frame.inner.x - extents.left, frame.inner.y - extents.top).into(),
+        (
+            w + extents.left + extents.right,
+            h + extents.top + extents.bottom,
+        )
+            .into(),
+    );
+    let full = frame.request.full == Some(FullKind::Fullscreen);
+    let maximized = frame.request.full == Some(FullKind::Maximized);
+    let result = (|| {
+        if surface.is_hidden() {
+            surface.set_hidden(false)?;
+        }
+        if surface.is_fullscreen() != full {
+            surface.set_fullscreen(full)?;
+        }
+        if surface.is_maximized() != maximized {
+            surface.set_maximized(maximized)?;
+        }
+        Ok::<_, smithay::reexports::x11rb::errors::ConnectionError>(())
+    })();
+    if let Err(err) = result {
+        tracing::debug!(%err, "failed to update an X11 window");
+    }
+    if surface.last_configure() != rect
+        && let Err(err) = surface.configure(rect)
+    {
+        tracing::debug!(?err, "failed to configure an X11 window");
+    }
+}
+
 /// Whether a surface has content to show.
 pub(crate) fn has_buffer(surface: &WlSurface) -> bool {
     with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
@@ -1200,6 +1407,18 @@ fn border_edges(tile: Rect, width: i32, color: [f32; 4]) -> impl Iterator<Item =
         location: (x, y).into(),
         buffer: SolidColorBuffer::new((w, h), color),
     })
+}
+
+/// What it takes to keep an X server running.
+#[derive(Debug, Default)]
+pub struct XwaylandState {
+    /// The display number. Known from the start: clients may connect before the server is up, and
+    /// wait for it.
+    pub display: Option<u32>,
+    /// The event source, which owns the server.
+    pub source: Option<RegistrationToken>,
+    /// When it was started, to give up on a server that keeps dying.
+    pub starts: Vec<Instant>,
 }
 
 /// Per-client data.

@@ -102,6 +102,15 @@ pub struct MonitorRule {
     pub position: Option<(i32, i32)>,
 }
 
+/// Whether X11 programs get a server, and which one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Xwayland {
+    /// Whatever works, see `crate::xwayland::locate`.
+    Find,
+    Off,
+    At(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub gaps: Gaps,
@@ -120,6 +129,8 @@ pub struct Config {
     pub cursor_size: Option<u32>,
     /// The card that renders, by name like `card1`. `None` means the boot GPU.
     pub render_gpu: Option<String>,
+    /// How to run X11 programs.
+    pub xwayland: Xwayland,
     pub monitor_rules: Vec<MonitorRule>,
     pub binds: Vec<Bind>,
     pub mouse_binds: Vec<MouseBind>,
@@ -173,6 +184,7 @@ impl Config {
             cursor_theme: None,
             cursor_size: None,
             render_gpu: None,
+            xwayland: Xwayland::Find,
             monitor_rules: Vec::new(),
             binds: Vec::new(),
             mouse_binds: Vec::new(),
@@ -265,6 +277,13 @@ impl Config {
             }
             "cursor_size" => self.cursor_size = Some(parse_size(value)? as u32),
             "render_gpu" => self.render_gpu = Some(value).filter(|v| !v.is_empty()).map(Into::into),
+            "xwayland" => {
+                self.xwayland = match value {
+                    "" | "auto" => Xwayland::Find,
+                    "off" => Xwayland::Off,
+                    path => Xwayland::At(path.into()),
+                }
+            }
             "monitorrule" => self.monitor_rules.push(parse_monitor_rule(value)?),
             "bind" => self.binds.push(parse_bind(value)?),
             "mousebind" => self.mouse_binds.push(parse_mouse_bind(value)?),

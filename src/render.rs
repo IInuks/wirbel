@@ -4,20 +4,32 @@ use smithay::{
     backend::renderer::{
         ImportAll, ImportMem, Renderer, Texture,
         element::{
-            AsRenderElements, Kind,
+            AsRenderElements, Kind, RenderElementStates, default_primary_scanout_output_compare,
             memory::MemoryRenderBufferRenderElement,
             solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+            utils::select_dmabuf_feedback,
         },
     },
-    desktop::{LayerSurface, PopupManager, layer_map_for_output, utils::send_frames_surface_tree},
+    desktop::{
+        LayerSurface, PopupManager, layer_map_for_output,
+        utils::{
+            OutputPresentationFeedback, send_dmabuf_feedback_surface_tree,
+            send_frames_surface_tree, surface_presentation_feedback_flags_from_states,
+            surface_primary_scanout_output, take_presentation_feedback_surface_tree,
+            update_surface_primary_scanout_output, with_surfaces_surface_tree,
+        },
+    },
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     output::Output,
-    reexports::wayland_server::Resource,
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{Logical, Physical, Point, Scale},
-    wayland::{compositor::with_states, shell::wlr_layer::Layer},
+    wayland::{
+        compositor::with_states, dmabuf::DmabufFeedback, seat::WaylandFocus,
+        shell::wlr_layer::Layer,
+    },
 };
-use std::{sync::Mutex, time::Duration};
+use std::{borrow::Cow, sync::Mutex, time::Duration};
 
 use crate::{Wirbel, workspace::FullKind};
 
@@ -270,6 +282,85 @@ impl Wirbel {
             ));
         }
         elements
+    }
+
+    /// What is on `output` right now: every surface of the scene, windows and layers first.
+    fn shown_surfaces(&self, output: &Output) -> Vec<WlSurface> {
+        if self.lock.is_active() {
+            return self.lock.surface_on(output).into_iter().collect();
+        }
+        let windows = self.space.elements_for_output(output);
+        let mut roots: Vec<WlSurface> = windows
+            .filter_map(|window| window.wl_surface().map(Cow::into_owned))
+            .collect();
+        let map = layer_map_for_output(output);
+        roots.extend(map.layers().map(|layer| layer.wl_surface().clone()));
+        let popups = roots.iter().flat_map(PopupManager::popups_for_surface);
+        let popups: Vec<WlSurface> = popups
+            .map(|(popup, _)| popup.wl_surface().clone())
+            .collect();
+        roots.extend(popups);
+        roots
+    }
+
+    /// Notes which output each surface was last seen on, from what a render found out. Everything
+    /// that goes by the output of a surface comes after this.
+    pub fn update_scanout_outputs(&self, output: &Output, states: &RenderElementStates) {
+        let mut roots = self.shown_surfaces(output);
+        if let CursorImageStatus::Surface(surface) = &self.cursor_status {
+            roots.push(surface.clone());
+        }
+        roots.extend(self.dnd_icon.clone());
+        for root in roots.iter().filter(|root| root.is_alive()) {
+            with_surfaces_surface_tree(root, |surface, data| {
+                update_surface_primary_scanout_output(
+                    surface,
+                    output,
+                    data,
+                    None,
+                    states,
+                    default_primary_scanout_output_compare,
+                );
+            });
+        }
+    }
+
+    /// Takes what clients want to know about the frame that `states` belong to, to answer it when
+    /// the frame is on the screen.
+    pub fn presentation_feedback(
+        &self,
+        output: &Output,
+        states: &RenderElementStates,
+    ) -> OutputPresentationFeedback {
+        let mut feedback = OutputPresentationFeedback::new(output);
+        for root in self.shown_surfaces(output) {
+            take_presentation_feedback_surface_tree(
+                &root,
+                &mut feedback,
+                surface_primary_scanout_output,
+                |surface, _| surface_presentation_feedback_flags_from_states(surface, None, states),
+            );
+        }
+        feedback
+    }
+
+    /// Sends each surface the dmabuf feedback for how it was drawn last: `scanout` for one that
+    /// made it onto a plane of its own, or could, `render` for the rest.
+    pub fn send_dmabuf_feedback(
+        &self,
+        output: &Output,
+        states: &RenderElementStates,
+        render: &DmabufFeedback,
+        scanout: &DmabufFeedback,
+    ) {
+        for root in self.shown_surfaces(output) {
+            send_dmabuf_feedback_surface_tree(
+                &root,
+                output,
+                surface_primary_scanout_output,
+                |surface, _| select_dmabuf_feedback(surface, states, render, scanout),
+            );
+        }
     }
 
     /// Tells clients that a frame went out, so that they may draw the next one, and counts that

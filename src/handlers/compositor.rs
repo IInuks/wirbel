@@ -15,8 +15,10 @@ use smithay::{
             with_states,
         },
         dmabuf::get_dmabuf,
+        drm_syncobj::DrmSyncobjCachedState,
         shm::{ShmHandler, ShmState},
     },
+    xwayland::XWaylandClientData,
 };
 
 use crate::{ClientState, Wirbel};
@@ -27,33 +29,59 @@ impl CompositorHandler for Wirbel {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        if let Some(state) = client.get_data::<XWaylandClientData>() {
+            return &state.compositor_state;
+        }
         &client
             .get_data::<ClientState>()
             .expect("client without ClientState")
             .compositor_state
     }
 
-    /// A dmabuf may still be in the works on the GPU. Its commit waits until it can be read.
+    /// A dmabuf may still be in the works on the GPU. Its commit waits until it can be read: for
+    /// the acquire point of a client with explicit sync, or else for the fence of the buffer.
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, |state, _, surface| {
-            let dmabuf = with_states(surface, |states| {
+            let (dmabuf, acquire) = with_states(surface, |states| {
                 let mut cached = states.cached_state.get::<SurfaceAttributes>();
-                match cached.pending().buffer.as_ref() {
+                let dmabuf = match cached.pending().buffer.as_ref() {
                     Some(BufferAssignment::NewBuffer(buffer)) => get_dmabuf(buffer).ok().cloned(),
                     _ => None,
-                }
+                };
+                let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
+                (dmabuf, syncobj.pending().acquire_point.clone())
             });
             let (Some(dmabuf), Some(client)) = (dmabuf, surface.client()) else {
                 return;
             };
-            let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) else {
-                return;
-            };
-            let cleared = state.loop_handle.insert_source(source, move |_, _, state| {
+            let unblock = move |state: &mut Wirbel| {
                 let display = state.display_handle.clone();
                 state
                     .client_compositor_state(&client)
                     .blocker_cleared(state, &display);
+            };
+            if let Some(acquire) = acquire {
+                match acquire.generate_blocker() {
+                    Ok((blocker, source)) => {
+                        let unblock = unblock.clone();
+                        let cleared =
+                            state.loop_handle.insert_source(source, move |_, _, state| {
+                                unblock(state);
+                                Ok(())
+                            });
+                        if cleared.is_ok() {
+                            add_blocker(surface, blocker);
+                            return;
+                        }
+                    }
+                    Err(err) => tracing::warn!(?err, "failed to wait for an acquire point"),
+                }
+            }
+            let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) else {
+                return;
+            };
+            let cleared = state.loop_handle.insert_source(source, move |_, _, state| {
+                unblock(state);
                 Ok(())
             });
             if cleared.is_ok() {

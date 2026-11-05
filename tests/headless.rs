@@ -34,6 +34,10 @@ use smithay::{
     },
     utils::{Buffer, Rectangle, Size, Transform},
 };
+use smithay::{
+    reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback as server_feedback,
+    wayland::presentation::Refresh,
+};
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop,
     event_created_child,
@@ -48,6 +52,7 @@ use wayland_client::{
         wl_keyboard::{self, WlKeyboard},
         wl_output::{self, WlOutput},
         wl_pointer::{self, WlPointer},
+        wl_region::WlRegion,
         wl_registry::WlRegistry,
         wl_seat::WlSeat,
         wl_shm::{Format, WlShm},
@@ -79,14 +84,31 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
     zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
 };
+use wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_confined_pointer_v1::{self, ZwpConfinedPointerV1},
+    zwp_locked_pointer_v1::{self, ZwpLockedPointerV1},
+    zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1},
+};
+use wayland_protocols::wp::presentation_time::client::{
+    wp_presentation::WpPresentation,
+    wp_presentation_feedback::{self, WpPresentationFeedback},
+};
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
     zwp_primary_selection_device_v1::{self, ZwpPrimarySelectionDeviceV1},
     zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
     zwp_primary_selection_source_v1::{self, ZwpPrimarySelectionSourceV1},
 };
+use wayland_protocols::wp::relative_pointer::zv1::client::{
+    zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
+    zwp_relative_pointer_v1::{self, ZwpRelativePointerV1},
+};
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
+use wayland_protocols::xdg::activation::v1::client::{
+    xdg_activation_token_v1::{self, XdgActivationTokenV1},
+    xdg_activation_v1::XdgActivationV1,
 };
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
@@ -108,7 +130,21 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
 };
 use wirbel::{
-    Wirbel, config::Config, input::Scroll, ipc::Position, layout::Rect, workspace::Placement,
+    Wirbel, config::Config, focus::KeyboardFocus, input::Scroll, ipc::Position, layout::Rect,
+    workspace::Placement,
+};
+use x11rb::{
+    COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT,
+    connection::Connection as _,
+    protocol::{
+        Event,
+        xproto::{
+            AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
+            EventMask, PropMode, WindowClass,
+        },
+    },
+    rust_connection::RustConnection,
+    wrapper::ConnectionExt as _,
 };
 
 const WIDTH: i32 = 1000;
@@ -413,6 +449,14 @@ struct ClientState {
     key_serial: u32,
     /// Serial of the latest pointer enter, for setting the cursor.
     enter_serial: u32,
+    /// Lock and confinement going on and off.
+    constraint_events: Vec<bool>,
+    /// Accelerated and raw motion by the relative pointer.
+    relative: Vec<(f64, f64, f64, f64)>,
+    /// Whether presentation feedback said presented, each time it answered.
+    presented: Vec<bool>,
+    /// The latest activation token.
+    activation_token: Option<String>,
 }
 
 /// First index of surfaces in `Input` events that are no windows.
@@ -1383,6 +1427,99 @@ delegate_noop!(ClientState: ignore ZwpIdleInhibitorV1);
 delegate_noop!(ClientState: ignore ExtIdleNotifierV1);
 delegate_noop!(ClientState: ignore ZwpLinuxDmabufV1);
 delegate_noop!(ClientState: ignore ZxdgOutputManagerV1);
+delegate_noop!(ClientState: ignore WlRegion);
+delegate_noop!(ClientState: ignore ZwpPointerConstraintsV1);
+delegate_noop!(ClientState: ignore ZwpRelativePointerManagerV1);
+delegate_noop!(ClientState: ignore WpPresentation);
+delegate_noop!(ClientState: ignore XdgActivationV1);
+
+impl Dispatch<ZwpLockedPointerV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwpLockedPointerV1,
+        event: zwp_locked_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_locked_pointer_v1::Event::Locked => state.constraint_events.push(true),
+            zwp_locked_pointer_v1::Event::Unlocked => state.constraint_events.push(false),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpConfinedPointerV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwpConfinedPointerV1,
+        event: zwp_confined_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_confined_pointer_v1::Event::Confined => state.constraint_events.push(true),
+            zwp_confined_pointer_v1::Event::Unconfined => state.constraint_events.push(false),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpRelativePointerV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwpRelativePointerV1,
+        event: zwp_relative_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_relative_pointer_v1::Event::RelativeMotion {
+            dx,
+            dy,
+            dx_unaccel,
+            dy_unaccel,
+            ..
+        } = event
+        {
+            state.relative.push((dx, dy, dx_unaccel, dy_unaccel));
+        }
+    }
+}
+
+impl Dispatch<WpPresentationFeedback, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_presentation_feedback::Event::Presented { .. } => state.presented.push(true),
+            wp_presentation_feedback::Event::Discarded => state.presented.push(false),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<XdgActivationTokenV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &XdgActivationTokenV1,
+        event: xdg_activation_token_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_activation_token_v1::Event::Done { token } = event {
+            state.activation_token = Some(token);
+        }
+    }
+}
 
 // Output 1000x600, outer gap 10, inner gap 5, border 4. One window fills the output minus gap and
 // border. Two windows share 975 pixels of width: tiles of 488 and 487 pixels.
@@ -1419,6 +1556,10 @@ fn offers_the_globals_kitty_needs() {
         "ext_session_lock_manager_v1",
         "zwp_idle_inhibit_manager_v1",
         "ext_idle_notifier_v1",
+        "zwp_pointer_constraints_v1",
+        "zwp_relative_pointer_manager_v1",
+        "wp_presentation",
+        "xdg_activation_v1",
     ] {
         assert!(
             names.iter().any(|global| global == name),
@@ -4465,9 +4606,9 @@ fn a_grabbing_popup_gets_the_keyboard_and_gives_it_back() {
     assert!(compositor.with(|state| state.popup_grab.is_some()));
     let focus = compositor.with(|state| {
         let keyboard = state.seat.get_keyboard().unwrap();
-        keyboard.current_focus().map(|surface| {
-            use smithay::reexports::wayland_server::Resource;
-            surface.id().protocol_id()
+        keyboard.current_focus().map(|focus| {
+            use smithay::{reexports::wayland_server::Resource, wayland::seat::WaylandFocus};
+            focus.wl_surface().unwrap().id().protocol_id()
         })
     });
     assert_eq!(focus, Some(popup.surface.id().protocol_id()));
@@ -5541,4 +5682,547 @@ fn named_cursors_are_drawn_when_nobody_else_does_it_also_while_locked() {
     locker.lock();
     let shot = compositor.screenshot();
     assert!(differs_from_background(&shot, background, 300, 200));
+}
+
+/// A window with the pointer inside and the keyboard, and what a game needs from the compositor.
+fn window_for_game() -> (Compositor, Client, ZwpPointerConstraintsV1, usize) {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let window = client.open_window(0xff0000);
+    let constraints = client.bind::<ZwpPointerConstraintsV1>(1..=1);
+    compositor.pointer_at(100.0, 100.0);
+    client.take_input();
+    (compositor, client, constraints, window)
+}
+
+impl Compositor {
+    fn pointer_delta(&self, dx: f64, dy: f64) {
+        self.with(move |state| {
+            let delta = (dx, dy).into();
+            let raw = (dx * 2.0, dy * 2.0).into();
+            state.on_pointer_delta(delta, raw, InputTime::now());
+        });
+    }
+
+    fn pointer_location(&self) -> (f64, f64) {
+        self.with(|state| {
+            let location = state.seat.get_pointer().unwrap().current_location();
+            (location.x, location.y)
+        })
+    }
+}
+
+#[test]
+fn a_relative_pointer_gets_the_motion_as_the_mouse_made_it() {
+    let (compositor, mut client, _, _) = window_for_game();
+    let manager = client.bind::<ZwpRelativePointerManagerV1>(1..=1);
+    let _relative = manager.get_relative_pointer(&client._pointer, &client.handle, ());
+    client.sync();
+
+    compositor.pointer_delta(3.0, -4.0);
+    client.sync();
+    assert_eq!(client.state.relative, [(3.0, -4.0, 6.0, -8.0)]);
+    assert_eq!(compositor.pointer_location(), (103.0, 96.0));
+}
+
+#[test]
+fn a_locked_pointer_stays_while_the_mouse_keeps_reporting() {
+    let (compositor, mut client, constraints, window) = window_for_game();
+    let manager = client.bind::<ZwpRelativePointerManagerV1>(1..=1);
+    let _relative = manager.get_relative_pointer(&client._pointer, &client.handle, ());
+    let surface = client.state.windows[window].surface.clone();
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &client._pointer,
+        None,
+        Lifetime::Persistent,
+        &client.handle,
+        (),
+    );
+    client.sync();
+    client.sync();
+    assert_eq!(client.state.constraint_events, [true]);
+
+    compositor.pointer_delta(50.0, 50.0);
+    client.sync();
+    assert_eq!(compositor.pointer_location(), (100.0, 100.0));
+    assert_eq!(client.state.relative.len(), 1);
+    assert!(
+        !client
+            .take_input()
+            .iter()
+            .any(|input| matches!(input, Input::PointerMotion(..)))
+    );
+}
+
+#[test]
+fn a_lock_takes_the_pointer_to_the_hint_when_it_ends() {
+    let (compositor, mut client, constraints, window) = window_for_game();
+    let surface = client.state.windows[window].surface.clone();
+    let lock = constraints.lock_pointer(
+        &surface,
+        &client._pointer,
+        None,
+        Lifetime::Persistent,
+        &client.handle,
+        (),
+    );
+    client.sync();
+    lock.set_cursor_position_hint(30.0, 40.0);
+    surface.commit();
+    client.sync();
+    lock.destroy();
+    client.sync();
+    client.sync();
+
+    let origin = compositor.focused_rect().unwrap();
+    let expected = (f64::from(origin.x) + 30.0, f64::from(origin.y) + 40.0);
+    assert_eq!(compositor.pointer_location(), expected);
+}
+
+#[test]
+fn a_confined_pointer_slides_along_the_edge_of_its_region() {
+    let (compositor, mut client, constraints, window) = window_for_game();
+    let rect = compositor.focused_rect().unwrap();
+    let local = |x: f64, y: f64| (f64::from(rect.x) + x, f64::from(rect.y) + y);
+    let start = local(50.0, 50.0);
+    compositor.pointer_at(start.0, start.1);
+
+    let surface = client.state.windows[window].surface.clone();
+    let region = client.compositor.create_region(&client.handle, ());
+    region.add(0, 0, 100, 100);
+    let _confined = constraints.confine_pointer(
+        &surface,
+        &client._pointer,
+        Some(&region),
+        Lifetime::Persistent,
+        &client.handle,
+        (),
+    );
+    surface.commit();
+    client.sync();
+    client.sync();
+    assert_eq!(client.state.constraint_events, [true]);
+
+    compositor.pointer_delta(10.0, 0.0);
+    assert_eq!(compositor.pointer_location(), local(60.0, 50.0));
+    // Past the right edge, but free to go down.
+    compositor.pointer_delta(100.0, 5.0);
+    assert_eq!(compositor.pointer_location(), local(60.0, 55.0));
+    compositor.pointer_delta(100.0, 100.0);
+    assert_eq!(compositor.pointer_location(), local(60.0, 55.0));
+}
+
+#[test]
+fn a_window_without_the_keyboard_cannot_catch_the_pointer() {
+    let (compositor, mut client, constraints, first) = window_for_game();
+    let second = client.open_window(0x00ff00);
+    client.sync();
+    let rects = compositor.frames();
+    let left = rects[0];
+    compositor.pointer_at(f64::from(left.x + 10), f64::from(left.y + 10));
+    assert_ne!(first, second);
+
+    // The pointer is over the first window, the second one has the keyboard.
+    let surface = client.state.windows[first].surface.clone();
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &client._pointer,
+        None,
+        Lifetime::Persistent,
+        &client.handle,
+        (),
+    );
+    client.sync();
+    client.sync();
+    assert_eq!(client.state.constraint_events, []);
+
+    compositor.click();
+    client.sync();
+    client.sync();
+    assert_eq!(client.state.constraint_events, [true]);
+
+    compositor.chord(&[KEY_LEFTALT], KEY_RIGHT);
+    client.sync();
+    client.sync();
+    assert_eq!(client.state.constraint_events, [true, false]);
+}
+
+#[test]
+fn moving_the_pointer_away_by_command_ends_a_lock() {
+    let (compositor, mut client, constraints, window) = window_for_game();
+    let surface = client.state.windows[window].surface.clone();
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &client._pointer,
+        None,
+        Lifetime::Persistent,
+        &client.handle,
+        (),
+    );
+    client.sync();
+    client.sync();
+    compositor.pointer_at(2.0, 2.0);
+    client.sync();
+    assert_eq!(client.state.constraint_events, [true, false]);
+}
+
+/// Asks for a token, with the serial of the latest key press if `serial` is set.
+fn activation_token(client: &mut Client, serial: bool, surface: &WlSurface) -> String {
+    let activation = client.bind::<XdgActivationV1>(1..=1);
+    let token = activation.get_activation_token(&client.handle, ());
+    if serial {
+        let seat: WlSeat = client.globals.bind(&client.handle, 1..=9, ()).unwrap();
+        token.set_serial(client.state.key_serial, &seat);
+    }
+    token.set_surface(surface);
+    token.commit();
+    client.sync();
+    client.state.activation_token.take().unwrap()
+}
+
+#[test]
+fn a_token_from_a_key_press_brings_up_the_window_on_its_workspace() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let far = client.open_window(0xff0000);
+    compositor.chord(&[KEY_LEFTMETA], KEY_2);
+    assert_eq!(compositor.active_workspace(), 1);
+    let near = client.open_window(0x00ff00);
+    client.sync();
+    compositor.tap_key(KEY_A);
+    client.sync();
+
+    let surface = client.state.windows[near].surface.clone();
+    let token = activation_token(&mut client, true, &surface);
+    let activation = client.bind::<XdgActivationV1>(1..=1);
+    activation.activate(token, &client.state.windows[far].surface);
+    client.sync();
+    client.sync();
+    assert_eq!(compositor.active_workspace(), 0);
+    assert!(client.state.windows[far].activated);
+}
+
+#[test]
+fn a_window_that_only_wants_attention_gets_no_focus() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let far = client.open_window(0xff0000);
+    let near = client.open_window(0x00ff00);
+    client.sync();
+
+    let surface = client.state.windows[far].surface.clone();
+    let token = activation_token(&mut client, false, &surface);
+    let activation = client.bind::<XdgActivationV1>(1..=1);
+    activation.activate(token, &client.state.windows[far].surface);
+    client.sync();
+    client.sync();
+    assert!(client.state.windows[near].activated);
+    assert!(!client.state.windows[far].activated);
+}
+
+#[test]
+fn presentation_feedback_answers_with_the_frame_that_shows_the_surface() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let window = client.open_window(0xff0000);
+    let presentation = client.bind::<WpPresentation>(1..=1);
+
+    let surface = client.state.windows[window].surface.clone();
+    let _feedback = presentation.feedback(&surface, &client.handle, ());
+    surface.commit();
+    client.sync();
+
+    compositor.with(|state| {
+        state.space.refresh();
+        let output = state.monitors[0].output.clone();
+        let mut renderer = PixmanRenderer::new().unwrap();
+        let size = Size::<i32, Buffer>::from((WIDTH, HEIGHT));
+        let mut image: Image<'static, 'static> =
+            renderer.create_buffer(Fourcc::Argb8888, size).unwrap();
+        let mut framebuffer = renderer.bind(&mut image).unwrap();
+        let elements = state.scene_elements(&mut renderer, &output);
+        let mut tracker = OutputDamageTracker::from_output(&output);
+        let result = tracker
+            .render_output(&mut renderer, &mut framebuffer, 0, &elements, [0.0; 4])
+            .unwrap();
+        state.update_scanout_outputs(&output, &result.states);
+        let mut feedback = state.presentation_feedback(&output, &result.states);
+        let refresh = Refresh::fixed(Duration::from_millis(16));
+        let kind = server_feedback::Kind::Vsync;
+        feedback.presented(state.clock.now(), refresh, 7, kind);
+    });
+    client.sync();
+    assert_eq!(client.state.presented, [true]);
+}
+
+/// A compositor with a running X server and an X client of it, or `None` on a machine without
+/// Xwayland, where there is nothing to test.
+fn with_x_server() -> Option<(Compositor, RustConnection, u32)> {
+    let compositor = Compositor::start();
+    compositor.with(Wirbel::start_xwayland);
+    let display = compositor.with(|state| state.xwayland.display)?;
+    wait_for(|| compositor.with(|state| state.xwm.is_some()));
+    let (connection, screen) = x11rb::connect(Some(&format!(":{display}"))).unwrap();
+    let root = connection.setup().roots[screen].root;
+    Some((compositor, connection, root))
+}
+
+/// Opens an X11 window. With `override_redirect` it is a menu, without one a normal window.
+fn x_window(connection: &RustConnection, root: u32, override_redirect: bool) -> u32 {
+    let window = connection.generate_id().unwrap();
+    let aux = CreateWindowAux::new()
+        .background_pixel(0x00ff0000)
+        .override_redirect(u32::from(override_redirect))
+        .event_mask(EventMask::KEY_PRESS | EventMask::STRUCTURE_NOTIFY | EventMask::FOCUS_CHANGE);
+    connection
+        .create_window(
+            COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            40,
+            30,
+            200,
+            100,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            COPY_FROM_PARENT,
+            &aux,
+        )
+        .unwrap();
+    connection.map_window(window).unwrap();
+    connection.flush().unwrap();
+    window
+}
+
+fn wait_for(mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Where a window is on the screen. Its parent is the frame of the window manager.
+fn x_geometry(connection: &RustConnection, window: u32) -> (i32, i32, u32, u32) {
+    let geometry = connection.get_geometry(window).unwrap().reply().unwrap();
+    let on_screen = connection
+        .translate_coordinates(window, geometry.root, 0, 0)
+        .unwrap()
+        .reply()
+        .unwrap();
+    (
+        on_screen.dst_x.into(),
+        on_screen.dst_y.into(),
+        geometry.width.into(),
+        geometry.height.into(),
+    )
+}
+
+/// Ends the Xwayland of a display the hard way.
+fn kill_x_server(display: u32) {
+    let wanted = format!(":{display}");
+    let mine = std::process::id().to_string();
+    for entry in fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(line) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let mut words = line.split(|byte| *byte == 0);
+        let is_server = words.next().is_some_and(|word| word.ends_with(b"Xwayland"))
+            && words.next() == Some(wanted.as_bytes());
+        let status = fs::read_to_string(entry.path().join("status")).unwrap_or_default();
+        let parent = status.lines().find_map(|line| line.strip_prefix("PPid:"));
+        if is_server && parent.is_some_and(|parent| parent.trim() == mine) {
+            let pid = entry.file_name().into_string().unwrap();
+            Command::new("kill").args(["-9", &pid]).status().unwrap();
+            return;
+        }
+    }
+    panic!("no Xwayland on {wanted}");
+}
+
+#[test]
+fn an_x11_window_is_tiled_gets_the_keyboard_and_closes() {
+    let Some((compositor, connection, root)) = with_x_server() else {
+        return;
+    };
+    let window = x_window(&connection, root, false);
+    wait_for(|| compositor.focused_rect().is_some());
+
+    let rect = compositor.focused_rect().unwrap();
+    wait_for(|| {
+        let wanted = (rect.x, rect.y, rect.w as u32, rect.h as u32);
+        x_geometry(&connection, window) == wanted
+    });
+    assert!(rect.w > 900, "not tiled: {rect:?}");
+
+    compositor.tap_key(KEY_A);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let press = loop {
+        match connection.poll_for_event().unwrap() {
+            Some(Event::KeyPress(press)) => break press,
+            _ => {
+                assert!(Instant::now() < deadline, "no key press");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    assert_eq!(press.detail, (KEY_A + 8) as u8);
+
+    connection.destroy_window(window).unwrap();
+    connection.flush().unwrap();
+    wait_for(|| compositor.focused_rect().is_none());
+    assert_eq!(compositor.frames(), []);
+}
+
+#[test]
+fn x11_and_wayland_windows_share_a_workspace() {
+    let Some((compositor, connection, root)) = with_x_server() else {
+        return;
+    };
+    let mut client = Client::connect(&compositor);
+    client.open_window(0x00ff00);
+    let window = x_window(&connection, root, false);
+    wait_for(|| compositor.frames().len() == 2);
+    wait_for(|| {
+        let rects = compositor.frames();
+        let (x, y, w, h) = x_geometry(&connection, window);
+        rects
+            .iter()
+            .any(|r| (r.x, r.y, r.w, r.h) == (x, y, w as i32, h as i32))
+    });
+    // The newcomer has the keyboard, and the screen shows both.
+    wait_for(|| {
+        compositor.with(|state| {
+            let keyboard = state.seat.get_keyboard().unwrap();
+            matches!(keyboard.current_focus(), Some(KeyboardFocus::X11(_)))
+        })
+    });
+}
+
+#[test]
+fn an_x11_menu_stays_out_of_the_tiling() {
+    let Some((compositor, connection, root)) = with_x_server() else {
+        return;
+    };
+    let mut client = Client::connect(&compositor);
+    let wayland = client.open_window(0x00ff00);
+    let rect = compositor.focused_rect().unwrap();
+    let menu = x_window(&connection, root, true);
+    wait_for(|| compositor.with(|state| state.overrides.len() == 1));
+
+    assert_eq!(compositor.frames(), [rect]);
+    assert_eq!(compositor.focused_rect(), Some(rect));
+    assert!(client.state.windows[wayland].activated);
+    let (x, y) = compositor.with(|state| {
+        let window = &state.overrides[0];
+        let location = state.space.element_location(window).unwrap();
+        (location.x, location.y)
+    });
+    assert_eq!((x, y), (40, 30));
+
+    connection.unmap_window(menu).unwrap();
+    connection.flush().unwrap();
+    wait_for(|| compositor.with(|state| state.overrides.is_empty()));
+}
+
+#[test]
+fn an_x11_window_can_go_fullscreen() {
+    let Some((compositor, connection, root)) = with_x_server() else {
+        return;
+    };
+    let window = x_window(&connection, root, false);
+    wait_for(|| compositor.focused_rect().is_some());
+
+    let atom = |name: &[u8]| {
+        connection
+            .intern_atom(false, name)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom
+    };
+    let (state_atom, full) = (atom(b"_NET_WM_STATE"), atom(b"_NET_WM_STATE_FULLSCREEN"));
+    let event = ClientMessageEvent::new(32, window, state_atom, [1, full, 0, 1, 0]);
+    connection
+        .send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .unwrap();
+    connection.flush().unwrap();
+    wait_for(|| x_geometry(&connection, window) == (0, 0, WIDTH as u32, HEIGHT as u32));
+    assert_eq!(
+        compositor.focused_rect(),
+        Some(Rect::new(0, 0, WIDTH, HEIGHT))
+    );
+}
+
+#[test]
+fn a_dialog_of_x11_floats_and_may_move() {
+    let Some((compositor, connection, root)) = with_x_server() else {
+        return;
+    };
+    let main = x_window(&connection, root, false);
+    wait_for(|| compositor.focused_rect().is_some());
+
+    let dialog = connection.generate_id().unwrap();
+    connection
+        .create_window(
+            COPY_DEPTH_FROM_PARENT,
+            dialog,
+            root,
+            0,
+            0,
+            300,
+            200,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            COPY_FROM_PARENT,
+            &CreateWindowAux::new().background_pixel(0x0000ff00),
+        )
+        .unwrap();
+    connection
+        .change_property32(
+            PropMode::REPLACE,
+            dialog,
+            AtomEnum::WM_TRANSIENT_FOR,
+            AtomEnum::WINDOW,
+            &[main],
+        )
+        .unwrap();
+    connection.map_window(dialog).unwrap();
+    connection.flush().unwrap();
+    wait_for(|| compositor.frames().len() == 2);
+
+    // In the middle of the output, as wide as it was made.
+    wait_for(|| {
+        let (x, y, w, h) = x_geometry(&connection, dialog);
+        (w, h) == (300, 200) && (x, y) == ((WIDTH - 300) / 2, (HEIGHT - 200) / 2)
+    });
+    connection
+        .configure_window(dialog, &ConfigureWindowAux::new().x(11).y(22).width(320))
+        .unwrap();
+    connection.flush().unwrap();
+    wait_for(|| x_geometry(&connection, dialog) == (11, 22, 320, 200));
+}
+
+#[test]
+fn a_dead_x_server_takes_its_windows_along_and_comes_back() {
+    let Some((compositor, connection, root)) = with_x_server() else {
+        return;
+    };
+    x_window(&connection, root, false);
+    wait_for(|| compositor.focused_rect().is_some());
+
+    kill_x_server(compositor.with(|state| state.xwayland.display).unwrap());
+    wait_for(|| compositor.frames().is_empty());
+    wait_for(|| compositor.with(|state| state.xwm.is_some()));
+    let after = compositor.with(|state| state.xwayland.display).unwrap();
+    let (connection, screen) = x11rb::connect(Some(&format!(":{after}"))).unwrap();
+    let root = connection.setup().roots[screen].root;
+    x_window(&connection, root, false);
+    wait_for(|| compositor.focused_rect().is_some());
 }

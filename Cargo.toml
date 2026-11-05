@@ -33,6 +33,7 @@ features = [
     "desktop",
     "renderer_multi",
     "wayland_frontend",
+    "xwayland",
 ]
 
 # Only the connector scanner: libdisplay-info differs between the strata, Arch 0.3, Void 0.2.
@@ -46,6 +47,7 @@ rustix = { version = "1", features = ["pipe"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+x11rb = "0.14"
 
 [dev-dependencies.smithay]
 git = "https://github.com/Smithay/smithay"

@@ -179,6 +179,7 @@ fn run(options: Options, kind: backend::Kind) -> Result<(), Box<dyn std::error::
         backend::Kind::Drm => backend::drm::init(&mut event_loop, &mut state, active)?,
     }
 
+    state.start_xwayland();
     tracing::info!(socket = ?state.socket_name, "compositor ready");
     for command in &options.commands {
         state.spawn(command);

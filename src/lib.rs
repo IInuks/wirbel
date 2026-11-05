@@ -6,6 +6,7 @@ pub mod check;
 pub mod cli;
 pub mod config;
 pub mod cursor;
+pub mod focus;
 pub mod grabs;
 pub mod handlers;
 pub mod input;
@@ -16,5 +17,6 @@ pub mod render;
 pub mod safety;
 pub mod state;
 pub mod workspace;
+pub mod xwayland;
 
 pub use state::{ClientState, Wirbel};

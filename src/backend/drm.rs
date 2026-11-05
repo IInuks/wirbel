@@ -26,8 +26,9 @@ use smithay::{
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
         },
         drm::{
-            DrmAccessError, DrmDevice, DrmDeviceFd, DrmError, DrmEvent, DrmNode,
-            compositor::{FrameFlags, RenderFrameError},
+            DrmAccessError, DrmDevice, DrmDeviceFd, DrmError, DrmEvent, DrmEventMetadata,
+            DrmEventTime, DrmNode, Planes,
+            compositor::{FrameFlags, PrimaryPlaneElement, RenderFrameError},
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
         },
@@ -37,6 +38,7 @@ use smithay::{
         renderer::{
             ImportDma, ImportMemWl,
             damage::Error as DamageError,
+            element::RenderElementStates,
             gles::GlesRenderer,
             multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
         },
@@ -46,6 +48,7 @@ use smithay::{
         },
         udev::{UdevBackend, UdevEvent, primary_gpu},
     },
+    desktop::utils::OutputPresentationFeedback,
     output::{Mode, Output, PhysicalProperties, Scale},
     reexports::{
         calloop::{
@@ -58,9 +61,17 @@ use smithay::{
         },
         input::{self, DeviceCapability, Libinput},
         rustix::fs::OFlags,
+        wayland_protocols::wp::{
+            linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags,
+            presentation_time::server::wp_presentation_feedback,
+        },
         wayland_server::backend::GlobalId,
     },
-    utils::DeviceFd,
+    utils::{DeviceFd, Monotonic, Time},
+    wayland::{
+        dmabuf::{DmabufFeedback, DmabufFeedbackBuilder},
+        presentation::Refresh,
+    },
 };
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
@@ -87,14 +98,28 @@ type Allocator = GbmAllocator<DrmDeviceFd>;
 struct Surface {
     output: Output,
     global: Option<GlobalId>,
-    drm_output: DrmOutput<Allocator, Exporter, (), DrmDeviceFd>,
+    drm_output: DrmOutput<Allocator, Exporter, Option<OutputPresentationFeedback>, DrmDeviceFd>,
     pacing: Pacing,
     /// Whether the log already told that this output shows something.
     presented: bool,
+    /// The dmabuf feedback of this output, if it could be put together.
+    feedback: Option<OutputFeedback>,
+    /// What the last frame found out about the surfaces on it.
+    states: Rc<RenderElementStates>,
+    /// Whether a client buffer is on the primary plane instead of a frame of ours.
+    scanout: bool,
+}
+
+/// What clients should allocate: for a surface we draw, and for one that could go to the screen as
+/// it is. Only the latter is worth a format the renderer finds harder.
+#[derive(Clone)]
+struct OutputFeedback {
+    render: DmabufFeedback,
+    scanout: DmabufFeedback,
 }
 
 struct Device {
-    manager: DrmOutputManager<Allocator, Exporter, (), DrmDeviceFd>,
+    manager: DrmOutputManager<Allocator, Exporter, Option<OutputPresentationFeedback>, DrmDeviceFd>,
     scanner: DrmScanner,
     /// `None` for a GPU that cannot render here: it only scans out what another one drew.
     render_node: Option<DrmNode>,
@@ -150,6 +175,34 @@ fn identity(node: &DrmNode, name: &str) -> monitor::Identity {
     monitor::Identity::from_edid(&edid)
 }
 
+/// Puts together the feedback of an output of the card `node`. Formats for the scanout tranche have
+/// to work for us too, in case a buffer does not make it to a plane after all.
+fn output_feedback(
+    render_gpu: DrmNode,
+    render_formats: &FormatSet,
+    node: DrmNode,
+    planes: &Planes,
+) -> Result<OutputFeedback, std::io::Error> {
+    let on_planes: FormatSet = planes
+        .primary
+        .iter()
+        .chain(&planes.overlay)
+        .flat_map(|plane| plane.formats.iter().copied())
+        .filter(|format| render_formats.contains(format))
+        .collect();
+    let builder = DmabufFeedbackBuilder::new(render_gpu.dev_id(), render_formats.iter().copied());
+    let render = builder.clone().build()?;
+    let scanout = builder
+        .add_preference_tranche(
+            node.dev_id(),
+            TrancheFlags::Scanout,
+            on_planes.iter().copied(),
+            4u32..=6,
+        )
+        .build()?;
+    Ok(OutputFeedback { render, scanout })
+}
+
 /// The scale a rule asks for, as the kind of scale Smithay wants.
 fn output_scale(scale: f64) -> Scale {
     if scale.fract() == 0.0 {
@@ -180,8 +233,8 @@ impl Drm {
         let events = drm.clone();
         let token = self
             .handle
-            .insert_source(notifier, move |event, _, state| match event {
-                DrmEvent::VBlank(crtc) => on_vblank(&events, state, node, crtc),
+            .insert_source(notifier, move |event, metadata, state| match event {
+                DrmEvent::VBlank(crtc) => on_vblank(&events, state, node, crtc, metadata),
                 DrmEvent::Error(err) => tracing::error!(%node, ?err, "DRM event"),
             })
             .map_err(|err| err.error)?;
@@ -352,6 +405,20 @@ impl Drm {
             planes.overlay.clear();
         }
 
+        let render_formats = self
+            .gpus
+            .single_renderer(&render_gpu)
+            .map(|renderer| renderer.dmabuf_formats());
+        let feedback = match render_formats {
+            Ok(formats) => output_feedback(render_gpu, &formats, node, &planes)
+                .inspect_err(|err| tracing::warn!(name, %err, "no dmabuf feedback"))
+                .ok(),
+            Err(err) => {
+                tracing::warn!(name, ?err, "no dmabuf feedback");
+                None
+            }
+        };
+
         let identity = identity(&node, &name);
         let (width, height) = connector.size().unwrap_or((0, 0));
         let output = Output::new(
@@ -442,6 +509,9 @@ impl Drm {
                 drm_output,
                 pacing: Pacing::default(),
                 presented: false,
+                feedback,
+                states: Rc::default(),
+                scanout: false,
             },
         );
         state.add_output(&output);
@@ -570,6 +640,13 @@ fn frame_done(
         state.lock_frame_presented(output);
     }
     state.send_frames(output);
+    let dmabuf = drm
+        .borrow_mut()
+        .surface_mut(node, crtc)
+        .and_then(|surface| Some((surface.feedback.clone()?, surface.states.clone())));
+    if let Some((feedback, states)) = dmabuf {
+        state.send_dmabuf_feedback(output, &states, &feedback.render, &feedback.scanout);
+    }
     if presented.render {
         let copies = {
             let this = drm.borrow();
@@ -580,14 +657,54 @@ fn frame_done(
     }
 }
 
-fn on_vblank(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc::Handle) {
+/// Clients learn when their frame reached the screen, down to the kernel's clock if it says so.
+fn present(
+    feedback: &mut OutputPresentationFeedback,
+    now: Time<Monotonic>,
+    refresh_mhz: i32,
+    metadata: Option<&DrmEventMetadata>,
+) {
+    let vblank = metadata.and_then(|metadata| match metadata.time {
+        DrmEventTime::Monotonic(time) if !time.is_zero() => Some(Time::from(time)),
+        _ => None,
+    });
+    let vsync = wp_presentation_feedback::Kind::Vsync;
+    let (time, flags) = match vblank {
+        Some(time) => (
+            time,
+            vsync
+                | wp_presentation_feedback::Kind::HwClock
+                | wp_presentation_feedback::Kind::HwCompletion,
+        ),
+        None => (now, vsync),
+    };
+    let sequence = metadata.map_or(0, |metadata| u64::from(metadata.sequence));
+    let refresh = Refresh::fixed(frame_duration(refresh_mhz));
+    feedback.presented(time, refresh, sequence, flags);
+}
+
+fn on_vblank(
+    drm: &Rc<RefCell<Drm>>,
+    state: &mut Wirbel,
+    node: DrmNode,
+    crtc: crtc::Handle,
+    metadata: &mut Option<DrmEventMetadata>,
+) {
     let (output, presented) = {
         let mut this = drm.borrow_mut();
         let Some(surface) = this.surface_mut(node, crtc) else {
             return;
         };
-        if let Err(err) = surface.drm_output.frame_submitted() {
-            tracing::warn!(?err, "frame not submitted");
+        match surface.drm_output.frame_submitted() {
+            Ok(Some(Some(mut feedback))) => {
+                let refresh = surface
+                    .output
+                    .current_mode()
+                    .map_or(60_000, |mode| mode.refresh);
+                present(&mut feedback, state.clock.now(), refresh, metadata.as_ref());
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(?err, "frame not submitted"),
         }
         if !surface.presented {
             surface.presented = true;
@@ -698,11 +815,27 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
                     FrameFlags::DEFAULT,
                 );
                 match frame {
-                    Ok(frame) if frame.is_empty => Rendered::Unchanged,
-                    Ok(_) => match surface.drm_output.queue_frame(()) {
-                        Ok(()) => Rendered::Queued,
-                        Err(err) => classify(err.into()),
-                    },
+                    Ok(frame) => {
+                        let scanout =
+                            matches!(frame.primary_element, PrimaryPlaneElement::Element(_));
+                        if scanout != surface.scanout {
+                            surface.scanout = scanout;
+                            tracing::info!(name = output.name(), scanout, "direct scanout");
+                        }
+                        state.update_scanout_outputs(&output, &frame.states);
+                        let mut feedback = state.presentation_feedback(&output, &frame.states);
+                        surface.states = Rc::new(frame.states.clone());
+                        if frame.is_empty {
+                            // Nothing new reached the screen, nor will it.
+                            feedback.discarded();
+                            Rendered::Unchanged
+                        } else {
+                            match surface.drm_output.queue_frame(Some(feedback)) {
+                                Ok(()) => Rendered::Queued,
+                                Err(err) => classify(err.into()),
+                            }
+                        }
+                    }
                     Err(RenderFrameError::PrepareFrame(err)) => classify(err.into()),
                     Err(RenderFrameError::RenderFrame(DamageError::Rendering(err))) => {
                         classify(err.into())
@@ -916,6 +1049,13 @@ pub fn init(
         let formats = renderer.dmabuf_formats();
         drop(renderer);
         state.offer_dmabufs(render_gpu.dev_id(), formats);
+        let rendering = this
+            .devices
+            .values()
+            .find(|device| device.render_node == Some(render_gpu));
+        if let Some(device) = rendering {
+            state.offer_syncobj(device.manager.device().device_fd().clone());
+        }
         if !this
             .devices
             .values()

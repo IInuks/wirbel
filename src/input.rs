@@ -9,9 +9,14 @@ use smithay::{
     },
     input::{
         keyboard::{FilterResult, Keysym, KeysymHandle, ModifiersState},
-        pointer::{AxisFrame, ButtonEvent},
+        pointer::{AxisFrame, ButtonEvent, RelativeMotionEvent},
     },
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER, Serial},
+    wayland::{
+        compositor::RegionAttributes,
+        pointer_constraints::{PointerConstraint, with_pointer_constraint},
+    },
 };
 
 use crate::{Wirbel, config::Action, state::Target};
@@ -45,11 +50,7 @@ impl Wirbel {
                 self.on_key(event.key_code(), event.state(), event.time());
             }
             InputEvent::PointerMotion { event } => {
-                let Some(pointer) = self.seat.get_pointer() else {
-                    return;
-                };
-                let location = pointer.current_location() + event.delta();
-                self.on_pointer_motion(location, event.time());
+                self.on_pointer_delta(event.delta(), event.delta_unaccel(), event.time());
             }
             InputEvent::PointerMotionAbsolute { event } => {
                 // Absolute devices only exist in the nested backend, which has one output.
@@ -136,6 +137,68 @@ impl Wirbel {
         if let Some(Some(action)) = action {
             self.run_action(action);
         }
+    }
+
+    /// A mouse moved, which only says how far. Clients get that as it is, for example a game that
+    /// locked the pointer. What it does to the pointer depends on the constraint in force.
+    pub fn on_pointer_delta(
+        &mut self,
+        delta: Point<f64, Logical>,
+        delta_unaccel: Point<f64, Logical>,
+        time: InputTime,
+    ) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let event = RelativeMotionEvent {
+            delta,
+            delta_unaccel,
+            time,
+        };
+        let location = pointer.current_location();
+        let under = self.surface_under(location);
+        pointer.relative_motion(self, under, &event);
+        pointer.frame(self);
+
+        match self.active_constraint() {
+            Some(Constraint::Locked) => self.note_activity(),
+            Some(Constraint::Confined(surface, region)) => {
+                let target = location + delta;
+                let candidates = [
+                    target,
+                    (target.x, location.y).into(),
+                    (location.x, target.y).into(),
+                ];
+                let allowed = candidates.into_iter().find(|candidate| {
+                    self.surface_under(*candidate)
+                        .is_some_and(|(under, origin)| {
+                            let local = (*candidate - origin).to_i32_floor();
+                            under == surface
+                                && region.as_ref().is_none_or(|region| region.contains(local))
+                        })
+                });
+                match allowed {
+                    Some(allowed) => self.on_pointer_motion(allowed, time),
+                    None => self.note_activity(),
+                }
+            }
+            None => self.on_pointer_motion(location + delta, time),
+        }
+    }
+
+    /// What holds the pointer back right now.
+    fn active_constraint(&self) -> Option<Constraint> {
+        let pointer = self.seat.get_pointer()?;
+        let surface = pointer.current_focus()?;
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            match &*constraint.filter(|constraint| constraint.is_active())? {
+                PointerConstraint::Locked(_) => Some(Constraint::Locked),
+                PointerConstraint::Confined(confined) => Some(Constraint::Confined(
+                    surface.clone(),
+                    confined.region().cloned(),
+                )),
+            }
+        })
     }
 
     pub fn on_pointer_motion(&mut self, location: Point<f64, Logical>, time: InputTime) {
@@ -255,6 +318,13 @@ impl Wirbel {
         pointer.axis(self, frame);
         pointer.frame(self);
     }
+}
+
+/// What a pointer constraint does.
+enum Constraint {
+    Locked,
+    /// The surface and the part of it that the pointer stays in.
+    Confined(WlSurface, Option<RegionAttributes>),
 }
 
 /// One scroll event. Each axis has a continuous amount and steps of 1/120 of a wheel notch.

@@ -142,7 +142,8 @@ impl Wirbel {
                 self.awaiting_buffer.remove(index);
                 self.set_focus(Some(window.clone()));
             }
-            (None, false) => {
+            // An X11 window leaves through the X server. Xwayland drops buffers at will.
+            (None, false) if window.toplevel().is_some() => {
                 self.remove_window(&window);
                 self.unconfigured.push(window);
                 return;
@@ -208,7 +209,10 @@ impl Wirbel {
             surface.send_popup_done();
             return;
         }
-        let Ok(mut grab) = self.popups.grab_popup(root.clone(), kind, seat, serial) else {
+        let Ok(mut grab) = self
+            .popups
+            .grab_popup(root.clone().into(), kind, seat, serial)
+        else {
             surface.send_popup_done();
             return;
         };

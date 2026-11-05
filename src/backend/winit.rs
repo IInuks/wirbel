@@ -1,9 +1,10 @@
 //! Nested backend: runs inside a window of another Wayland compositor or X server.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, fs::OpenOptions, os::unix::fs::OpenOptionsExt, rc::Rc, time::Duration};
 
 use smithay::{
     backend::{
+        drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
         renderer::{ImportDma, damage::OutputDamageTracker, gles::GlesRenderer},
         winit::{self, WinitEvent, WinitGraphicsBackend},
@@ -12,9 +13,11 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::EventLoop,
+        wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         winit::{cursor::Cursor, dpi::LogicalSize, window::WindowAttributes},
     },
-    utils::Transform,
+    utils::{DeviceFd, Transform},
+    wayland::presentation::Refresh,
 };
 
 use crate::Wirbel;
@@ -131,6 +134,25 @@ fn offer_dmabufs(backend: &mut WinitGraphicsBackend<GlesRenderer>, state: &mut W
     tracing::info!(%node, "offering dmabufs");
     let formats = backend.renderer().dmabuf_formats();
     state.offer_dmabufs(node.dev_id(), formats);
+    offer_syncobj(node, state);
+}
+
+/// Explicit sync only needs a file handle on the GPU, which the render node gives to everybody.
+fn offer_syncobj(node: DrmNode, state: &mut Wirbel) {
+    let Some(path) = node.dev_path() else {
+        return;
+    };
+    let device = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&path);
+    match device {
+        Ok(device) => state.offer_syncobj(DrmDeviceFd::new(DeviceFd::from(
+            std::os::fd::OwnedFd::from(device),
+        ))),
+        Err(err) => tracing::warn!(%err, ?path, "no explicit sync"),
+    }
 }
 
 impl Nested {
@@ -158,14 +180,14 @@ impl Nested {
             }
         };
         let elements = state.scene_elements(renderer, &self.output);
-        let damage = match self.damage_tracker.render_output(
+        let (damage, states) = match self.damage_tracker.render_output(
             renderer,
             &mut framebuffer,
             age,
             &elements,
             state.config.background_color,
         ) {
-            Ok(result) => result.damage.cloned(),
+            Ok(result) => (result.damage.cloned(), result.states),
             Err(err) => {
                 tracing::error!(?err, "failed to render");
                 return;
@@ -173,11 +195,20 @@ impl Nested {
         };
         drop(framebuffer);
 
+        state.update_scanout_outputs(&self.output, &states);
+        let mut feedback = state.presentation_feedback(&self.output, &states);
         if let Err(err) = self.backend.submit(damage.as_deref()) {
             tracing::error!(%err, "failed to present");
             return;
         }
         self.presented = true;
+        // The host shows it some time later, and does not tell when. It is the best guess.
+        feedback.presented(
+            state.clock.now(),
+            Refresh::fixed(Duration::from_secs_f64(1_000.0 / f64::from(REFRESH_MHZ))),
+            0,
+            wp_presentation_feedback::Kind::empty(),
+        );
         state.send_frame_callbacks(&self.output);
     }
 }

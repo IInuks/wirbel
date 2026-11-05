@@ -1,5 +1,7 @@
 //! Clipboard, primary selection and drag and drop between clients.
 
+use std::os::fd::OwnedFd;
+
 use smithay::{
     input::{
         Seat,
@@ -9,7 +11,7 @@ use smithay::{
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, Serial},
     wayland::selection::{
-        SelectionHandler,
+        SelectionHandler, SelectionSource, SelectionTarget,
         data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler},
         primary_selection::{PrimarySelectionHandler, PrimarySelectionState},
     },
@@ -19,6 +21,36 @@ use crate::Wirbel;
 
 impl SelectionHandler for Wirbel {
     type SelectionUserData = ();
+
+    /// X11 clients get to see what Wayland clients copied.
+    fn new_selection(
+        &mut self,
+        target: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if let Some(xwm) = self.xwm.as_mut()
+            && let Err(err) = xwm.new_selection(target, source.map(|source| source.mime_types()))
+        {
+            tracing::warn!(?err, ?target, "failed to offer the selection to X11");
+        }
+    }
+
+    /// A Wayland client pastes what an X11 client copied.
+    fn send_selection(
+        &mut self,
+        target: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        if let Some(xwm) = self.xwm.as_mut()
+            && let Err(err) = xwm.send_selection(target, mime_type, fd)
+        {
+            tracing::warn!(?err, ?target, "failed to fetch the selection from X11");
+        }
+    }
 }
 
 impl DataDeviceHandler for Wirbel {

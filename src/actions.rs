@@ -17,6 +17,11 @@ impl Wirbel {
                 if let Some(toplevel) = self.focused.as_ref().and_then(Window::toplevel) {
                     toplevel.send_close();
                 }
+                if let Some(surface) = self.focused.as_ref().and_then(Window::x11_surface)
+                    && let Err(err) = surface.close()
+                {
+                    tracing::warn!(%err, "failed to close an X11 window");
+                }
             }
             Action::Quit => self.loop_signal.stop(),
             Action::Reload => self.reload_config(),
@@ -171,6 +176,16 @@ impl Wirbel {
             WorkspaceTarget::Previous => (active + WORKSPACES - 1) % WORKSPACES,
             WorkspaceTarget::Next => (active + 1) % WORKSPACES,
         })
+    }
+
+    /// Brings `window` to the user, wherever it is: its workspace comes up, and it gets the focus.
+    pub fn activate_window(&mut self, window: &Window) {
+        let Some((m, w)) = self.locate(window) else {
+            return;
+        };
+        self.active_monitor = m;
+        self.show_workspace(w);
+        self.set_focus(Some(window.clone()));
     }
 
     pub fn show_workspace(&mut self, index: usize) {

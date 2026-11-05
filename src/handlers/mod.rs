@@ -4,13 +4,15 @@ mod compositor;
 mod layer_shell;
 mod selection;
 mod session_lock;
+mod xdg_activation;
 mod xdg_shell;
+mod xwayland;
 
 use smithay::{
-    backend::{allocator::Format, allocator::dmabuf::Dmabuf},
+    backend::{allocator::Format, allocator::dmabuf::Dmabuf, drm::DrmDeviceFd},
     input::{
         Seat, SeatHandler, SeatState, keyboard::LedState, pointer::CursorImageStatus,
-        tablet::TabletSeatHandler,
+        pointer::PointerHandle, tablet::TabletSeatHandler,
     },
     reexports::{
         wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
@@ -19,22 +21,24 @@ use smithay::{
     wayland::{
         compositor::with_states,
         dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState, supports_syncobj_eventfd},
         fractional_scale::FractionalScaleHandler,
         idle_inhibit::IdleInhibitHandler,
         idle_notify::{IdleNotifierHandler, IdleNotifierState},
         output::OutputHandler,
-        pointer_constraints::PointerConstraintsHandler,
+        pointer_constraints::{ConstraintRemove, PointerConstraint, PointerConstraintsHandler},
+        seat::WaylandFocus,
         selection::{data_device::set_data_device_focus, primary_selection::set_primary_focus},
         shell::xdg::{ToplevelSurface, XdgToplevelSurfaceData, decoration::XdgDecorationHandler},
     },
 };
 
-use crate::{Wirbel, state::apply_output_scale};
+use crate::{Wirbel, focus::KeyboardFocus, state::apply_output_scale};
 
 pub use session_lock::SessionLock;
 
 impl SeatHandler for Wirbel {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = KeyboardFocus;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -43,8 +47,10 @@ impl SeatHandler for Wirbel {
     }
 
     /// The clipboard belongs to the client with the keyboard.
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        let client = focused.and_then(Resource::client);
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&KeyboardFocus>) {
+        let client = focused
+            .and_then(WaylandFocus::wl_surface)
+            .and_then(|surface| surface.client());
         set_data_device_focus(&self.display_handle, seat, client.clone());
         set_primary_focus(&self.display_handle, seat, client);
     }
@@ -66,8 +72,40 @@ impl TabletSeatHandler for Wirbel {
 
 impl OutputHandler for Wirbel {}
 
-// `WlSurface` is only a valid pointer target with this. The protocol itself is not offered yet.
-impl PointerConstraintsHandler for Wirbel {}
+impl PointerConstraintsHandler for Wirbel {
+    fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {
+        self.update_pointer_constraint();
+    }
+
+    /// A client that drew its own cursor while the pointer was locked says where that was, so that
+    /// the real one takes over there. Leaving the surface ends the lock too, but then the pointer
+    /// is somewhere else already, and in the middle of moving.
+    fn remove_constraint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        removal: ConstraintRemove,
+    ) {
+        let ConstraintRemove::Destroyed(PointerConstraint::Locked(locked)) = removal else {
+            return;
+        };
+        let Some(hint) = locked.cursor_position_hint() else {
+            return;
+        };
+        let location = pointer.current_location();
+        if let Some((under, origin)) = self.surface_under(location)
+            && under == *surface
+        {
+            self.warp_pointer(origin + hint);
+        }
+    }
+}
+
+impl DrmSyncobjHandler for Wirbel {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.syncobj_state.as_mut()
+    }
+}
 
 /// Windows have no decoration except what we draw around them, so nobody draws their own.
 impl XdgDecorationHandler for Wirbel {
@@ -119,6 +157,17 @@ impl DmabufHandler for Wirbel {
 }
 
 impl Wirbel {
+    /// Offers explicit sync on the given device, if it can do that. Clients of the NVIDIA driver
+    /// want it, and they cannot do without implicit sync elsewhere.
+    pub fn offer_syncobj(&mut self, device: DrmDeviceFd) {
+        if supports_syncobj_eventfd(&device) {
+            tracing::info!("offering explicit sync");
+            self.syncobj_state = Some(DrmSyncobjState::new::<Self>(&self.display_handle, device));
+        } else {
+            tracing::info!("this GPU has no explicit sync");
+        }
+    }
+
     /// Offers dmabufs of the given device to clients. The backend calls this once it knows what
     /// its renderer can import, along with setting `import_dmabuf`.
     pub fn offer_dmabufs(&mut self, device: u64, formats: impl IntoIterator<Item = Format>) {

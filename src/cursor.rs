@@ -112,6 +112,28 @@ impl Cursors {
         })
     }
 
+    /// The default arrow for X clients: pixels, size and hotspot. An X cursor is little endian ARGB
+    /// like an Xcursor file, whatever Smithay calls the format.
+    pub fn default_pixels(&self) -> (Vec<u8>, (u16, u16), (u16, u16)) {
+        let image = ["default", "left_ptr"].iter().find_map(|name| {
+            let path = self.themes.iter().find_map(|theme| theme.load_icon(name))?;
+            let images = parse_xcursor(&fs::read(path).ok()?)?;
+            let distance = |image: &&xcursor::parser::Image| image.size.abs_diff(self.size);
+            images.iter().min_by_key(distance).cloned()
+        });
+        match image {
+            Some(image) => {
+                let (xhot, yhot) = (image.xhot as u16, image.yhot as u16);
+                let size = (image.width as u16, image.height as u16);
+                (image.pixels_rgba, size, (xhot, yhot))
+            }
+            None => {
+                let (pixels, width, height) = built_in_arrow(1);
+                (pixels, (width as u16, height as u16), (0, 0))
+            }
+        }
+    }
+
     fn built_in(&self, pixels: u32) -> CursorImage {
         let unit = (pixels as i32 / (ARROW + 8)).max(1);
         let (data, width, height) = built_in_arrow(unit);

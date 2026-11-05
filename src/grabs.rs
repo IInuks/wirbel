@@ -19,8 +19,9 @@ use smithay::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::protocol::wl_surface::WlSurface,
     },
-    utils::{Logical, Point, Serial},
-    wayland::{compositor::with_states, shell::xdg::SurfaceCachedState},
+    utils::{Logical, Point, SERIAL_COUNTER, Serial},
+    wayland::{compositor::with_states, seat::WaylandFocus, shell::xdg::SurfaceCachedState},
+    xwayland::{X11Surface, xwm::ResizeEdge},
 };
 
 use crate::{
@@ -39,6 +40,18 @@ pub struct Edges {
 impl From<xdg_toplevel::ResizeEdge> for Edges {
     fn from(edge: xdg_toplevel::ResizeEdge) -> Self {
         use xdg_toplevel::ResizeEdge as Edge;
+        Self {
+            left: matches!(edge, Edge::Left | Edge::TopLeft | Edge::BottomLeft),
+            right: matches!(edge, Edge::Right | Edge::TopRight | Edge::BottomRight),
+            top: matches!(edge, Edge::Top | Edge::TopLeft | Edge::TopRight),
+            bottom: matches!(edge, Edge::Bottom | Edge::BottomLeft | Edge::BottomRight),
+        }
+    }
+}
+
+impl From<ResizeEdge> for Edges {
+    fn from(edge: ResizeEdge) -> Self {
+        use ResizeEdge as Edge;
         Self {
             left: matches!(edge, Edge::Left | Edge::TopLeft | Edge::BottomLeft),
             right: matches!(edge, Edge::Right | Edge::TopRight | Edge::BottomRight),
@@ -89,7 +102,8 @@ fn min_size(window: &Window) -> (i32, i32) {
             cached.current().min_size
         })
     });
-    let min = min.unwrap_or_default();
+    let x11 = window.x11_surface().and_then(X11Surface::min_size);
+    let min = min.or(x11).unwrap_or_default();
     (min.w.max(MIN_FLOATING_SIZE), min.h.max(MIN_FLOATING_SIZE))
 }
 
@@ -155,6 +169,25 @@ impl Wirbel {
         }
     }
 
+    /// `start_client_drag` for an X11 client, which holds a button instead of naming a serial.
+    pub fn start_x11_drag(&mut self, surface: &X11Surface, kind: DragKind) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let (Some(window), Some(start)) = (self.find_x11(surface), pointer.grab_start_data())
+        else {
+            return;
+        };
+        let same_client = start.focus.as_ref().is_some_and(|(focus, _)| {
+            use smithay::reexports::wayland_server::Resource;
+            let surface = window.wl_surface();
+            surface.is_some_and(|surface| focus.id().same_client_as(&surface.id()))
+        });
+        if same_client {
+            self.start_drag(window, kind, start, SERIAL_COUNTER.next_serial());
+        }
+    }
+
     fn start_drag(
         &mut self,
         window: Window,
@@ -162,7 +195,11 @@ impl Wirbel {
         start: GrabStartData<Self>,
         serial: Serial,
     ) {
-        if self.drag.is_some() || self.full_kind(&window).is_some() {
+        // Windows outside the workspaces, like X11 menus, cannot be dragged.
+        if self.drag.is_some()
+            || self.full_kind(&window).is_some()
+            || self.locate(&window).is_none()
+        {
             return;
         }
         let Some(pointer) = self.seat.get_pointer() else {
