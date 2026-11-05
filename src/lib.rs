@@ -10,6 +10,7 @@ pub mod input;
 pub mod ipc;
 pub mod layout;
 pub mod render;
+pub mod safety;
 pub mod state;
 pub mod workspace;
 

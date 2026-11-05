@@ -5,21 +5,51 @@ use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
         InputTime, KeyState, KeyboardKeyEvent, Keycode, PointerAxisEvent, PointerButtonEvent,
+        PointerMotionEvent,
     },
     input::{
-        keyboard::FilterResult,
+        keyboard::{FilterResult, Keysym, KeysymHandle, ModifiersState},
         pointer::{AxisFrame, ButtonEvent},
     },
     utils::{Logical, Point, SERIAL_COUNTER, Serial},
 };
 
-use crate::{Wirbel, state::Target};
+use crate::{Wirbel, config::Action, state::Target};
+
+/// xkb codes are evdev codes shifted by this.
+const XKB_OFFSET: u32 = 8;
+const SWITCH_VT_1: u32 = Keysym::XF86_Switch_VT_1.raw();
+const SWITCH_VT_12: u32 = Keysym::XF86_Switch_VT_12.raw();
+const F1: u32 = Keysym::F1.raw();
+const F12: u32 = Keysym::F12.raw();
+
+/// The VT a key asks for: `XF86Switch_VT_n`, or Ctrl+Alt+Fn for keymaps without those symbols.
+fn vt_of_key(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option<i32> {
+    let number = |sym: u32, first: u32| (sym - first + 1) as i32;
+    let modified = handle.modified_sym().raw();
+    if (SWITCH_VT_1..=SWITCH_VT_12).contains(&modified) {
+        return Some(number(modified, SWITCH_VT_1));
+    }
+    let function = handle
+        .raw_syms()
+        .iter()
+        .map(|sym| sym.raw())
+        .find(|sym| (F1..=F12).contains(sym))?;
+    (modifiers.ctrl && modifiers.alt).then(|| number(function, F1))
+}
 
 impl Wirbel {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event } => {
                 self.on_key(event.key_code(), event.state(), event.time());
+            }
+            InputEvent::PointerMotion { event } => {
+                let Some(pointer) = self.seat.get_pointer() else {
+                    return;
+                };
+                let location = pointer.current_location() + event.delta();
+                self.on_pointer_motion(location, event.time());
             }
             InputEvent::PointerMotionAbsolute { event } => {
                 // Absolute devices only exist in the nested backend, which has one output.
@@ -54,8 +84,13 @@ impl Wirbel {
     }
 
     /// Binds take the key from clients, press and release alike. A locked session has no binds:
-    /// every key belongs to the lock screen.
+    /// every key belongs to the lock screen. The two ways out work regardless, the session stays
+    /// locked behind them: the emergency chord and switching the VT.
     pub fn on_key(&mut self, key: Keycode, state: KeyState, time: InputTime) {
+        let evdev = key.raw().saturating_sub(XKB_OFFSET) as u16;
+        if self.chord.feed(evdev, state == KeyState::Pressed) {
+            (self.emergency)();
+        }
         self.note_activity();
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
@@ -68,6 +103,13 @@ impl Wirbel {
             serial,
             time,
             |wirbel, modifiers, handle| match state {
+                KeyState::Pressed
+                    if let Some(vt) = vt_of_key(modifiers, &handle)
+                        && wirbel.change_vt.is_some() =>
+                {
+                    wirbel.swallowed_keys.push(key);
+                    FilterResult::Intercept(Some(Action::ChangeVt(vt)))
+                }
                 KeyState::Pressed if wirbel.lock.is_active() => FilterResult::Forward,
                 KeyState::Pressed => {
                     let action = wirbel.config.action_for_key(modifiers.into(), &handle);

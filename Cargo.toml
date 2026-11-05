@@ -15,13 +15,31 @@ path = "src/main.rs"
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+xcursor = "0.3"
 
 # Pinned to git: the DRM/multi-GPU work of later stages needs fixes that are not in 0.7.0.
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay"
 rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca"
 default-features = false
-features = ["backend_drm", "backend_winit", "desktop", "wayland_frontend"]
+features = [
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    "backend_winit",
+    "desktop",
+    "renderer_multi",
+    "wayland_frontend",
+]
+
+# Only the connector scanner: libdisplay-info differs between the strata, Arch 0.3, Void 0.2.
+[dependencies.smithay-drm-extras]
+git = "https://github.com/Smithay/smithay"
+rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca"
+default-features = false
 
 [dev-dependencies]
 rustix = { version = "1", features = ["pipe"] }

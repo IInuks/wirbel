@@ -67,6 +67,8 @@ pub enum Action {
     MoveToWorkspace(usize),
     FocusOutput(Direction),
     MoveToOutput(Direction),
+    /// Not for binds: comes from the VT keys, which work regardless of them.
+    ChangeVt(i32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

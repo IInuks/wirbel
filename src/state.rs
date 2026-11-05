@@ -68,6 +68,7 @@ use crate::{
     ipc::{Ipc, Position},
     layout::Rect,
     render::{LayerEntry, LayerPart, LayerTiers},
+    safety::Chord,
     workspace::{Frame, FullKind, Monitor, Placement, Workspace},
 };
 
@@ -177,6 +178,12 @@ pub struct Wirbel {
     pub needs_redraw: bool,
     /// Asks the backend for a new frame. Set by the backend.
     pub redraw: Box<dyn Fn()>,
+    /// Switches to a virtual terminal. Set by a backend that owns one.
+    pub change_vt: Option<Box<dyn FnMut(i32)>>,
+    /// Sees the same keys as the watcher thread, which is not running in every setup.
+    pub chord: Chord,
+    /// What the emergency chord does. The binary ends the process here.
+    pub emergency: Box<dyn Fn()>,
 }
 
 impl Wirbel {
@@ -249,6 +256,9 @@ impl Wirbel {
 
             needs_redraw: true,
             redraw: Box::new(|| {}),
+            change_vt: None,
+            chord: Chord::default(),
+            emergency: Box::new(|| tracing::error!("emergency chord pressed")),
             display_handle: dh,
         })
     }

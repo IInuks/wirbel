@@ -5399,3 +5399,17 @@ fn a_visible_inhibitor_holds_off_idling_and_a_hidden_one_does_not() {
     assert!(!compositor.with(|state| state.idle_notifier_state.is_inhibited()));
     wait_for_idle(&mut client, 1);
 }
+
+/// Taking over the screen needs a VT on stdin. This also keeps tests off the DRM backend.
+#[test]
+fn refuses_the_drm_backend_without_a_virtual_terminal() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wirbel"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(message.contains("not a virtual terminal"), "{message}");
+}

@@ -47,6 +47,11 @@ impl Wirbel {
             Action::MoveToWorkspace(index) => self.move_to_workspace(index),
             Action::FocusOutput(direction) => self.focus_output(direction),
             Action::MoveToOutput(direction) => self.move_to_output(direction),
+            Action::ChangeVt(vt) => {
+                if let Some(change_vt) = &mut self.change_vt {
+                    change_vt(vt);
+                }
+            }
         }
     }
 
