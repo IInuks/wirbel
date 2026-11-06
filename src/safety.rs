@@ -12,15 +12,16 @@
 use std::{
     backtrace::Backtrace,
     env,
+    ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::{
         fd::{AsRawFd, RawFd},
-        unix::fs::OpenOptionsExt,
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     },
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     },
     thread,
@@ -185,11 +186,72 @@ pub fn say(message: &str) {
     }
 }
 
+/// What has to go with the process, however it ends. A hard exit runs no destructors.
+#[derive(Debug, Default)]
+struct Leftovers {
+    files: Vec<CString>,
+    groups: Vec<libc::pid_t>,
+}
+
+static LEFTOVERS: Mutex<Leftovers> = Mutex::new(Leftovers {
+    files: Vec::new(),
+    groups: Vec::new(),
+});
+
+fn leftovers() -> std::sync::MutexGuard<'static, Leftovers> {
+    LEFTOVERS.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+/// A socket or lock file of ours. A later clean exit removes it itself, that does no harm.
+pub fn remove_at_exit(path: &Path) {
+    if let Ok(path) = CString::new(path.as_os_str().as_bytes()) {
+        leftovers().files.push(path);
+    }
+}
+
+/// A process group of the autostart, which ends with the session.
+pub fn end_at_exit(group: libc::pid_t) {
+    leftovers().groups.push(group);
+}
+
+/// Forgets a group that may be empty by now, before its number comes up for someone else.
+pub fn group_left(group: libc::pid_t) {
+    // Safety: signal 0 only asks whether the group exists.
+    if unsafe { libc::kill(-group, 0) } != 0 {
+        leftovers().groups.retain(|other| *other != group);
+    }
+}
+
+fn end_groups(leftovers: &mut Leftovers) {
+    for group in leftovers.groups.drain(..) {
+        // Safety: the group is ours, see `group_left`.
+        unsafe { libc::kill(-group, libc::SIGTERM) };
+    }
+}
+
+/// The autostart ends, on a clean stop.
+pub fn end_autostart() {
+    end_groups(&mut leftovers());
+}
+
+/// Works from the panic hook and other threads. It does not wait for a lock: a thread may have died
+/// holding it, and the screen matters more than a file.
+fn clean_up() {
+    if let Ok(mut leftovers) = LEFTOVERS.try_lock() {
+        end_groups(&mut leftovers);
+        for file in &leftovers.files {
+            // Safety: a valid C string, and it is fine if the file is gone.
+            unsafe { libc::unlink(file.as_ptr()) };
+        }
+    }
+}
+
 /// Ends the process right here: no destructors, nothing that could wait for the main loop. The
 /// kernel closes the DRM devices and the session, which is what hands the screen back.
 pub fn hard_exit(code: i32, reason: &str) -> ! {
     tracing::error!(code, reason, "hard exit");
     restore_terminal();
+    clean_up();
     let log = LOG_PATH
         .get()
         .map(|path| format!(", log: {}", path.display()))

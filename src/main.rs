@@ -192,10 +192,11 @@ fn run(options: Options, kind: backend::Kind) -> Result<(), Box<dyn std::error::
     state.start_xwayland();
     tracing::info!(socket = ?state.socket_name, "compositor ready");
     for command in options.commands.iter().chain(&state.config.exec_once) {
-        state.spawn(command);
+        state.autostart(command);
     }
 
     event_loop.run(None, &mut state, Wirbel::after_dispatch)?;
+    safety::end_autostart();
     tracing::info!("stopped");
     Ok(())
 }

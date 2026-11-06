@@ -8,6 +8,7 @@
 use std::{
     borrow::Cow,
     os::{fd::OwnedFd, unix::net::UnixStream},
+    path::Path,
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -47,6 +48,7 @@ use crate::{
     focus::KeyboardFocus,
     grabs::DragKind,
     layout::Rect,
+    safety,
     state::has_buffer,
     workspace::FullKind,
     xwayland::{self, Binary},
@@ -108,7 +110,10 @@ impl Wirbel {
             |_| {},
         )?;
         let pipe = server.poll_fd().try_clone_to_owned()?;
-        self.xwayland.display = Some(server.display_number());
+        let display = server.display_number();
+        self.xwayland.display = Some(display);
+        safety::remove_at_exit(Path::new(&format!("/tmp/.X11-unix/X{display}")));
+        safety::remove_at_exit(Path::new(&format!("/tmp/.X{display}-lock")));
         self.xwayland.server = Some(server);
         self.loop_handle
             .insert_source(

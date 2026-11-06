@@ -340,6 +340,7 @@ impl Ipc {
             _ => {}
         }
         let listener = UnixListener::bind(&path)?;
+        crate::safety::remove_at_exit(&path);
         listener.set_nonblocking(true)?;
         let source = Generic::new(listener, Interest::READ, Mode::Level);
         let inserted = self.handle.insert_source(source, |_, listener, state| {

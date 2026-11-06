@@ -1,6 +1,8 @@
 use std::{
     borrow::Cow,
+    env,
     ffi::OsString,
+    os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
@@ -85,7 +87,7 @@ use crate::{
     ipc::{Ipc, Position},
     layout::Rect,
     render::{LayerEntry, LayerPart, LayerTiers},
-    safety::Chord,
+    safety::{self, Chord},
     stats::Stats,
     workspace::{Frame, FullKind, Monitor, Placement, Workspace},
 };
@@ -362,6 +364,12 @@ impl Wirbel {
     ) -> Result<OsString, Box<dyn std::error::Error>> {
         let socket = ListeningSocketSource::new_auto()?;
         let name = socket.socket_name().to_os_string();
+        if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") {
+            let mut path = PathBuf::from(runtime).join(&name).into_os_string();
+            safety::remove_at_exit(path.as_ref());
+            path.push(".lock");
+            safety::remove_at_exit(path.as_ref());
+        }
         let handle = event_loop.handle();
 
         handle.insert_source(socket, |stream, _, state| {
@@ -424,6 +432,16 @@ impl Wirbel {
 
     /// Runs a shell command as a client of this compositor.
     pub fn spawn(&self, command: &str) {
+        self.start(command, false);
+    }
+
+    /// A program of the autostart. It gets a process group of its own, which ends with the session:
+    /// not all of them notice that the display went away, and some are a loop in a script.
+    pub fn autostart(&self, command: &str) {
+        self.start(command, true);
+    }
+
+    fn start(&self, command: &str, autostart: bool) {
         let mut child = Command::new("sh");
         child
             .args(["-c", command])
@@ -434,11 +452,23 @@ impl Wirbel {
             Some(display) => child.env("DISPLAY", format!(":{display}")),
             None => child.env_remove("DISPLAY"),
         };
+        if autostart {
+            child.process_group(0);
+        }
         let child = child.spawn();
         match child {
             Ok(mut child) => {
+                let group = child.id() as libc::pid_t;
+                if autostart {
+                    safety::end_at_exit(group);
+                }
                 // Reap it when it exits, the compositor has no use for the status.
-                std::thread::spawn(move || child.wait());
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                    if autostart {
+                        safety::group_left(group);
+                    }
+                });
             }
             Err(err) => tracing::warn!(%err, command, "failed to spawn"),
         }
