@@ -89,6 +89,7 @@ impl WaylandDndGrabHandler for Wirbel {
             return;
         };
         self.dnd_icon = icon;
+        self.dnd_offset = Point::default();
         let grab = DnDGrab::new_pointer(&self.display_handle, start, source, seat);
         pointer.set_grab(self, grab, serial, Focus::Keep);
     }

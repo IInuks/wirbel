@@ -37,7 +37,7 @@ use smithay::{
     },
     xwayland::{
         X11Surface, X11Wm, XWayland, XwmHandler,
-        xwm::{Reorder, ResizeEdge, XwmId},
+        xwm::{Reorder, ResizeEdge, WmWindowProperty, XwmId},
     },
 };
 
@@ -343,6 +343,16 @@ impl XwmHandler for Wirbel {
 
     fn unmaximize_request(&mut self, _xwm: XwmId, surface: X11Surface) {
         self.x11_full_request(&surface, None);
+    }
+
+    /// The X11 way of `xdg_activation` without a fresh input event.
+    fn property_notify(&mut self, _xwm: XwmId, surface: X11Surface, property: WmWindowProperty) {
+        if property == WmWindowProperty::Hints
+            && surface.hints().is_some_and(|hints| hints.urgent)
+            && let Some(window) = self.find_x11(&surface)
+        {
+            self.mark_urgent(&window);
+        }
     }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, surface: X11Surface) {

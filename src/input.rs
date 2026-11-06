@@ -125,6 +125,9 @@ impl Wirbel {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
+        if state == KeyState::Pressed {
+            self.last_press = serial;
+        }
         let action = keyboard.input(
             self,
             key,
@@ -303,6 +306,9 @@ impl Wirbel {
         };
         let serial = SERIAL_COUNTER.next_serial();
         let pressed = state == ButtonState::Pressed;
+        if pressed {
+            self.last_press = serial;
+        }
         let popup_grab = self.popup_grab.is_some();
         if pressed && !pointer.is_grabbed() {
             self.press(Some(button), serial);

@@ -104,6 +104,7 @@ struct MonitorState {
     scale: f64,
     active_workspace: usize,
     windows: [usize; WORKSPACES],
+    urgent: [bool; WORKSPACES],
 }
 
 fn tags_json(monitor: &MonitorState) -> String {
@@ -113,8 +114,9 @@ fn tags_json(monitor: &MonitorState) -> String {
         .enumerate()
         .map(|(index, windows)| {
             let (number, active) = (index + 1, index == monitor.active_workspace);
+            let urgent = monitor.urgent[index];
             format!(
-                r#"{{"index":{number},"is_active":{active},"is_urgent":false,"layout":"DW","client_count":{windows}}}"#
+                r#"{{"index":{number},"is_active":{active},"is_urgent":{urgent},"layout":"DW","client_count":{windows}}}"#
             )
         })
         .collect();
@@ -597,6 +599,10 @@ impl Wirbel {
                     scale: monitor.output.current_scale().fractional_scale(),
                     active_workspace: monitor.active,
                     windows: std::array::from_fn(|index| monitor.workspaces[index].windows().len()),
+                    urgent: std::array::from_fn(|index| {
+                        let windows = monitor.workspaces[index].windows();
+                        windows.iter().any(|window| self.urgent.contains(window))
+                    }),
                 }
             })
             .collect()
@@ -697,6 +703,7 @@ mod tests {
             scale: 1.0,
             active_workspace: 1,
             windows: [2, 0, 0, 0, 0, 0, 0, 0, 0],
+            urgent: [false; WORKSPACES],
         }];
         let tags = all_tags_json(&monitors);
         assert!(

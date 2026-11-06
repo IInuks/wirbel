@@ -7548,3 +7548,156 @@ fn a_bar_can_end_the_session() {
     assert_eq!(next_line(&mut quit), "ok\n");
     compositor.thread.take().unwrap().join().unwrap();
 }
+
+// Session 10: hardening.
+
+#[test]
+fn altgr_e_reaches_the_client_as_altgr_and_e() {
+    // The euro sign of a German keyboard. No bind may take it, the session template least of all.
+    let compositor = Compositor::start_with(include_str!("../session/config"));
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.take_input();
+    const KEY_E: u32 = 18;
+    compositor.chord(&[KEY_RIGHTALT], KEY_E);
+    let input = client.take_input();
+    for wanted in [
+        Input::Key(KEY_E, wl_keyboard::KeyState::Pressed),
+        Input::Key(KEY_E, wl_keyboard::KeyState::Released),
+    ] {
+        assert!(input.contains(&wanted), "{input:?}");
+    }
+}
+
+#[test]
+fn the_offset_of_a_cursor_surface_moves_its_hotspot() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    compositor.pointer_at(400.0, 300.0);
+    client.sync();
+    let pointer = client._pointer.clone();
+    let cursor = client.compositor.create_surface(&client.handle, ());
+    let _buffer = client.fill(&cursor, 8, 8, BLUE);
+    pointer.set_cursor(client.state.enter_serial, Some(&cursor), 4, 4);
+    client.sync();
+    assert_eq!(compositor.screenshot().at(396, 296), BLUE);
+
+    cursor.offset(-3, -2);
+    cursor.commit();
+    client.sync();
+    // The hotspot stays in the picture where the client's image moved to.
+    assert_eq!(compositor.screenshot().at(399, 298), BLUE);
+    assert_ne!(compositor.screenshot().at(392, 294), BLUE);
+}
+
+/// A tile that draws up to the edge of the output, across the gap it was told to leave.
+fn overflowing_tile() -> (Compositor, Client, usize) {
+    let compositor = Compositor::start_with("gap_outer = 40\nborder_width = 0\n");
+    let mut client = Client::connect(&compositor);
+    let tile = client.open_window(RED);
+    client.sync();
+    client.draw_sized(tile, (WIDTH, HEIGHT), RED);
+    client.sync();
+    client.take_input();
+    (compositor, client, tile)
+}
+
+#[test]
+fn a_tile_that_stays_too_big_ends_at_its_place() {
+    let (compositor, _client, _) = overflowing_tile();
+    let shot = compositor.screenshot();
+    assert_eq!(shot.at(WIDTH / 2, HEIGHT / 2), RED);
+    assert_ne!(shot.at(WIDTH - 20, HEIGHT / 2), RED);
+    assert_ne!(shot.at(WIDTH / 2, HEIGHT - 20), RED);
+}
+
+#[test]
+fn what_is_cut_off_gets_no_pointer_events() {
+    let (compositor, mut client, _) = overflowing_tile();
+    compositor.pointer_at(f64::from(WIDTH - 20), f64::from(HEIGHT / 2));
+    client.sync();
+    assert_eq!(client.take_input(), []);
+}
+
+#[test]
+fn a_tile_that_stays_too_big_keeps_its_popups() {
+    let (compositor, mut client, tile) = overflowing_tile();
+    let parent = client.xdg_surface(tile);
+    let _popup = client.open_popup(&parent, (WIDTH - 90, 100), (40, 40), POPUP, None);
+    client.sync();
+    assert_eq!(compositor.screenshot().at(WIDTH - 35, 160), POPUP);
+}
+
+#[test]
+fn a_window_goes_fullscreen_on_the_output_it_names() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    compositor.add_output("second", (WIDTH, 0));
+    let a = client.open_window(RED);
+    client.sync();
+    let output = client
+        .globals
+        .contents()
+        .clone_list()
+        .iter()
+        .filter(|global| global.interface == "wl_output")
+        .map(|global| {
+            let registry = client.globals.registry();
+            registry.bind::<WlOutput, _, _>(global.name, 4, &client.handle, ())
+        })
+        .nth(1)
+        .unwrap();
+    client.sync();
+    client.toplevel(a).set_fullscreen(Some(&output));
+    client.sync();
+    let (monitor, area) = compositor.with(|state| {
+        let window = state.focused.clone().unwrap();
+        let (monitor, _) = state.locate(&window).unwrap();
+        (monitor, state.monitor_area(monitor).unwrap())
+    });
+    assert_eq!(monitor, 1);
+    assert_eq!(client.size(a), (area.w, area.h));
+    assert!(client.has_state(a, xdg_toplevel::State::Fullscreen));
+}
+
+#[test]
+fn a_popup_grab_with_an_old_serial_is_refused() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.click();
+    client.sync();
+    let old = client.state.button_serial;
+    compositor.click();
+    client.sync();
+    let parent = client.xdg_surface(a);
+    let _popup = client.open_popup(&parent, (200, 200), (100, 100), POPUP, Some(old));
+    client.sync();
+    assert_eq!(client.state.popups_done, 1);
+    assert!(compositor.with(|state| state.popup_grab.is_none()));
+}
+
+#[test]
+fn a_window_that_wants_attention_shows_in_the_tags_until_it_has_the_focus() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let far = client.open_window(RED);
+    let near = client.open_window(GREEN);
+    client.sync();
+    let surface = client.state.windows[far].surface.clone();
+    let token = activation_token(&mut client, false, &surface);
+    let activation = client.bind::<XdgActivationV1>(1..=1);
+    activation.activate(token, &client.state.windows[far].surface);
+    client.sync();
+    client.sync();
+    assert!(client.state.windows[near].activated);
+    assert!(next_line(&mut ipc_lines(&compositor, "tags")).contains(r#""is_urgent":true"#));
+
+    compositor.with(|state| {
+        let window = state.urgent[0].clone();
+        state.set_focus(Some(window));
+    });
+    assert!(!next_line(&mut ipc_lines(&compositor, "tags")).contains(r#""is_urgent":true"#));
+}

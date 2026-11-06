@@ -8,11 +8,11 @@ use smithay::{
             memory::MemoryRenderBufferRenderElement,
             solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
-            utils::select_dmabuf_feedback,
+            utils::{CropRenderElement, select_dmabuf_feedback},
         },
     },
     desktop::{
-        LayerSurface, PopupManager, layer_map_for_output,
+        LayerSurface, PopupManager, Window, layer_map_for_output,
         utils::{
             OutputPresentationFeedback, send_dmabuf_feedback_surface_tree,
             send_frames_surface_tree, surface_presentation_feedback_flags_from_states,
@@ -23,7 +23,7 @@ use smithay::{
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     output::Output,
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
-    utils::{Logical, Physical, Point, Scale},
+    utils::{Logical, Physical, Point, Rectangle, Scale},
     wayland::{
         compositor::with_states, dmabuf::DmabufFeedback, seat::WaylandFocus,
         shell::wlr_layer::Layer,
@@ -38,6 +38,7 @@ smithay::backend::renderer::element::render_elements! {
     Surface=WaylandSurfaceRenderElement<R>,
     Solid=SolidColorRenderElement,
     Cursor=MemoryRenderBufferRenderElement<R>,
+    Cropped=CropRenderElement<WaylandSurfaceRenderElement<R>>,
 }
 
 /// Which part of a layer surface a place in the stacking order is about.
@@ -192,9 +193,18 @@ impl Wirbel {
             let Some(location) = self.space.element_location(window) else {
                 continue;
             };
-            let location =
-                (location - window.geometry().loc - origin).to_physical_precise_round(scale);
-            elements.extend(window.render_elements(renderer, location, scale, 1.0));
+            let location = location - window.geometry().loc;
+            match self.overflow_clip(window, location) {
+                None => {
+                    let location = (location - origin).to_physical_precise_round(scale);
+                    elements.extend(window.render_elements(renderer, location, scale, 1.0));
+                }
+                Some(clip) => {
+                    let clip = Rectangle::new(clip.loc - origin, clip.size);
+                    let at = location - origin;
+                    elements.extend(self.clipped_window(renderer, window, at, clip, scale));
+                }
+            }
 
             let border = self.borders.iter().find(|(owner, _)| owner == window);
             let edges = border.into_iter().flat_map(|(_, edges)| edges);
@@ -210,6 +220,72 @@ impl Wirbel {
             }));
         }
         elements.extend(self.layer_elements(renderer, &tiers.below, origin, scale));
+        elements
+    }
+
+    /// The rectangle a window has to stay in, if it does not. A tile or a window that fills its
+    /// workspace has its place, and a client that draws more than it was told must not cover the
+    /// neighbours. Floating windows and menus of X11 clients go where they like.
+    pub fn overflow_clip(
+        &self,
+        window: &Window,
+        location: Point<i32, Logical>,
+    ) -> Option<Rectangle<i32, Logical>> {
+        let clip = self.clip_of(window)?;
+        let mut bbox = window.bbox();
+        bbox.loc += location;
+        (!clip.contains_rect(bbox)).then_some(clip)
+    }
+
+    /// The place of a window, see `overflow_clip`.
+    pub fn clip_of(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        let frame = self.frames.iter().find(|frame| frame.window == *window)?;
+        let bound = frame.tiled || frame.request.full.is_some();
+        let inner = frame.inner;
+        bound.then(|| Rectangle::new((inner.x, inner.y).into(), (inner.w, inner.h).into()))
+    }
+
+    /// A window cut off at `clip`. Its popups are not, they are supposed to leave the window.
+    fn clipped_window<R>(
+        &self,
+        renderer: &mut R,
+        window: &Window,
+        location: Point<i32, Logical>,
+        clip: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
+    ) -> Vec<SceneElement<R>>
+    where
+        R: Renderer + ImportAll + ImportMem,
+        R::TextureId: Clone + Texture + 'static,
+    {
+        let mut elements = Vec::new();
+        let Some(surface) = window.wl_surface() else {
+            return elements;
+        };
+        for (popup, offset) in PopupManager::popups_for_surface(&surface) {
+            let offset = window.geometry().loc + offset - popup.geometry().loc;
+            elements.extend(render_elements_from_surface_tree(
+                renderer,
+                popup.wl_surface(),
+                (location + offset).to_physical_precise_round(scale),
+                scale,
+                1.0,
+                Kind::Unspecified,
+            ));
+        }
+        let clip = clip.to_physical_precise_round(scale);
+        let tree: Vec<WaylandSurfaceRenderElement<R>> = render_elements_from_surface_tree(
+            renderer,
+            &surface,
+            location.to_physical_precise_round::<_, i32>(scale),
+            scale,
+            1.0,
+            Kind::Unspecified,
+        );
+        elements.extend(tree.into_iter().filter_map(|element| {
+            let cropped = CropRenderElement::from_element(element, scale, clip)?;
+            Some(SceneElement::Cropped(cropped))
+        }));
         elements
     }
 
@@ -271,7 +347,9 @@ impl Wirbel {
             ));
         }
         if let Some(icon) = self.dnd_icon.as_ref().filter(|icon| icon.is_alive()) {
-            let location = at.to_physical(scale).to_i32_round();
+            let location = (at + self.dnd_offset.to_f64())
+                .to_physical(scale)
+                .to_i32_round();
             elements.extend(render_elements_from_surface_tree(
                 renderer,
                 icon,

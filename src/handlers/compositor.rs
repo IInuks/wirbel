@@ -1,5 +1,8 @@
+use std::sync::Mutex;
+
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
+    input::pointer::{CursorImageAttributes, CursorImageStatus},
     reexports::{
         calloop::Interest,
         wayland_server::{
@@ -102,6 +105,7 @@ impl CompositorHandler for Wirbel {
         }
         on_commit_buffer_handler::<Self>(surface);
         (self.early_import)(surface);
+        self.apply_buffer_offset(surface);
 
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
@@ -120,6 +124,38 @@ impl CompositorHandler for Wirbel {
         // longer do so.
         self.update_pointer_focus();
         self.needs_redraw = true;
+    }
+}
+
+impl Wirbel {
+    /// `wl_surface.offset` of a window moves nothing that the client does not also tell through
+    /// its geometry. A cursor or dragged icon has only this to say where its image is now.
+    fn apply_buffer_offset(&mut self, surface: &WlSurface) {
+        let is_cursor = matches!(&self.cursor_status,
+            CursorImageStatus::Surface(cursor) if cursor == surface);
+        let is_icon = self.dnd_icon.as_ref() == Some(surface);
+        if !is_cursor && !is_icon {
+            return;
+        }
+        let offset = with_states(surface, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let offset = attributes.current().buffer_delta.take();
+            if is_cursor
+                && let Some((offset, attributes)) = offset.zip(
+                    states
+                        .data_map
+                        .get::<Mutex<CursorImageAttributes>>()
+                        .and_then(|attributes| attributes.lock().ok()),
+                )
+            {
+                let mut attributes = attributes;
+                attributes.hotspot -= offset;
+            }
+            offset
+        });
+        if is_icon {
+            self.dnd_offset += offset.unwrap_or_default();
+        }
     }
 }
 

@@ -5,6 +5,7 @@ use smithay::{
         find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
     },
     input::{Seat, pointer::Focus},
+    output::Output,
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::protocol::{wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
@@ -60,7 +61,20 @@ impl XdgShellHandler for Wirbel {
         }
     }
 
-    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
+        // A window goes to the output it asks for. Before the initial commit `place_new_window`
+        // looks at this.
+        let wanted = output.as_ref().and_then(Output::from_resource);
+        let monitor = wanted.and_then(|output| self.monitor_of_output(&output));
+        match (self.find_window(surface.wl_surface()), monitor) {
+            (Some(window), Some(monitor)) => {
+                if self.locate(&window).is_some_and(|(m, _)| m != monitor) {
+                    self.send_to_monitor(&window, monitor, None);
+                }
+            }
+            (None, _) => surface.with_pending_state(|state| state.fullscreen_output = output),
+            _ => {}
+        }
         self.full_request(&surface, Some(FullKind::Fullscreen));
     }
 
@@ -197,6 +211,11 @@ impl Wirbel {
     /// possible: its parent is out of sight, the session is locked, or the seat is busy.
     fn start_popup_grab(&mut self, surface: &PopupSurface, seat: &Seat<Self>, serial: Serial) {
         let kind = PopupKind::Xdg(surface.clone());
+        // Taking the input needs input to answer to, not an old serial the client kept.
+        if !serial.is_no_older_than(&self.last_press) {
+            surface.send_popup_done();
+            return;
+        }
         let Ok(root) = find_popup_root_surface(&kind) else {
             surface.send_popup_done();
             return;

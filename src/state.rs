@@ -40,7 +40,7 @@ use smithay::{
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
         compositor::{
             CompositorClientState, CompositorState, SurfaceData, get_parent, send_surface_state,
@@ -234,6 +234,12 @@ pub struct Wirbel {
     pub cursors: Option<Cursors>,
     /// What the client shows at the pointer during drag and drop.
     pub dnd_icon: Option<WlSurface>,
+    /// Where the icon is relative to the pointer. It moves with `wl_surface.offset`.
+    pub dnd_offset: Point<i32, Logical>,
+    /// Windows that asked for attention and did not get the focus yet.
+    pub urgent: Vec<Window>,
+    /// The latest press of a key or button: what a popup may take its grab with.
+    pub last_press: Serial,
     pub ipc: Ipc,
     /// Asks the renderer whether it can use a dmabuf. Set by a backend that offers dmabufs.
     pub import_dmabuf: Box<dyn FnMut(&Dmabuf) -> bool>,
@@ -342,6 +348,9 @@ impl Wirbel {
             cursor_status: CursorImageStatus::default_named(),
             cursors: None,
             dnd_icon: None,
+            dnd_offset: Point::default(),
+            urgent: Vec::new(),
+            last_press: Serial::from(0),
             ipc,
             import_dmabuf: Box::new(|_| false),
 
@@ -427,6 +436,13 @@ impl Wirbel {
         });
         if let Err(err) = inserted {
             tracing::debug!(%err, "cannot wait for this fence");
+        }
+    }
+
+    /// A window wants attention. The bar shows it on the workspace, until the window has the focus.
+    pub fn mark_urgent(&mut self, window: &Window) {
+        if self.focused.as_ref() != Some(window) && !self.urgent.contains(window) {
+            self.urgent.push(window.clone());
         }
     }
 
@@ -707,6 +723,14 @@ impl Wirbel {
         } else {
             Placement::Tiled
         };
+        let wanted = toplevel.with_pending_state(|state| state.fullscreen_output.clone());
+        let monitor = wanted
+            .as_ref()
+            .and_then(Output::from_resource)
+            .and_then(|output| self.monitor_of_output(&output));
+        if let Some(monitor) = monitor {
+            self.active_monitor = monitor;
+        }
         self.place(window, placement, requested)
     }
 
@@ -1102,6 +1126,8 @@ impl Wirbel {
             if !visible {
                 return;
             }
+            self.urgent.retain(|other| other != window);
+            let workspace = &mut self.monitors[m].workspaces[w];
             if workspace
                 .full
                 .as_ref()
@@ -1152,6 +1178,7 @@ impl Wirbel {
     pub fn remove_window(&mut self, window: &Window) {
         self.dismiss_window_popups(window);
         self.awaiting_buffer.retain(|other| other != window);
+        self.urgent.retain(|other| other != window);
         let next = self.workspace_of_mut(window).and_then(|workspace| {
             workspace.take(window);
             workspace.focus_candidate()
@@ -1278,11 +1305,20 @@ impl Wirbel {
         };
         on_layer(&above)
             .or_else(|| {
-                let (window, location) = self.space.element_under(position)?;
-                let relative = position - location.to_f64();
-                let (surface, offset) = window.surface_under(relative, WindowSurfaceType::ALL)?;
-                let location = (offset + location).to_f64();
-                Some((Target::Window(window.clone()), surface, location))
+                self.space.elements().rev().find_map(|window| {
+                    let location = self.space.element_location(window)? - window.geometry().loc;
+                    let relative = position - location.to_f64();
+                    // What is cut off in the picture is not there for the pointer either.
+                    let kind = match self.overflow_clip(window, location) {
+                        Some(clip) if !clip.to_f64().contains(position) => {
+                            WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE
+                        }
+                        _ => WindowSurfaceType::ALL,
+                    };
+                    let (surface, offset) = window.surface_under(relative, kind)?;
+                    let location = (offset + location).to_f64();
+                    Some((Target::Window(window.clone()), surface, location))
+                })
             })
             .or_else(|| on_layer(&below))
     }
