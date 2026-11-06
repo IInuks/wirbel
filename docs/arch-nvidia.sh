@@ -3,8 +3,8 @@
 # version of the loaded kernel module. Anything else leaves the driver broken, so the script stops
 # before it changes anything if Arch does not have that version.
 #
-#   ~/WM/docs/arch-nvidia.sh --pruefen   only looks, needs no root, changes nothing
-#   sudo ~/WM/docs/arch-nvidia.sh        installs, after you confirmed the plan
+#   ~/wirbel/docs/arch-nvidia.sh --pruefen   only looks, needs no root, changes nothing
+#   sudo ~/wirbel/docs/arch-nvidia.sh        installs, after you confirmed the plan
 #
 # Exit: 0 done or check fine, 1 wrong use, 2 the version does not exist in Arch, 3 no driver or no
 # network. Nothing has been changed in those cases.

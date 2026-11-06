@@ -1,6 +1,6 @@
 # wirbel auf einem freien TTY testen
 
-Am einfachsten: `~/WM/docs/tty-run.sh` auf dem TTY starten, das Skript führt durch alle Tests unten und schreibt das Ergebnis nach `~/wirbel-test/ergebnis.txt`. Gestartet wird der Release-Build, das Skript lehnt einen veralteten ab. Jeder Test läuft mit `--stats` auf einem eigenen D-Bus ohne Dienste.
+Am einfachsten: `~/wirbel/docs/tty-run.sh` auf dem TTY starten, das Skript führt durch alle Tests unten und schreibt das Ergebnis nach `~/wirbel-test/ergebnis.txt`. Gestartet wird der Release-Build, das Skript lehnt einen veralteten ab. Jeder Test läuft mit `--stats` auf einem eigenen D-Bus ohne Dienste.
 
 Dauert etwa 15 Minuten. Mango läuft auf tty7 weiter, mit **Strg+Alt+F7** kommst du jederzeit zurück.
 Der Monitor hängt an der NVIDIA-Karte, deren Treiber-Bibliotheken liegen nur im Void-Stratum. Darum
@@ -25,7 +25,7 @@ wechseln (Strg+Alt+F4). Danach die Logs mitbringen, siehe unten.
 ## Vorbereitung, in Mango
 
 ```sh
-cd ~/WM
+cd ~/wirbel
 strat -r arch env PATH=$HOME/.cargo/bin:$PATH cargo build --release
 strat void ./target/release/wirbel check
 ```
@@ -35,7 +35,7 @@ einem Terminal `sudo chvt 3` nutzen: Deine Mango-Config belegt die Tasten nicht 
 geht vom TTY mit Strg+Alt+F7 oder `sudo chvt 7`. Auf dem TTY:
 
 ```sh
-cd ~/WM
+cd ~/wirbel
 alias w='strat void ./target/release/wirbel --config docs/tty-test.conf'
 strat void ./target/release/wirbel check
 ```
@@ -56,7 +56,7 @@ normal Text anzeigen und Eingaben annehmen.
 | 4 | `w --timeout 30 --panic-after 5` | nichts | Nach 5 s Meldung `panic` auf dem TTY | 101 |
 | 5 | `w --timeout 40 --hang-after 5` | Nach 10 s Strg+Alt+Shift+Rücktaste | wirbel reagiert ab 5 s nicht mehr, die Taste beendet es trotzdem | 70 |
 | 6 | `w --timeout 10 --hang-after 3` | nichts | Nach 15 s von selbst zurück am TTY | 71 |
-| 7 | `w --timeout 90 -c 'sleep 3; qs -p ~/WM/docs/tty-lock.qml'` | Warten, bis `Gesperrt` kommt. Strg+Alt+F7 und zurück mit Strg+Alt+F3: bleibt gesperrt. Enter entsperrt | Nur die Sperre sichtbar, nie alter Inhalt | 0 |
+| 7 | `w --timeout 90 -c 'sleep 3; qs -p ~/wirbel/docs/tty-lock.qml'` | Warten, bis `Gesperrt` kommt. Strg+Alt+F7 und zurück mit Strg+Alt+F3: bleibt gesperrt. Enter entsperrt | Nur die Sperre sichtbar, nie alter Inhalt | 0 |
 | 8 | wie Nr 7 | Während `Gesperrt` steht: Strg+Alt+Shift+Rücktaste | Sofort zurück am TTY | 70 |
 | 9 | `w --timeout 60 -c kitty` | Monitor aus- und einschalten oder Kabel ziehen und stecken | Bild kommt wieder, kitty lebt, auch wenn der Ausgang von DP-4 zu DP-3 wechselt | 0 |
 
@@ -74,7 +74,7 @@ notieren, und bei welcher GPU.
 
 ## Nachtest nach Etappe 6 und 7
 
-`~/WM/docs/tty-run.sh nach` startet nur die Tests 11 bis 21 und schreibt nach
+`~/wirbel/docs/tty-run.sh nach` startet nur die Tests 11 bis 21 und schreibt nach
 `~/wirbel-test/ergebnis.txt`, dazu die wichtigen Log-Zeilen. Die Tests 1 bis 10 sind bestanden und
 müssen nicht wiederholt werden. Geprüft wird, was nested nicht geht: X11-Programme auf dem echten
 Schirm, Zeiger-Sperre und relative Bewegung mit der echten Maus (`docs/pointer-test.html`), Vollbild,
@@ -85,7 +85,7 @@ PipeWire kommt von dort, und Discord muss dort beendet sein. Die Portale laufen 
 
 ## Abschlusstest
 
-`~/WM/docs/tty-run.sh ende` startet nur die Tests 22 bis 26, etwa 8 Minuten, Mango muss nicht beendet werden. Geprüft
+`~/wirbel/docs/tty-run.sh ende` startet nur die Tests 22 bis 26, etwa 8 Minuten, Mango muss nicht beendet werden. Geprüft
 wird, was nach dem Nachtest repariert oder gefunden wurde: 170 Hz als Alltags-Mode (22), die Blase von Chromium,
 wenn ein zweites Fenster dazukommt (23), Scrollen in einer langen Seite (24) und in Steam (25), jeweils mit
 Messwerten, dazu die NVIDIA als Render-GPU mit Voids Treiber im Client (26). Die Messwerte landen in
@@ -94,7 +94,7 @@ wirbel selbst stockt, bei `scroll`, ob es der Client ist.
 
 ## Die ganze Sitzung
 
-`~/WM/docs/tty-run.sh sitzung` startet die Tests 30 bis 34, etwa 10 Minuten. Hier läuft `wirbel-session` statt wirbel allein,
+`~/wirbel/docs/tty-run.sh sitzung` startet die Tests 30 bis 34, etwa 10 Minuten. Hier läuft `wirbel-session` statt wirbel allein,
 also mit Bus, Portalen, Autostart und der Config-Vorlage: Bar und Wallpaper (30), die Tasten aus Mango (31), Logout über
 die Bar (32), Screenshot (33), Bildschirm teilen über die Portale der Sitzung (34). Mango darf laufen, die Sitzung ist dann
 Gast, siehe `docs/SESSION.md`. Was nur ohne Mango geht, zeigt der Login über den Greeter, ebenfalls dort beschrieben.
