@@ -33,8 +33,14 @@ make_lib() { # DIR
   # Erst kopieren, dann umbenennen: Eine laufende Sitzung behaelt ihre Datei.
   cp "$BIN" "$1/wirbel.new" && mv -f "$1/wirbel.new" "$1/wirbel" || return 1
   ln -sf wirbel "$1/mmsg"
-  cp "$ROOT/session/wirbel-session" "$ROOT/session/xdpw.conf" "$1/" || return 1
+  cp "$ROOT/session/wirbel-session" "$ROOT/session/steam" "$ROOT/session/xdpw.conf" "$1/" || return 1
   cp "$ROOT/docs/tty-dbus.conf" "$1/bus.conf"
+  # Der Eintrag von Steam nennt /usr/bin/steam, er muss wie `steam` im PATH auf die Sitzung zeigen.
+  local entry=/bedrock/strata/void/usr/share/applications/steam.desktop
+  if [ -f "$entry" ]; then
+    mkdir -p "$1/share/applications"
+    sed "s|^Exec=/usr/bin/steam|Exec=$1/steam|" "$entry" > "$1/share/applications/steam.desktop"
+  fi
 }
 
 fresh_build() {

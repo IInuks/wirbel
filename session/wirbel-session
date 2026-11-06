@@ -15,6 +15,8 @@ LIB=$(dirname "$(readlink -f "$0")")
 SELF=$LIB/wirbel-session
 STRAT=/bedrock/bin/strat
 export PATH="$LIB:$PATH"
+# Our entry for Steam goes before the one of the stratum, see the script `steam`.
+export XDG_DATA_DIRS="$LIB/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share:/bedrock/cross}"
 
 say() { echo "wirbel-session: $*" >&2; }
 

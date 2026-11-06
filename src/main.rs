@@ -158,7 +158,7 @@ fn run(options: Options, kind: backend::Kind) -> Result<(), Box<dyn std::error::
         load_config(config_path.as_deref()),
     )?;
     state.config_path = config_path;
-    if options.stats {
+    if options.stats || state.config.stats {
         state.stats.enable();
     }
     state.emergency = Box::new(|| {

@@ -173,6 +173,8 @@ pub struct Config {
     pub background_color: [f32; 4],
     pub keyboard_layout: String,
     pub keyboard_variant: String,
+    /// Same as `--stats`, for a session that nobody starts by hand.
+    pub stats: bool,
     pub keyboard_options: String,
     pub repeat_delay: i32,
     pub repeat_rate: i32,
@@ -234,6 +236,7 @@ impl Config {
             background_color: [0.0; 4],
             keyboard_layout: String::new(),
             keyboard_variant: String::new(),
+            stats: false,
             keyboard_options: String::new(),
             repeat_delay: 0,
             repeat_rate: 0,
@@ -332,6 +335,7 @@ impl Config {
             "repeat_delay" => self.repeat_delay = parse_size(value)?,
             "repeat_rate" => self.repeat_rate = parse_size(value)?,
             "sloppy_focus" => self.sloppy_focus = parse_bool(value)?,
+            "stats" => self.stats = parse_bool(value)?,
             "warp_cursor" => self.warp_cursor = parse_bool(value)?,
             "cursor_theme" => {
                 self.cursor_theme = Some(value).filter(|v| !v.is_empty()).map(Into::into)
@@ -708,7 +712,8 @@ mod tests {
              focus_color = #00ff0080\n\
              keyboard_layout = us\n\
              keyboard_variant = dvorak\n\
-             sloppy_focus = 0\n",
+             sloppy_focus = 0\n\
+             stats = 1\n",
         );
         assert_eq!(config.gaps.outer, 3);
         assert_eq!(config.gaps.inner, 5);
@@ -718,6 +723,7 @@ mod tests {
         assert_eq!(config.keyboard_layout, "us");
         assert_eq!(config.xkb().variant, "dvorak");
         assert!(!config.sloppy_focus);
+        assert!(config.stats);
         assert_eq!(config.binds, Config::default().binds);
     }
 
