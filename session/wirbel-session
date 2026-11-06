@@ -1,0 +1,242 @@
+#!/bin/sh
+# Starts a whole wirbel session: its own D-Bus, PipeWire, the portals and wirbel, which runs the
+# rest from the exec-once lines of its configuration. The greeter starts this. See docs/SESSION.md.
+#
+#   wirbel-session [--gast] [--config FILE] [-- ARGUMENTS FOR WIRBEL]
+#   wirbel-session --status    says from inside a session what runs, also for a bug report
+#
+# --gast is for a session next to another one of the same user, like a test on a TTY while Mango
+# runs. It comes by itself if such a session is seen. It takes a bus without services, because a
+# bus that can start xdg-document-portal ends the one of the other session, on whatever bus that
+# is, and it uses the PipeWire that is there.
+#
+# Nothing here looks for processes by name to end them. What ends is what this script started.
+LIB=$(dirname "$(readlink -f "$0")")
+SELF=$LIB/wirbel-session
+STRAT=/bedrock/bin/strat
+export PATH="$LIB:$PATH"
+
+say() { echo "wirbel-session: $*" >&2; }
+
+# wirbel comes from the Arch stratum but has to run in Void, only Void has the NVIDIA libraries. So
+# does the session bus, as under Mango.
+if [ "$(/bedrock/bin/brl which 2>/dev/null)" != void ]; then
+    exec "$STRAT" void "$0" "$@"
+fi
+
+other_session() {
+    mountpoint -q "$XDG_RUNTIME_DIR/doc" || pgrep -u "$(id -u)" -x mango >/dev/null
+}
+
+owned() {
+    dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.NameHasOwner "string:$1" 2>/dev/null | grep -q 'boolean true'
+}
+
+await_name() {
+    i=0
+    while ! owned "$1" && [ $i -lt 30 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+}
+
+# Runs a command again if it dies, until it gets TERM.
+keep() {
+    (
+        trap 'kill "$child" 2>/dev/null; exit 0' TERM
+        while :; do
+            "$@" &
+            child=$!
+            wait "$child"
+            say "$* ended"
+            sleep 2
+        done
+    ) &
+    STARTED="$STARTED $!"
+}
+
+pipewire_alive() {
+    [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] &&
+        timeout 3 "$STRAT" debian pw-cli info 0 >/dev/null 2>&1
+}
+
+# As under Mango from Debian. Other sessions leave theirs running after a logout, it is still
+# good for the sound, so it stays.
+start_pipewire() {
+    if pipewire_alive; then
+        say "PipeWire is already there, using it"
+        return
+    fi
+    keep "$STRAT" debian pipewire
+    i=0
+    while [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ] && [ $i -lt 50 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    keep "$STRAT" debian wireplumber
+    keep "$STRAT" debian pipewire-pulse
+}
+
+# Needs the compositor, so wirbel runs this as its first child. The portals come from Arch, which
+# is the only stratum that has them. xdg-desktop-portal needs its backends up on a bus without
+# services, and that one also ends with them: it may outlive its bus.
+portals() {
+    dbus-update-activation-environment --all 2>/dev/null
+    if [ -n "$WIRBEL_GAST" ]; then
+        names=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+            org.freedesktop.DBus.ListActivatableNames) || exit 1
+        case $names in
+        *org.freedesktop.portal*)
+            say "guest on a bus that can start portals, not starting any"
+            exit 1
+            ;;
+        esac
+    fi
+    gtk=
+    portal=
+    if ! owned org.freedesktop.impl.portal.desktop.gtk; then
+        "$STRAT" arch /usr/lib/xdg-desktop-portal-gtk &
+        gtk=$!
+    fi
+    (
+        while :; do
+            "$STRAT" arch /usr/lib/xdg-desktop-portal-wlr -c "$LIB/xdpw.conf"
+            wirbel pos --once >/dev/null 2>&1 || exit 0
+            say "xdg-desktop-portal-wlr ended"
+            sleep 2
+        done
+    ) &
+    wlr=$!
+    await_name org.freedesktop.impl.portal.desktop.wlr
+    await_name org.freedesktop.impl.portal.desktop.gtk
+    if ! owned org.freedesktop.portal.Desktop; then
+        "$STRAT" arch /usr/lib/xdg-desktop-portal &
+        portal=$!
+    fi
+    wait "$wlr"
+    # shellcheck disable=SC2086
+    kill $portal $gtk 2>/dev/null
+}
+
+# The bus runs under this script and not the other way round with dbus-run-session: that one dies
+# of a TERM and leaves everything below it running.
+start_bus() {
+    if [ -n "$WIRBEL_GAST" ]; then
+        export WIRBEL_GAST
+        kind=--config-file=$LIB/bus.conf
+    else
+        # The full bus, the same as under Mango: the keyring, dconf, gvfs and the document portal
+        # start through it. It is the only one of this user, so the portals exist once.
+        kind=--session
+    fi
+    bus=$(dbus-daemon "$kind" --fork --print-address --print-pid) || exit 1
+    DBUS_SESSION_BUS_ADDRESS=${bus%%[[:space:]]*}
+    STARTED=${bus##*[[:space:]]}
+    export DBUS_SESSION_BUS_ADDRESS
+    unset DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE
+}
+
+run_session() {
+    trap 'kill $STARTED 2>/dev/null' EXIT
+    trap 'kill "$compositor" 2>/dev/null' TERM INT HUP
+    start_bus
+    start_pipewire
+    # A background job gets /dev/null as stdin, wirbel needs the VT there.
+    exec 3<&0
+    wirbel -c "$SELF --portals" "$@" <&3 3<&- &
+    compositor=$!
+    exec 3<&-
+    # A signal ends this wait early.
+    while :; do
+        wait "$compositor"
+        code=$?
+        kill -0 "$compositor" 2>/dev/null || break
+    done
+    say "wirbel ended with $code"
+    return "$code"
+}
+
+status() {
+    echo "XDG_SESSION_TYPE=$XDG_SESSION_TYPE XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP"
+    echo "WAYLAND_DISPLAY=$WAYLAND_DISPLAY DISPLAY=$DISPLAY"
+    echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+    echo "guest: ${WIRBEL_GAST:-no}"
+    for name in org.freedesktop.portal.Desktop org.freedesktop.impl.portal.desktop.wlr \
+        org.freedesktop.impl.portal.desktop.gtk org.freedesktop.portal.Documents \
+        org.freedesktop.secrets; do
+        if owned "$name"; then echo "bus: $name is there"; else echo "bus: $name is NOT there"; fi
+    done
+    for portal in ScreenCast Screenshot; do
+        # The portal has an interface only if it found a backend for it.
+        if dbus-send --session --print-reply --dest=org.freedesktop.portal.Desktop \
+            /org/freedesktop/portal/desktop org.freedesktop.DBus.Properties.Get \
+            "string:org.freedesktop.portal.$portal" string:version >/dev/null 2>&1; then
+            echo "portal: $portal has a backend"
+        else
+            echo "portal: $portal has NO backend"
+        fi
+    done
+    if pipewire_alive; then echo "PipeWire is there"; else echo "PipeWire is NOT there"; fi
+    if mountpoint -q "$XDG_RUNTIME_DIR/doc"; then echo "document portal mount is there"; else
+        echo "document portal mount is NOT there"
+    fi
+    wirbel pos --once
+    mmsg get all-tags | cut -c 1-200
+}
+
+case $1 in
+--status)
+    status
+    exit
+    ;;
+--portals)
+    portals
+    exit
+    ;;
+esac
+
+if [ -z "$XDG_RUNTIME_DIR" ]; then
+    say "XDG_RUNTIME_DIR is not set"
+    exit 1
+fi
+
+config=
+while [ $# -gt 0 ]; do
+    case $1 in
+    --gast)
+        WIRBEL_GAST=1
+        ;;
+    --config)
+        config=$2
+        shift
+        ;;
+    --)
+        shift
+        break
+        ;;
+    *)
+        say "unknown argument $1"
+        exit 2
+        ;;
+    esac
+    shift
+done
+[ -n "$config" ] && set -- --config "$config" "$@"
+
+state=${XDG_STATE_HOME:-$HOME/.local/state}/wirbel
+mkdir -p "$state"
+[ -f "$state/session.log" ] && mv -f "$state/session.log" "$state/session.log.old"
+exec >>"$state/session.log" 2>&1
+date
+
+# What programs read to find out where they run. Chromium and Electron share the screen through
+# PipeWire only with these, and the portal picks wirbel-portals.conf by the first one. wlroots is
+# for the programs that test for it, like flameshot.
+export XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=wirbel:wlroots XDG_SESSION_DESKTOP=wirbel
+
+if [ -z "$WIRBEL_GAST" ] && other_session; then
+    say "another session of this user is running, going on as a guest"
+    WIRBEL_GAST=1
+fi
+run_session "$@"

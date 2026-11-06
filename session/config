@@ -1,0 +1,106 @@
+# wirbel, ~/.config/wirbel/config. Made from ~/.config/mango/config.conf, every option and action is
+# described in src/default.conf. Colours, gaps, cursor, keyboard and pointer behaviour need no line
+# here, the defaults are those of Mango. So are the 170 Hz: without a monitorrule wirbel takes the
+# highest refresh rate. PipeWire, the portals and the environment are not here but in wirbel-session.
+
+# Autostart, one exec-once per program. They run through sh, so $HOME works.
+# Not taken from Mango:
+#   dbus-update-activation-environment   wirbel-session does that
+#   pipewire, wireplumber, pipewire-pulse   wirbel-session starts them, with a restart
+#   start-portals   ends every portal by pattern, also the ones of another session
+exec-once = qs -p $HOME/quickdots/shellwall -n
+exec-once = qs -p $HOME/quickdots/blobball -n
+# Starts awww-daemon and sets the last wallpaper, on any output name.
+exec-once = $HOME/.local/bin/wall-restore
+# Copies the wallpaper for the greeter.
+exec-once = $HOME/quickdots/greeter/scripts/wallsync.sh
+exec-once = /bedrock/bin/strat void /usr/libexec/polkit-gnome-authentication-agent-1
+# >>> quickdots. Mango's block is rewritten by the quickdots menu, this one is not: After changing
+# the bar there, change it here too.
+exec-once = qs -p $HOME/quickdots/menu -n
+exec-once = qs -p $HOME/quickdots/bars/salbei -n
+exec-once = $HOME/quickdots/menu/scripts/launcher-host.sh sync
+exec-once = $HOME/quickdots/menu/scripts/widgets-host.sh sync
+
+bind = SUPER, r, reload
+
+bind = CTRL+SUPER, space, spawn, qs -p $HOME/quickdots/shellwall ipc call coverflow toggle
+bind = CTRL, Shift_R, spawn, qs -p $HOME/quickdots/menu ipc call wizard blob
+bind = SUPER, Return, spawn, kitty
+bind = SUPER+SHIFT, b, spawn, firefox
+bind = SUPER+SHIFT, s, spawn, flameshot gui
+
+bind = CTRL+SUPER+ALT, space, spawn, $HOME/quickdots/menu/scripts/toggle-menu.sh
+bind = SUPER, space, spawn, qs -p $HOME/quickdots/bars/salbei ipc call launcher toggle
+bind = SUPER, Escape, spawn, qs -p $HOME/quickdots/bars/salbei ipc call power toggle
+bind = CTRL+SUPER, c, spawn, qs -p $HOME/quickdots/bars/salbei ipc call controlcenter toggle
+bind = CTRL+SUPER, k, spawn, qs -p $HOME/quickdots/bars/salbei ipc call calendar toggle
+bind = CTRL+SUPER, n, spawn, qs -p $HOME/quickdots/bars/salbei ipc call controlcenter page notifications
+
+bind = SUPER, m, quit
+bind = ALT, q, close
+bind = SUPER, w, close
+bind = SUPER+SHIFT, BackSpace, spawn, loginctl poweroff
+
+bind = SUPER, Tab, focus_next
+bind = ALT, Left, focus, left
+bind = ALT, Right, focus, right
+bind = ALT, Up, focus, up
+bind = ALT, Down, focus, down
+
+bind = SUPER+SHIFT, Up, swap, up
+bind = SUPER+SHIFT, Down, swap, down
+bind = SUPER+SHIFT, Left, swap, left
+bind = SUPER+SHIFT, Right, swap, right
+
+# resizewin of Mango. Tiled windows are what is there to resize.
+bind = CTRL+ALT, Right, split_ratio, +0.05
+bind = CTRL+ALT, Up, split_ratio, +0.05
+bind = CTRL+ALT, Left, split_ratio, -0.05
+bind = CTRL+ALT, Down, split_ratio, -0.05
+
+# On a German keyboard the backslash needs AltGr, so the key is bound by its plain symbol too.
+bind = ALT, backslash, float
+bind = ALT, ssharp, float
+bind = ALT, a, maximize
+bind = ALT, f, fullscreen
+
+bind = SUPER, Left, workspace, prev
+bind = SUPER, Right, workspace, next
+bind = CTRL, Left, workspace, prev_used
+bind = CTRL, Right, workspace, next_used
+bind = SUPER, 1, workspace, 1
+bind = SUPER, 2, workspace, 2
+bind = SUPER, 3, workspace, 3
+bind = SUPER, 4, workspace, 4
+bind = SUPER, 5, workspace, 5
+bind = SUPER, 6, workspace, 6
+bind = SUPER, 7, workspace, 7
+bind = SUPER, 8, workspace, 8
+bind = SUPER, 9, workspace, 9
+bind = SUPER+SHIFT, 1, move_to_workspace, 1
+bind = SUPER+SHIFT, 2, move_to_workspace, 2
+bind = SUPER+SHIFT, 3, move_to_workspace, 3
+bind = SUPER+SHIFT, 4, move_to_workspace, 4
+bind = SUPER+SHIFT, 5, move_to_workspace, 5
+bind = SUPER+SHIFT, 6, move_to_workspace, 6
+bind = SUPER+SHIFT, 7, move_to_workspace, 7
+bind = SUPER+SHIFT, 8, move_to_workspace, 8
+bind = SUPER+SHIFT, 9, move_to_workspace, 9
+
+bind = ALT+SHIFT, Left, focus_output, left
+bind = ALT+SHIFT, Right, focus_output, right
+bind = SUPER+ALT, Left, move_to_output, left
+bind = SUPER+ALT, Right, move_to_output, right
+
+mousebind = SUPER, btn_left, move
+mousebind = SUPER, btn_right, resize
+
+axisbind = SUPER, UP, workspace, prev_used
+axisbind = SUPER, DOWN, workspace, next_used
+
+# Binds of Mango without a counterpart:
+#   Scratchpad, overlay, minimize, global: left out on purpose.
+#   Scroller, layouts, proportions, gaps at runtime, fake fullscreen: wirbel has only dwindle.
+#   tagtoleft, tagtoright (CTRL+SUPER, Left and Right), movewin (CTRL+SHIFT, arrows),
+#   dwindle_toggle_split_direction (ALT+SHIFT, Return): no such action yet.

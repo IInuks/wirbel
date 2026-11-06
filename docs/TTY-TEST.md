@@ -92,6 +92,13 @@ Messwerten, dazu die NVIDIA als Render-GPU mit Voids Treiber im Client (26). Die
 `~/wirbel-test/stats.txt`, die Bedeutung steht oben in `src/stats.rs`. Bei `input` und `late` zeigt sich, ob
 wirbel selbst stockt, bei `scroll`, ob es der Client ist.
 
+## Die ganze Sitzung
+
+`~/WM/docs/tty-run.sh sitzung` startet die Tests 30 bis 34, etwa 10 Minuten. Hier läuft `wirbel-session` statt wirbel allein,
+also mit Bus, Portalen, Autostart und der Config-Vorlage: Bar und Wallpaper (30), die Tasten aus Mango (31), Logout über
+die Bar (32), Screenshot (33), Bildschirm teilen über die Portale der Sitzung (34). Mango darf laufen, die Sitzung ist dann
+Gast, siehe `docs/SESSION.md`. Was nur ohne Mango geht, zeigt der Login über den Greeter, ebenfalls dort beschrieben.
+
 ## Was du mitbringen sollst
 
 Nach einem Fehler sofort, denn der nächste Start verschiebt das Log nach `wirbel.log.old`:

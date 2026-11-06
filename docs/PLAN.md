@@ -18,6 +18,7 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
   Strg+Alt+Fn wechselt das VT, auch gesperrt, die Sperre bleibt. SIGTERM und SIGINT beenden sauber.
   Eine Panik loggt mit Backtrace, stellt den TTY wieder her (Exit 101). `--panic-after SEK` und
   `--hang-after SEK` lösen das zum Ausprobieren aus.
+- Alltag ist `wirbel-session` aus dem Eintrag im quickdots-Greeter, siehe `docs/SESSION.md`.
 - Log: auf dem VT `~/.local/state/wirbel/wirbel.log` (das vorige wird `.old`), sonst stderr, mit
   `--log DATEI` immer dorthin. stderr und damit die Meldungen von Treibern und Clients folgen in die
   Datei.
@@ -66,8 +67,15 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
 - Fensterlisten (`wlr-foreign-toplevel-management`) sehen alle Fenster, auch auf versteckten Workspaces, und
   können sie fokussieren, schließen, maximieren und in den Vollbildmodus setzen. Minimieren tut nichts.
 - Zwischenablage-Manager lesen und setzen Clipboard und Primary über `wlr-data-control`, auch ohne Fenster.
-- Für Programme muss die Sitzung `XDG_SESSION_TYPE=wayland` und `XDG_CURRENT_DESKTOP` setzen: Chromium und
-  Electron teilen sonst nicht über PipeWire, das Portal findet sonst sein Backend nicht. Das ist Etappe 8.
+- Für Programme setzt `wirbel-session` `XDG_SESSION_TYPE=wayland` und `XDG_CURRENT_DESKTOP=wirbel:wlroots`:
+  Chromium und Electron teilen sonst nicht über PipeWire, das Portal findet sonst sein Backend nicht.
+- Binds: Ein Modifier kann selbst die Taste sein (`bind = CTRL, Shift_R, ...`), `axisbind` belegt das Rad, mit
+  `axis_bind_apply_timeout` wie Mango. Gehaltene Tasten wiederholen nur Schritte (`Action::repeats`), nicht `spawn`
+  oder `close`. Mango wiederholt alles, hier öffnet Super+Return aber bewusst kein Dutzend Terminals. `ALTGR` ist ein
+  eigener Modifier, ein Bind ohne ihn feuert bei gehaltenem AltGr nicht.
+- `wirbel mmsg` ersetzt Mangos `mmsg` für die Bars, nur was sie brauchen: `get` und `watch` von `all-tags` und
+  `all-monitors`, `dispatch` von `view,N`, `quit`, `reload_config`. Als Symlink `mmsg` im PATH der Sitzung, quickdots
+  bleibt unverändert. Mango hat sein echtes `mmsg` weiter, nur die Sitzung sieht den Ersatz zuerst.
 
 ## Stil
 Minimal heißt: keine Animationen, kein Blur, keine Fensterdeko außer Rahmen und Lücke, keine
@@ -106,11 +114,14 @@ am 5.11.2026 entschieden, auch bei der Migration von Mango nicht nachbauen.
 - `src/state.rs`: `Wirbel`, zentraler Zustand. `monitors` hält alle Fenster, `space` nur die
   sichtbaren. `retile()` leitet den ganzen Bildschirm aus `monitors` ab: blendet ein und aus, setzt
   die Stapelreihenfolge, schickt Configures. Nach jeder Änderung an Workspaces aufrufen.
-- `src/config.rs`, `src/default.conf`: Config-Parser und Defaults.
+- `src/config.rs`, `src/default.conf`: Config-Parser und Defaults. `session/`: Was die Sitzung ausmacht:
+  `wirbel-session`, die Config-Vorlage `config`, Greeter-Eintrag und Portal-Einstellungen. Eingerichtet von
+  `docs/install-session.sh`.
 - `src/actions.rs`: was Binds tun (`run_action`).
 - `src/ipc.rs`: Steuer-Socket `$XDG_RUNTIME_DIR/wirbel-<WAYLAND_DISPLAY>.sock`, Zeilenprotokoll
-  (oben in der Datei beschrieben), läuft nicht blockierend in der Event-Loop. `src/cli.rs`: die
-  Befehle `wirbel pos` und `wirbel move`.
+  (oben in der Datei beschrieben), läuft nicht blockierend in der Event-Loop. `publish_workspaces` vergleicht nach
+  jeder Loop-Iteration die Workspaces, aber nur, wenn jemand zusieht. `src/cli.rs`: die
+  Befehle `wirbel pos`, `wirbel move` und `wirbel mmsg`.
 - `Wirbel::under` (`src/state.rs`) ist die eine Antwort auf "was liegt an diesem Punkt", gesperrt nur
   Lock-Surfaces. `surface_under` und `window_at` lesen daraus, Hover, Klick, sloppy focus und
   `wirbel move` stimmen also von selbst.
@@ -265,12 +276,11 @@ am 5.11.2026 entschieden, auch bei der Migration von Mango nicht nachbauen.
    tearing/direct scanout für Fullscreen-Spiele.
 7. Screenshots/Screenshare: wlr-screencopy, ext-image-copy-capture, foreign-toplevel, wlr-data-control,
    xdg-desktop-portal, flameshot/grim.
-8. Session: `wirbel-session`, Autostart, Eintrag für quickdots-Greeter, Doku, Migration von Mango.
+8. Session: `wirbel-session`, Autostart, Eintrag für quickdots-Greeter, Doku, Migration von Mango. Fertig bis auf
+   den Test über den Greeter, `docs/SESSION.md`.
 9. Härtung: Review, Absturzpfade, Leaks, Client-Fehlverhalten, Performance.
 
-Für Etappe 9 offen: Screencopy auf dmabufs, damit das Zurücklesen die Hauptschleife nicht anhält. Für Etappe 8:
-PipeWire, WirePlumber und Portale gehören in den Autostart. Portale laufen aus Arch, weil Void keine hat. Die
-Sitzung braucht einen eigenen D-Bus, ohne den startet GIO einen, siehe die Hinweise zu Portal-Tests.
+Für Etappe 9 offen: Screencopy auf dmabufs, damit das Zurücklesen die Hauptschleife nicht anhält.
 
 ## Leistung (gemessen, Session 08)
 Der unoptimierte Debug-Build war nicht die Ursache fürs Stocken. Nested mit Chromium oder glxgears und kitty:
@@ -319,4 +329,4 @@ Binary mit Voids Bibliotheken und `__GLX_VENDOR_LIBRARY_NAME=nvidia` lief nested
 es in Arch und Void: Mit `strat void` gestartet nimmt wirbel das aus Void, das auch die NVIDIA-Treiber sieht.
 GPUs: NVIDIA RTX 4070 SUPER (Treiber 595, open) und AMD iGPU; Monitor an card1 (DP-4, wechselt
 gelegentlich zu DP-3). Alltag sind 170 Hz wie unter Mango, das hat der Nutzer entschieden, wirbel nimmt sie ohne
-Regel selbst. Getestet ist auf dem TTY bisher nur 165 Hz, 170 Hz kommt im Abschlusstest.
+Regel selbst. Auf dem TTY getestet, Abschlusstest 22.

@@ -2,6 +2,7 @@
 # Führt durch docs/TTY-TEST.md. Auf einem freien TTY starten: ~/WM/docs/tty-run.sh
 # Nur der Nachtest für XWayland, Spiele, Zeiger, Screenshot und Screenshare: ~/WM/docs/tty-run.sh nach
 # Nur der Abschlusstest, was nach dem Nachtest repariert wurde, und 170 Hz: ~/WM/docs/tty-run.sh ende
+# Die ganze Sitzung, wie sie der Greeter startet: ~/WM/docs/tty-run.sh sitzung
 cd "$HOME/WM" || exit 1
 OUT=$HOME/wirbel-test; mkdir -p "$OUT"; R=$OUT/ergebnis.txt
 BIN=./target/release/wirbel; CONF=docs/tty-test.conf
@@ -42,7 +43,13 @@ t() { # Nummer, erwartete Exit-Zahl, Anweisung, Argumente...
   read -r -p "Enter = los, s = ueberspringen, q = Ende: " a
   [ "$a" = q ] && fini
   [ "$a" = s ] && { echo "Test $n uebersprungen" >> "$R"; return; }
-  $RUN $BIN --stats --config "$CONF" "$@"; got=$?
+  if [ -n "$SESSION" ]; then
+    # shellcheck disable=SC2086
+    $SESSION --config "$CONF" -- --stats "$@"; got=$?
+    cp ~/.local/state/wirbel/session.log "$OUT/test$n-sitzung.log" 2>/dev/null
+  else
+    $RUN $BIN --stats --config "$CONF" "$@"; got=$?
+  fi
   stty sane 2>/dev/null
   cp ~/.local/state/wirbel/wirbel.log "$OUT/test$n.log" 2>/dev/null
   if [ "$DOC" = 1 ] && ! mountpoint -q "$XDG_RUNTIME_DIR/doc"; then
@@ -77,6 +84,35 @@ if [ "$1" = ende ]; then
   CONF=docs/tty-test.conf
   grep -ahE ' stats ' "$OUT"/test2[2-6].log | sed 's/^[^ ]* *[A-Z]* *[^ ]* //' > "$OUT/stats.txt"
   echo "Messwerte: $OUT/stats.txt" >> "$R"
+  fini
+fi
+if [ "$1" = sitzung ]; then
+  # Die Sitzung startet alles selbst, wie im Greeter: Bus, PipeWire, Portale, Autostart aus der Vorlage.
+  # Laeuft Mango noch, ist sie Gast: Ein Bus ohne Dienste, Mangos PipeWire, und in der Config drei
+  # Aenderungen, sonst blieben Bar und Hintergrund bei den Instanzen von Mango. Mit ausgeloggtem Mango
+  # laeuft alles wie im Alltag, das zeigt aber auch der Test ueber den Greeter, docs/SESSION.md.
+  docs/install-session.sh --lib-nach "$OUT/lib" || exit 1
+  SESSION=$OUT/lib/wirbel-session
+  CONF=$OUT/sitzung.conf
+  if mountpoint -q "$XDG_RUNTIME_DIR/doc" || pgrep -u "$(id -u)" -x mango >/dev/null; then
+    SESSION="$SESSION --gast"
+    echo "Mango laeuft, die Sitzung ist Gast. Tastenbund und Portale sind dieselben."
+    sed -E 's/ -n$//; /wallsync|launcher-host|widgets-host/d; s|^exec-once = \$HOME/.local/bin/wall-restore|exec-once = awww-daemon \& sleep 1; $HOME/.local/bin/wall-restore|' session/config > "$CONF"
+  else
+    cp session/config "$CONF"
+  fi
+  CHECK="sleep 10; wirbel-session --status > $OUT/status.txt 2>&1"
+  t 30 0 "Die Sitzung. Du siehst nach einigen Sekunden dein Wallpaper, oben die salbei-Bar mit den Workspaces 1 2 3 und irgendwo den Blob. Dann: Super+Return oeffnet kitty, in der Bar ist Workspace 1 jetzt belegt. Super+2: Die Bar springt auf 2, das Fenster ist weg. Klicke in der Bar auf die 1: kitty ist wieder da. Super+Leertaste oeffnet den Launcher, Esc schliesst ihn. Super+Esc oeffnet das Power-Menue, Esc schliesst es. Nichts auswaehlen. Endet nach 2 Minuten selbst." --timeout 120 -c "$CHECK"
+  cat "$OUT/status.txt" >> "$R" 2>/dev/null
+  t 31 0 "Tasten aus Mango. Erst Super+Return, zweimal, dann Super+Shift+3, damit ein kitty auf Workspace 3 liegt, und Super+1. 1. Super halten und Mausrad runter: Sprung auf 3, die leeren werden uebersprungen, rauf: zurueck auf 1. Im kitty scrollt dabei nichts. 2. Super+Rechts HALTEN: Nach 0,6 s laufen die Workspaces in der Bar schnell durch, loslassen stoppt. Super+1. 3. Strg halten, dann RECHTES Shift: Das quickdots-Menue kommt, Esc schliesst es. 4. Im kitty tippen: AltGr+Q ergibt @, AltGr+7 ergibt {, AltGr+E ergibt das Euro-Zeichen. Das kitty bleibt dabei offen. 5. Strg+Alt+Rechts halten: Die Fenster aendern laufend ihre Breite. Endet nach 2 Minuten selbst." --timeout 120
+  t 32 0 "Abmelden ueber die Bar: Super+Esc, dann Logout. Die Sitzung endet sofort und du bist hier zurueck, mit Exit 0. Endet sonst nach 60 s selbst." --timeout 60
+  rm -f "$OUT"/shot-*.png
+  t 33 0 "Screenshot. Super+Shift+S: Flameshot, der Schirm wird dunkler. Rechteck ziehen, Strg+C: Das Dunkle verschwindet. Dann Super+Return, im kitty 'grim $OUT/shot-sitzung.png' eingeben, die Datei muss danach dort liegen. Endet nach 60 s selbst." --timeout 60
+  ls -l "$OUT"/shot-sitzung.png >> "$R" 2>&1
+  rm -rf "$OUT/chromium-share"
+  SHARE="chromium --user-data-dir=$OUT/chromium-share --no-first-run --no-default-browser-check --password-store=basic --ozone-platform=wayland file://$HOME/WM/docs/share-test.html"
+  t 34 0 "Bildschirm teilen, diesmal mit den Portalen der Sitzung und ohne Extra-Schalter fuer Chromium. Auf 'Teilen starten' klicken, Reiter 'Entire Screen', Vorschaubild, 'Share'. Danach zeigt die schwarze Flaeche deinen Schirm wie ein Tunnel, aufrecht, und die Bildzahl oben zaehlt hoch, solange sich etwas bewegt. Endet nach 90 s selbst." --timeout 90 -c "$SHARE"
+  echo "Wenn alles passt: docs/install-session.sh --pruefen, dann ohne --pruefen, und ueber den Greeter einloggen, docs/SESSION.md."
   fini
 fi
 if [ "$1" != nach ]; then
