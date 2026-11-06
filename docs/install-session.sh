@@ -80,6 +80,8 @@ check() {
     if command -v "$tool" >/dev/null; then ok "$tool"; else bad "$tool"; fi
   done
 
+  if [ -e /bedrock/strata/void/usr/bin/steam ]; then ok "Steam in Void, die Sitzung startet es auf der NVIDIA"; else note "Kein Steam in Void, session/steam bleibt ungenutzt"; fi
+
   echo "Config-Vorlage:"
   local path list
   list=$(grep -oE '\$HOME/[^ ]+' "$ROOT/session/config" | sort -u)

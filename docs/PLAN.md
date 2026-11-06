@@ -89,7 +89,7 @@ am 5.11.2026 entschieden, auch bei der Migration von Mango nicht nachbauen.
   Threads: `Watchdog` (Deadline, Signale, meldet eine stehende Schleife) und `watch_keyboards` (liest
   die Notaus-Taste selbst aus `/dev/input`, ohne Grab, nur mit Gruppe `input`; Tasten anderer VTs werden
   verworfen). `on_key` prüft die Taste zusätzlich, nested läuft nur das, außer mit
-  `WIRBEL_EMERGENCY_DEVICES=PFAD:PFAD` (für Tests). Alles endet in `hard_exit`: `_exit` ohne Destruktoren,
+  `WIRBEL_EMERGENCY_DEVICES=PFAD:PFAD` (für Tests). Alles endet in `hard_exit`: Autostart-Gruppen beenden, Sockets löschen, `_exit` ohne Destruktoren,
   der Kernel schließt die Geräte und elogind gibt den VT zurück, `restore_terminal` tut das vorab per
   ioctl selbst. Einen in einem Treiber-ioctl hängenden Prozess kann auch das nicht beenden.
 - `src/check.rs`: `wirbel check`. Geht den Weg von libseats logind-Backend (libelogind oder libsystemd
@@ -157,7 +157,7 @@ am 5.11.2026 entschieden, auch bei der Migration von Mango nicht nachbauen.
   2560x1440 also etwa das Vierfache. Der Weg über dmabufs ist offen, siehe Etappe 9.
 - `src/handlers/foreign_toplevel.rs`: `refresh_foreign_toplevels` vergleicht nach jeder Loop-Iteration die Fenster
   mit dem, was Clients zuletzt erfuhren, sonst muss niemand im Compositor davon wissen.
-- `src/stats.rs`: `--stats`. Aus liest es keine Uhr. `check` nutzt `Summary` für die Messung der GPU-Kopie.
+- `src/stats.rs`: `--stats` oder `stats = 1` in der Config. Aus liest es keine Uhr. `check` nutzt `Summary` für die Messung der GPU-Kopie.
 - `apply_subsurface_positions` (`src/handlers/compositor.rs`): Smithay hält `wl_subsurface.set_position` im Pending-
   Zustand des Kindes, das Protokoll bindet die Position aber an den Commit des Elternteils. Chromium verschiebt
   seine Blasen (Subsurfaces, keine Popups) ohne Commit der Blase. Der Aufruf steht vor `on_commit_buffer_handler`,
@@ -280,7 +280,8 @@ am 5.11.2026 entschieden, auch bei der Migration von Mango nicht nachbauen.
    den Test über den Greeter, `docs/SESSION.md`.
 9. Härtung: Review, Absturzpfade, Leaks, Client-Fehlverhalten, Performance.
 
-Für Etappe 9 offen: Screencopy auf dmabufs, damit das Zurücklesen die Hauptschleife nicht anhält.
+Nach Etappe 9 offen: Screencopy auf dmabufs, damit das Zurücklesen die Hauptschleife nicht anhält. Das war kein Punkt
+der Härtung, es trifft nur wartende Screenshots und Streams.
 
 ## Leistung (gemessen, Session 08)
 Der unoptimierte Debug-Build war nicht die Ursache fürs Stocken. Nested mit Chromium oder glxgears und kitty:
@@ -293,6 +294,40 @@ einmalig 1,6 s beim ersten Scrollen einer langen Seite, das liegt am Client, `re
 Wayland sind gleich. Steam erreicht unter wirbel und unter Mango denselben Punkt nach 3 s. Spielstarts in Test 16
 enthielten ein Shader-Update von Steam und `pv-locale-gen`. Auf dem echten Ausgang gemessen ist noch nichts:
 Tests 24 und 25 des Abschlusstests liefern `input`, `gap` und `late`, nested gibt es die nicht, der Host taktet.
+
+## Stocken beim Scrollen (Session 10)
+Ursache: Die schwache iGPU macht drei Dinge zugleich, und die Bilder des Compositors warten in ihrer Warteschlange.
+Test 25 auf dem echten Ausgang (170 Hz, AMD rendert, NVIDIA zeigt), Phase mit `late` 230 bis 303 von rund 600:
+`render` n und `gap` n sind gleich, bei jedem Vblank wartet also ein Bild, trotzdem laufen nur 115 Bilder/s. `render`
+bleibt bei 0,34 ms, die Hauptschleife ist frei, `input` p99 0,3 ms. Das Bild ist fertig abgeschickt und wartet auf den
+Fence: Der Flip kommt erst, wenn der Fence signalisiert ist (`IN_FENCE_FD`, Smithay ab NVIDIA 560.35.3). Ohne Fence
+gäbe es kein `late`. Von den 5,88 ms bis zum Vblank geht die Kopie zur NVIDIA ab, im Mittel 2,2 ms, dem Bild auf der
+iGPU bleiben also 3,7 ms. Die Spielphase am Ende von Test 25 und Chromium in Test 24 zeigen `late` 0, nur Steam nicht.
+
+Nachgestellt nested mit Steam in Monitorgröße, Ausgabe 2492x1322 per Scale 0.5, Rad alle 80 ms, gleicher Build:
+
+| | Steam auf iGPU | Steam per PRIME auf NVIDIA | glxgears, kleines Fenster |
+|---|---|---|---|
+| iGPU-Zeit Steam + Xwayland | 35 % + 15 % | 0 + 22 % | |
+| Steam-Bilder/s | 84 | 106 | |
+| `gpu` p50, p99, Mittel in ms | 2,0 / 9,0 / 2,9 | 0,45 / 7,0 / 1,05 | 0,16 / 1,5 / 0,6 |
+| Bilder über 3,7 ms | 1111 von 2912, 38 % | 123 von 3653, 3 % | |
+| Bilder über 5 ms | 672 | 110 | |
+| `late` in 35 s | 110 | 1 | 0 |
+
+Die 38 % über dem Budget von 3,7 ms passen zu den rund 45 % `late` in Test 25, der mit 170 Hz mehr verlangt. Der Job von
+wirbel ist überall derselbe, gewachsen ist nur die Wartezeit. Der Rest von 6 bis 8 ms bleibt auch mit Steam auf der NVIDIA: Xwayland kopiert
+dann auf der iGPU, nested kommt Mango dazu. Ein solcher Job läuft ohne Vorrang zu Ende, unser `ContextPriority::High`
+ordnet nur, was noch wartet. Steam in der Sitzung läuft darum über `session/steam` auf der NVIDIA. Das ist die Abhilfe,
+nested belegt, auf dem echten Ausgang steht die Bestätigung noch aus. `--stats` hat dafür neu `gpu` (bis zum Fence),
+`flip` (Abstand auf der Uhr des Kernels) und `skipped` (Vblanks nach Sequenznummer). Ungeklärt ist ohne diese Zahlen,
+warum `gap` in Test 25 Werte zwischen den Vielfachen von 5,88 ms zeigt, auch das 5,48/6,31 einer ruhigen Phase.
+
+Die saubere Lösung wäre, dass die NVIDIA komponiert, `render_gpu = card1`: Test 26 zeigt `late` 0 und ein Bild weniger
+Latenz, `screen` 5,85 statt 10 bis 11 ms. Dann zeigt das dmabuf-Feedback aber auf die NVIDIA, und die Clients aus Arch und Debian
+haben dort nur Mesa, sie fielen auf zink oder Software zurück. Das geht erst mit NVIDIA-Treiber in Arch. Clients weiter auf
+die iGPU zu schicken und nur zu komponieren, hieße: Kopie je Commit über Smithays `early_import`, ohne Test auf dem echten
+Ausgang nicht vertretbar.
 
 ## Fenster teilen (Empfehlung, Session 08)
 Im Dialog von Chromium ging in Test 20 nur "Entire Screen". Jeder Klick auf "Window" loggt `wlroots: No supported
