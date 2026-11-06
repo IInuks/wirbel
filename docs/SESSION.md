@@ -1,5 +1,8 @@
 # wirbel als Alltagssitzung
 
+Dieses Dokument beschreibt die Bedrock-Einrichtung. Auf Arch, Debian/Ubuntu und Void richtet `./setup.sh` alles ein,
+Pakete und Build eingeschlossen. `./setup.sh --check` ändert nichts und zeigt, was passieren würde.
+
 ## Einrichten
 Alles Systemweite macht `docs/install-session.sh`, gestartet vom Nutzer, nach `cargo build --release`.
 1. `docs/install-session.sh --pruefen` ändert nichts und sagt, was fehlt und was passieren würde.

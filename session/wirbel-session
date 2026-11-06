@@ -14,6 +14,16 @@
 LIB=$(dirname "$(readlink -f "$0")")
 SELF=$LIB/wirbel-session
 STRAT=/bedrock/bin/strat
+# On Bedrock each program comes from the stratum that has it. Elsewhere there is one system, and
+# these stay empty.
+BEDROCK=
+ON_ARCH=
+ON_DEBIAN=
+if [ -x "$STRAT" ]; then
+    BEDROCK=1
+    ON_ARCH="$STRAT arch"
+    ON_DEBIAN="$STRAT debian"
+fi
 export PATH="$LIB:$PATH"
 # Our entry for Steam goes before the one of the stratum, see the script `steam`.
 export XDG_DATA_DIRS="$LIB/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share:/bedrock/cross}"
@@ -22,17 +32,33 @@ say() { echo "wirbel-session: $*" >&2; }
 
 # wirbel comes from the Arch stratum but has to run in Void, only Void has the NVIDIA libraries. So
 # does the session bus, as under Mango.
-if [ "$(/bedrock/bin/brl which 2>/dev/null)" != void ]; then
+if [ -n "$BEDROCK" ] && [ "$(/bedrock/bin/brl which 2>/dev/null)" != void ]; then
     exec "$STRAT" void "$0" "$@"
 fi
 
+# Bedrock only: On a system with systemd the document portal stays mounted after a logout, so the
+# mount says nothing there. A guest asks for it with --gast.
 other_session() {
+    [ -n "$BEDROCK" ] || return 1
     mountpoint -q "$XDG_RUNTIME_DIR/doc" || pgrep -u "$(id -u)" -x mango >/dev/null
 }
 
 owned() {
     dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
         org.freedesktop.DBus.NameHasOwner "string:$1" 2>/dev/null | grep -q 'boolean true'
+}
+
+# Where the distribution keeps a portal: Arch /usr/lib, Debian and Void /usr/libexec.
+portal_path() {
+    if [ -z "$BEDROCK" ]; then
+        for dir in /usr/libexec /usr/lib /usr/lib/"$1"; do
+            if [ -x "$dir/$1" ] && [ ! -d "$dir/$1" ]; then
+                echo "$dir/$1"
+                return
+            fi
+        done
+    fi
+    echo "/usr/lib/$1"
 }
 
 await_name() {
@@ -60,7 +86,7 @@ keep() {
 
 pipewire_alive() {
     [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] &&
-        timeout 3 "$STRAT" debian pw-cli info 0 >/dev/null 2>&1
+        timeout 3 $ON_DEBIAN pw-cli info 0 >/dev/null 2>&1
 }
 
 # As under Mango from Debian. Other sessions leave theirs running after a logout, it is still
@@ -70,14 +96,14 @@ start_pipewire() {
         say "PipeWire is already there, using it"
         return
     fi
-    keep "$STRAT" debian pipewire
+    keep $ON_DEBIAN pipewire
     i=0
     while [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ] && [ $i -lt 50 ]; do
         sleep 0.1
         i=$((i + 1))
     done
-    keep "$STRAT" debian wireplumber
-    keep "$STRAT" debian pipewire-pulse
+    keep $ON_DEBIAN wireplumber
+    keep $ON_DEBIAN pipewire-pulse
 }
 
 # Needs the compositor, so wirbel runs this as its first child. The portals come from Arch, which
@@ -85,6 +111,7 @@ start_pipewire() {
 # services, and that one also ends with them: it may outlive its bus.
 portals() {
     dbus-update-activation-environment --all 2>/dev/null
+    [ -d /run/systemd/system ] && dbus-update-activation-environment --systemd --all 2>/dev/null
     if [ -n "$WIRBEL_GAST" ]; then
         names=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
             org.freedesktop.DBus.ListActivatableNames) || exit 1
@@ -98,12 +125,12 @@ portals() {
     gtk=
     portal=
     if ! owned org.freedesktop.impl.portal.desktop.gtk; then
-        "$STRAT" arch /usr/lib/xdg-desktop-portal-gtk &
+        $ON_ARCH "$(portal_path xdg-desktop-portal-gtk)" &
         gtk=$!
     fi
     (
         while :; do
-            "$STRAT" arch /usr/lib/xdg-desktop-portal-wlr -c "$LIB/xdpw.conf"
+            $ON_ARCH "$(portal_path xdg-desktop-portal-wlr)" -c "$LIB/xdpw.conf"
             wirbel pos --once >/dev/null 2>&1 || exit 0
             say "xdg-desktop-portal-wlr ended"
             sleep 2
@@ -113,7 +140,7 @@ portals() {
     await_name org.freedesktop.impl.portal.desktop.wlr
     await_name org.freedesktop.impl.portal.desktop.gtk
     if ! owned org.freedesktop.portal.Desktop; then
-        "$STRAT" arch /usr/lib/xdg-desktop-portal &
+        $ON_ARCH "$(portal_path xdg-desktop-portal)" &
         portal=$!
     fi
     wait "$wlr"
@@ -124,6 +151,12 @@ portals() {
 # The bus runs under this script and not the other way round with dbus-run-session: that one dies
 # of a TERM and leaves everything below it running.
 start_bus() {
+    # systemd gives each user one bus. Services started through it would not see one of ours.
+    if [ -z "$BEDROCK" ] && [ -z "$WIRBEL_GAST" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+        DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
+        export DBUS_SESSION_BUS_ADDRESS
+        return
+    fi
     if [ -n "$WIRBEL_GAST" ]; then
         export WIRBEL_GAST
         kind=--config-file=$LIB/bus.conf

@@ -1,0 +1,10 @@
+
+# Added by setup.sh to the defaults above: a desktop from the packages it installs.
+exec-once = waybar
+exec-once = mako
+# Autostart runs through sh, so this works for any of them. Wallpaper: swaybg or awww, for example
+# exec-once = swaybg -i $HOME/Pictures/wallpaper.png
+
+bind = SUPER, space, spawn, fuzzel
+# Select an area, the picture goes to the clipboard.
+bind = SUPER+SHIFT, s, spawn, grim -g "$(slurp)" - | wl-copy

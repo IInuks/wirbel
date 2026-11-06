@@ -674,6 +674,15 @@ mod tests {
             .map(|bind| &bind.action)
     }
 
+    /// `setup.sh` builds a configuration from these two files.
+    #[test]
+    fn the_template_of_setup_sh_has_only_valid_lines() {
+        let text = concat!(include_str!("default.conf"), include_str!("../session/config.extra"));
+        let (config, errors) = Config::parse(text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(config.binds.iter().any(|bind| bind.action == Action::Spawn("fuzzel".into())));
+    }
+
     #[test]
     fn defaults_match_the_mango_setup() {
         let config = Config::default();
