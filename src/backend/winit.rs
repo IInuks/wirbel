@@ -224,6 +224,7 @@ impl Nested {
         state.stats.vblank(
             Duration::from_secs_f64(1_000.0 / f64::from(REFRESH_MHZ)),
             true,
+            None,
         );
     }
 }

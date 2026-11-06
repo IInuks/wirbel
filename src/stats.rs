@@ -6,6 +6,11 @@
 //! - `render`: one frame on the main loop, including the copy to another GPU.
 //! - `gap`: between two frames that reached the screen, and how many vblanks went unused in spite
 //!   of a redraw waiting. `late` counts them.
+//! - `flip`: the same gap on the kernel's clock, as far as the driver tells. Where `gap` wanders
+//!   and `flip` does not, the event came late, not the frame. `skipped` counts vblanks by their
+//!   sequence numbers, for every frame and not only with a redraw waiting.
+//! - `gpu`: from the end of `render` until the fence of the frame is signalled, so everything the
+//!   GPUs still had to do: waiting for their turn, drawing, the copy to another GPU.
 //! - `screen`: from a commit until the vblank that shows it, so what the compositor adds to a client.
 //! - `scroll`: from a wheel event until the client under the pointer commits, so what the client adds.
 //! - `tidy`: the housekeeping after every loop iteration.
@@ -78,10 +83,13 @@ pub struct Stats {
     input: Series,
     render: Series,
     gap: Series,
+    flip: Series,
+    gpu: Series,
     screen: Series,
     scroll: Series,
     tidy: Series,
     late: u32,
+    skipped: u32,
     /// The oldest commit that is not on the screen yet.
     commit: Option<Instant>,
     /// The oldest commit of the frame on its way.
@@ -91,6 +99,8 @@ pub struct Stats {
     last_vblank: Option<Instant>,
     /// Something asked for a redraw when the last vblank came.
     wanted: bool,
+    /// The kernel's time and sequence number of the last vblank.
+    last_flip: Option<(Duration, u32)>,
 }
 
 impl Stats {
@@ -137,6 +147,13 @@ impl Stats {
         }
     }
 
+    /// The fence of a frame was signalled, `start` being when its `render` ended.
+    pub fn gpu_done(&mut self, start: Instant) {
+        if self.enabled {
+            self.gpu.add(start.elapsed());
+        }
+    }
+
     pub fn tidied(&mut self, start: Option<Instant>) {
         if let Some(start) = start {
             self.tidy.add(start.elapsed());
@@ -153,12 +170,19 @@ impl Stats {
 
     /// A frame reached the screen. `frame` is the length of one refresh, `wanted` says that a
     /// redraw is already waiting. A gap of more than one and a half frames after a vblank with a
-    /// redraw waiting is a vblank we missed.
-    pub fn vblank(&mut self, frame: Duration, wanted: bool) {
+    /// redraw waiting is a vblank we missed. `flip` is what the kernel says about it, if it does.
+    pub fn vblank(&mut self, frame: Duration, wanted: bool, flip: Option<(Duration, u32)>) {
         if !self.enabled {
             return;
         }
         let now = Instant::now();
+        if let (Some((before, count_before)), Some((time, count))) = (self.last_flip, flip) {
+            self.skipped += count.wrapping_sub(count_before).saturating_sub(1);
+            if self.wanted {
+                self.flip.add(time.saturating_sub(before));
+            }
+        }
+        self.last_flip = flip;
         if let Some(last) = self.last_vblank
             && self.wanted
         {
@@ -188,6 +212,8 @@ impl Stats {
             self.input.take("input"),
             self.render.take("render"),
             self.gap.take("gap"),
+            self.flip.take("flip"),
+            self.gpu.take("gpu"),
             self.screen.take("screen"),
             self.scroll.take("scroll"),
             self.tidy.take("tidy"),
@@ -195,6 +221,7 @@ impl Stats {
         let line: Vec<String> = parts.into_iter().flatten().collect();
         tracing::info!(
             late = std::mem::take(&mut self.late),
+            skipped = std::mem::take(&mut self.skipped),
             "stats {}",
             line.join(" | ")
         );
@@ -254,11 +281,23 @@ mod tests {
     fn a_gap_only_counts_with_a_redraw_waiting() {
         let mut stats = Stats::default();
         stats.enable();
-        stats.vblank(ms(0), false);
-        stats.vblank(ms(0), true);
+        stats.vblank(ms(0), false, None);
+        stats.vblank(ms(0), true, None);
         assert!(stats.gap.0.is_empty());
-        stats.vblank(ms(0), false);
+        stats.vblank(ms(0), false, None);
         assert_eq!(stats.gap.0.len(), 1);
         assert_eq!(stats.late, 1);
+    }
+
+    #[test]
+    fn the_sequence_numbers_tell_skipped_vblanks() {
+        let mut stats = Stats::default();
+        stats.enable();
+        stats.vblank(ms(6), true, Some((ms(100), u32::MAX)));
+        stats.vblank(ms(6), true, Some((ms(106), 0)));
+        assert_eq!(stats.skipped, 0);
+        stats.vblank(ms(6), true, Some((ms(124), 3)));
+        assert_eq!(stats.skipped, 2);
+        assert_eq!(stats.flip.0, [ms(6), ms(18)]);
     }
 }

@@ -718,9 +718,13 @@ fn on_vblank(
             .output
             .current_mode()
             .map_or(60_000, |mode| mode.refresh);
+        let flip = metadata.as_ref().and_then(|metadata| match metadata.time {
+            DrmEventTime::Monotonic(time) if !time.is_zero() => Some((time, metadata.sequence)),
+            _ => None,
+        });
         state
             .stats
-            .vblank(frame_duration(refresh), presented.render);
+            .vblank(frame_duration(refresh), presented.render, flip);
         (surface.output.clone(), presented)
     };
     frame_done(drm, state, node, crtc, &output, presented);
@@ -806,6 +810,7 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
         }
         let locked = state.lock.is_active();
         let output = surface.output.clone();
+        let mut fence = None;
         let renderer = if target == render_gpu {
             this.gpus.single_renderer(&render_gpu)
         } else {
@@ -830,6 +835,13 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
                     Ok(frame) => {
                         let scanout =
                             matches!(frame.primary_element, PrimaryPlaneElement::Element(_));
+                        if let PrimaryPlaneElement::Swapchain(element) = &frame.primary_element {
+                            // Without a fence for the kernel the flip must not overtake the GPU.
+                            if frame.needs_sync() {
+                                let _ = element.sync.wait();
+                            }
+                            fence = Some(element.sync.clone());
+                        }
                         if scanout != surface.scanout {
                             surface.scanout = scanout;
                             tracing::info!(name = output.name(), scanout, "direct scanout");
@@ -863,6 +875,9 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
             Rendered::Queued => {
                 surface.pacing.queued(locked);
                 state.stats.queued();
+                if let Some(fence) = fence {
+                    state.time_gpu(&fence);
+                }
             }
             Rendered::Unchanged => surface.pacing.unchanged(locked),
             Rendered::Retry => surface.pacing.unchanged(false),

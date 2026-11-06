@@ -11,7 +11,9 @@ use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
         input::InputTime,
-        renderer::{element::solid::SolidColorBuffer, utils::with_renderer_surface_state},
+        renderer::{
+            element::solid::SolidColorBuffer, sync::SyncPoint, utils::with_renderer_surface_state,
+        },
     },
     desktop::{
         LayerSurface, PopupGrab, PopupManager, PopupUngrabStrategy, Space, Window,
@@ -400,6 +402,24 @@ impl Wirbel {
             tracing::warn!(%err, "failed to flush clients");
         }
         self.stats.tidied(start);
+    }
+
+    /// With `--stats`: tells the stats when the GPU is through with a frame.
+    pub fn time_gpu(&self, fence: &SyncPoint) {
+        let Some(start) = self.stats.start() else {
+            return;
+        };
+        let Some(fd) = fence.export() else {
+            return;
+        };
+        let source = Generic::new(fd, Interest::READ, Mode::OneShot);
+        let inserted = self.loop_handle.insert_source(source, move |_, _, state| {
+            state.stats.gpu_done(start);
+            Ok(PostAction::Remove)
+        });
+        if let Err(err) = inserted {
+            tracing::debug!(%err, "cannot wait for this fence");
+        }
     }
 
     /// Runs a shell command as a client of this compositor.
