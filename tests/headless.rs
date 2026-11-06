@@ -7870,7 +7870,7 @@ fn a_hundred_windows_fit_somehow() {
 #[test]
 fn nothing_stays_behind_when_windows_and_clients_go() {
     let compositor = Compositor::start();
-    for _ in 0..30 {
+    for round in 0..30 {
         let mut client = Client::connect(&compositor);
         let a = client.open_window(RED);
         let b = client.open_window(GREEN);
@@ -7884,7 +7884,7 @@ fn nothing_stays_behind_when_windows_and_clients_go() {
         client.close(b);
         client.sync();
         // Half of them end without saying goodbye.
-        if a % 2 == 0 {
+        if round < 15 {
             client.close(a);
             client.sync();
         }
