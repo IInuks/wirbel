@@ -36,6 +36,9 @@ impl XdgActivationHandler for Wirbel {
         if fresh {
             data.user_data.insert_if_missing(|| Fresh);
         }
+        // Tokens of no use pile up otherwise: a bell makes one each time.
+        self.activation_state
+            .retain_tokens(|_, data| data.timestamp.elapsed() <= TOKEN_LIFETIME);
         true
     }
 

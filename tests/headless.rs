@@ -7701,3 +7701,202 @@ fn a_window_that_wants_attention_shows_in_the_tags_until_it_has_the_focus() {
     });
     assert!(!next_line(&mut ipc_lines(&compositor, "tags")).contains(r#""is_urgent":true"#));
 }
+
+impl Client {
+    /// `sync` for a client that may have earned a protocol error, which ends it and only it.
+    fn sync_or_die(&mut self) {
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+}
+
+/// Whatever a client does to itself, the compositor stays and serves the next one.
+fn survives(compositor: &Compositor) {
+    let mut client = Client::connect(compositor);
+    let window = client.open_window(BLUE);
+    client.sync();
+    client.close(window);
+    client.sync();
+}
+
+#[test]
+fn absurd_sizes_do_no_harm() {
+    let compositor = Compositor::start();
+    for geometry in [
+        (0, 0, 1, 1),
+        (i32::MAX, i32::MAX, i32::MAX, i32::MAX),
+        (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        (0, 0, i32::MAX, 1),
+    ] {
+        let mut client = Client::connect(&compositor);
+        let a = client.open_window(RED);
+        let (x, y, w, h) = geometry;
+        client.xdg_surface(a).set_window_geometry(x, y, w, h);
+        client.state.windows[a].surface.commit();
+        client.sync_or_die();
+        compositor.screenshot();
+        compositor.pointer_at(10.0, 10.0);
+        survives(&compositor);
+    }
+    let mut client = Client::connect(&compositor);
+    let a = client.open_unmapped_window_with(|toplevel| {
+        toplevel.set_min_size(i32::MAX, i32::MAX);
+        toplevel.set_max_size(1, 1);
+    });
+    client.draw(a, RED);
+    client.sync_or_die();
+    compositor.screenshot();
+    survives(&compositor);
+}
+
+#[test]
+fn a_subsurface_far_away_does_no_harm() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let window = client.open_window(RED);
+    let subcompositor: WlSubcompositor = client.bind(1..=1);
+    let parent = client.state.windows[window].surface.clone();
+    let child = client.compositor.create_surface(&client.handle, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &client.handle, ());
+    subsurface.set_desync();
+    let _buffer = client.fill(&child, 10, 10, GREEN);
+    for position in [i32::MAX / 2, -i32::MAX / 2, 100_000] {
+        subsurface.set_position(position, position);
+        parent.commit();
+        client.sync_or_die();
+        compositor.screenshot();
+    }
+    survives(&compositor);
+}
+
+#[test]
+fn a_cursor_with_absurd_numbers_does_no_harm() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    compositor.pointer_at(100.0, 100.0);
+    client.sync();
+    let pointer = client._pointer.clone();
+    let cursor = client.compositor.create_surface(&client.handle, ());
+    let _buffer = client.fill(&cursor, 8, 8, BLUE);
+    pointer.set_cursor(client.state.enter_serial, Some(&cursor), i32::MAX, i32::MIN);
+    client.sync();
+    compositor.screenshot();
+    for _ in 0..3 {
+        cursor.offset(i32::MAX, i32::MIN);
+        cursor.commit();
+        client.sync();
+    }
+    compositor.screenshot();
+    cursor.destroy();
+    client.sync_or_die();
+    compositor.screenshot();
+    survives(&compositor);
+}
+
+#[test]
+fn a_client_may_leave_in_the_middle_of_anything() {
+    let compositor = Compositor::start();
+    // In a popup grab.
+    {
+        let (_, _) = {
+            let mut client = Client::connect(&compositor);
+            let a = client.open_window(RED);
+            compositor.pointer_at(100.0, 100.0);
+            compositor.button(BTN_LEFT, ButtonState::Pressed);
+            client.sync();
+            let serial = client.state.button_serial;
+            let parent = client.xdg_surface(a);
+            let _popup = client.open_popup(&parent, (20, 20), (50, 50), POPUP, Some(serial));
+            (a, serial)
+        };
+        compositor.button(BTN_LEFT, ButtonState::Released);
+        survives(&compositor);
+    }
+    // In a drag of its own window.
+    {
+        let mut client = Client::connect(&compositor);
+        client.open_window(RED);
+        compositor.pointer_at(100.0, 100.0);
+        compositor.button(BTN_LEFT, ButtonState::Pressed);
+        client.sync();
+        let seat = client.seat();
+        let serial = client.state.button_serial;
+        client.toplevel(0)._move(&seat, serial);
+        client.sync();
+        drop(client);
+        compositor.pointer_at(300.0, 200.0);
+        compositor.button(BTN_LEFT, ButtonState::Released);
+        survives(&compositor);
+    }
+    compositor.with(|state| assert!(state.popup_grab.is_none()));
+}
+
+#[test]
+fn a_popup_of_a_gone_parent_does_no_harm() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    let parent = client.xdg_surface(a);
+    let popup = client.open_popup(&parent, (20, 20), (50, 50), POPUP, None);
+    let nested = client.open_popup(&popup.xdg_surface, (5, 5), (20, 20), POPUP, None);
+    // Out of order, which the protocol forbids.
+    popup.popup.destroy();
+    client.sync_or_die();
+    nested.popup.destroy();
+    client.sync_or_die();
+    compositor.screenshot();
+    survives(&compositor);
+}
+
+#[test]
+fn a_hundred_windows_fit_somehow() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    for index in 0..100 {
+        let window = client.open_unmapped_window();
+        let size = client.size(window);
+        assert!(size.0 > 0 && size.1 > 0, "window {index} is {size:?}");
+        client.draw(window, RED);
+    }
+    compositor.screenshot();
+    for frame in compositor.frames() {
+        assert!(frame.w > 0 && frame.h > 0, "{frame:?}");
+    }
+    drop(client);
+    survives(&compositor);
+    assert!(compositor.frames().is_empty());
+}
+
+#[test]
+fn nothing_stays_behind_when_windows_and_clients_go() {
+    let compositor = Compositor::start();
+    for _ in 0..30 {
+        let mut client = Client::connect(&compositor);
+        let a = client.open_window(RED);
+        let b = client.open_window(GREEN);
+        let parent = client.xdg_surface(a);
+        let _popup = client.open_popup(&parent, (20, 20), (50, 50), POPUP, None);
+        let surface = client.state.windows[a].surface.clone();
+        let token = activation_token(&mut client, false, &surface);
+        let activation = client.bind::<XdgActivationV1>(1..=1);
+        activation.activate(token, &client.state.windows[a].surface);
+        client.sync();
+        client.close(b);
+        client.sync();
+        // Half of them end without saying goodbye.
+        if a % 2 == 0 {
+            client.close(a);
+            client.sync();
+        }
+    }
+    survives(&compositor);
+    compositor.with(|state| {
+        state.popups.cleanup();
+        assert!(state.urgent.is_empty());
+        assert!(state.awaiting_buffer.is_empty());
+        assert!(state.unconfigured.is_empty());
+        assert!(state.frames.is_empty());
+        assert!(state.borders.is_empty());
+        assert_eq!(state.space.elements().count(), 0);
+    });
+}

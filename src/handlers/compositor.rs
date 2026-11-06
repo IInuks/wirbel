@@ -149,12 +149,21 @@ impl Wirbel {
                 )
             {
                 let mut attributes = attributes;
-                attributes.hotspot -= offset;
+                let hotspot = attributes.hotspot;
+                attributes.hotspot = (
+                    hotspot.x.saturating_sub(offset.x),
+                    hotspot.y.saturating_sub(offset.y),
+                )
+                    .into();
             }
             offset
         });
-        if is_icon {
-            self.dnd_offset += offset.unwrap_or_default();
+        if is_icon && let Some(offset) = offset {
+            self.dnd_offset = (
+                self.dnd_offset.x.saturating_add(offset.x),
+                self.dnd_offset.y.saturating_add(offset.y),
+            )
+                .into();
         }
     }
 }
