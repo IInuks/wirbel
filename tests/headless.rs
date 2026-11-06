@@ -2297,6 +2297,26 @@ fn spawn_runs_the_command_of_the_bind() {
 }
 
 #[test]
+fn spawned_programs_start_at_home() {
+    let marker = scratch_path("spawned-cwd");
+    let compositor = Compositor::start_with(&format!(
+        "bind = SUPER, Return, spawn, pwd > {}\n",
+        marker.display()
+    ));
+    compositor.chord(SUPER, KEY_ENTER);
+    for _ in 0..200 {
+        if fs::read_to_string(&marker).is_ok_and(|text| text.ends_with('\n')) {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let cwd = fs::read_to_string(&marker).unwrap();
+    fs::remove_file(marker).unwrap();
+    let home = fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
+    assert_eq!(fs::canonicalize(cwd.trim()).unwrap(), home);
+}
+
+#[test]
 fn close_asks_the_focused_window_only() {
     let (compositor, mut client, _, b) = two_windows();
     compositor.chord(SUPER, KEY_W);

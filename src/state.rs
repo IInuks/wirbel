@@ -3,7 +3,7 @@ use std::{
     env,
     ffi::OsString,
     os::unix::process::CommandExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
@@ -463,6 +463,10 @@ impl Wirbel {
             .args(["-c", command])
             .env("WAYLAND_DISPLAY", &self.socket_name)
             .stdin(Stdio::null());
+        // Programs start at home, not in whatever folder wirbel itself was started from.
+        if let Some(home) = env::var_os("HOME").filter(|h| Path::new(h).is_dir()) {
+            child.current_dir(home);
+        }
         // Without Xwayland, a client must not end up on the host's X server.
         match self.xwayland.display {
             Some(display) => child.env("DISPLAY", format!(":{display}")),
