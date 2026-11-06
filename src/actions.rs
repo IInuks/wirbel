@@ -165,11 +165,15 @@ impl Wirbel {
     }
 
     fn workspace_index(&self, target: WorkspaceTarget) -> Option<usize> {
-        let active = self.monitors.get(self.active_monitor)?.active;
+        let monitor = self.monitors.get(self.active_monitor)?;
+        let active = monitor.active;
+        let used = |index: &usize| !monitor.workspaces[*index].windows().is_empty();
         Some(match target {
             WorkspaceTarget::Index(index) => index,
             WorkspaceTarget::Previous => (active + WORKSPACES - 1) % WORKSPACES,
             WorkspaceTarget::Next => (active + 1) % WORKSPACES,
+            WorkspaceTarget::PreviousUsed => (0..active).rev().find(used)?,
+            WorkspaceTarget::NextUsed => (active + 1..WORKSPACES).find(used)?,
         })
     }
 

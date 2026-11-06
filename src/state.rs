@@ -26,7 +26,8 @@ use smithay::{
     output::Output,
     reexports::{
         calloop::{
-            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken,
+            generic::Generic,
         },
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
@@ -74,7 +75,7 @@ use smithay::{
 };
 
 use crate::{
-    config::Config,
+    config::{Action, Config},
     cursor::Cursors,
     focus::KeyboardFocus,
     grabs::Drag,
@@ -217,6 +218,11 @@ pub struct Wirbel {
     pub borders: Vec<(Window, Vec<BorderEdge>)>,
     /// Pressed keys that triggered a bind. Their release must not reach a client either.
     pub swallowed_keys: Vec<Keycode>,
+    /// The bind of a modifier key, on its way out of the keyboard filter.
+    pub modifier_action: Option<Action>,
+    /// The timer of a held bind.
+    pub bind_repeat: Option<RegistrationToken>,
+    pub last_axis_bind: Option<Instant>,
     /// The window drag in progress.
     pub drag: Option<Drag>,
     pub cursor_status: CursorImageStatus,
@@ -325,6 +331,9 @@ impl Wirbel {
             frames: Vec::new(),
             borders: Vec::new(),
             swallowed_keys: Vec::new(),
+            modifier_action: None,
+            bind_repeat: None,
+            last_axis_bind: None,
             drag: None,
             cursor_status: CursorImageStatus::default_named(),
             cursors: None,
@@ -383,6 +392,7 @@ impl Wirbel {
         self.lock_refresh();
         self.update_idle_inhibit();
         self.refresh_foreign_toplevels();
+        self.publish_workspaces();
         if std::mem::take(&mut self.needs_redraw) {
             (self.redraw)();
         }

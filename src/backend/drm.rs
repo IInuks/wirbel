@@ -932,6 +932,7 @@ fn on_session_event(
         SessionEvent::PauseSession => {
             tracing::info!("session paused");
             active.store(false, Ordering::Relaxed);
+            state.stop_bind_repeat();
             libinput.suspend();
             drm.borrow_mut().pause();
         }

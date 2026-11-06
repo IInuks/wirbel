@@ -1,6 +1,8 @@
 //! Input handling. Backends translate their events into the `on_*` methods, which is also where
 //! tests inject input.
 
+use std::time::{Duration, Instant};
+
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
@@ -11,7 +13,10 @@ use smithay::{
         keyboard::{FilterResult, Keysym, KeysymHandle, ModifiersState},
         pointer::{AxisFrame, ButtonEvent, RelativeMotionEvent},
     },
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::{
+        calloop::timer::{TimeoutAction, Timer},
+        wayland_server::protocol::wl_surface::WlSurface,
+    },
     utils::{Logical, Point, SERIAL_COUNTER, Serial},
     wayland::{
         compositor::RegionAttributes,
@@ -19,7 +24,7 @@ use smithay::{
     },
 };
 
-use crate::{Wirbel, config::Action, state::Target};
+use crate::{Wirbel, config::Action, layout::Direction, state::Target};
 
 /// xkb codes are evdev codes shifted by this.
 const XKB_OFFSET: u32 = 8;
@@ -27,6 +32,26 @@ const SWITCH_VT_1: u32 = Keysym::XF86_Switch_VT_1.raw();
 const SWITCH_VT_12: u32 = Keysym::XF86_Switch_VT_12.raw();
 const F1: u32 = Keysym::F1.raw();
 const F12: u32 = Keysym::F12.raw();
+
+/// Whether this is a key that only changes what other keys do.
+fn is_modifier_key(handle: &KeysymHandle<'_>) -> bool {
+    handle.raw_syms().iter().any(|sym| {
+        matches!(
+            *sym,
+            Keysym::Shift_L
+                | Keysym::Shift_R
+                | Keysym::Control_L
+                | Keysym::Control_R
+                | Keysym::Alt_L
+                | Keysym::Alt_R
+                | Keysym::Meta_L
+                | Keysym::Meta_R
+                | Keysym::Super_L
+                | Keysym::Super_R
+                | Keysym::ISO_Level3_Shift
+        )
+    })
+}
 
 /// The VT a key asks for: `XF86Switch_VT_n`, or Ctrl+Alt+Fn for keymaps without those symbols.
 fn vt_of_key(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option<i32> {
@@ -84,15 +109,18 @@ impl Wirbel {
         self.idle_notifier_state.notify_activity(&seat);
     }
 
-    /// Binds take the key from clients, press and release alike. A locked session has no binds:
-    /// every key belongs to the lock screen. The two ways out work regardless, the session stays
-    /// locked behind them: the emergency chord and switching the VT.
+    /// Binds take the key from clients, press and release alike. A bind on a modifier key leaves
+    /// it to clients: wl_keyboard only sends modifiers along with a key that reaches them, so they
+    /// would miss that Shift is down. A locked session has no binds: every key belongs to the lock
+    /// screen. The two ways out work regardless, the session stays locked behind them: the
+    /// emergency chord and switching the VT.
     pub fn on_key(&mut self, key: Keycode, state: KeyState, time: InputTime) {
         let evdev = key.raw().saturating_sub(XKB_OFFSET) as u16;
         if self.chord.feed(evdev, state == KeyState::Pressed) {
             (self.emergency)();
         }
         self.note_activity();
+        self.stop_bind_repeat();
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
@@ -115,6 +143,10 @@ impl Wirbel {
                 KeyState::Pressed => {
                     let action = wirbel.config.action_for_key(modifiers.into(), &handle);
                     match action.cloned() {
+                        Some(action) if is_modifier_key(&handle) => {
+                            wirbel.modifier_action = Some(action);
+                            FilterResult::Forward
+                        }
                         Some(action) => {
                             wirbel.swallowed_keys.push(key);
                             FilterResult::Intercept(Some(action))
@@ -135,7 +167,42 @@ impl Wirbel {
             },
         );
         if let Some(Some(action)) = action {
+            if action.repeats() {
+                self.start_bind_repeat(action.clone());
+            }
             self.run_action(action);
+        }
+        if let Some(action) = self.modifier_action.take() {
+            self.run_action(action);
+        }
+    }
+
+    /// Runs `action` again while its key stays down. Every key event ends that.
+    fn start_bind_repeat(&mut self, action: Action) {
+        let (delay, rate) = (self.config.repeat_delay, self.config.repeat_rate);
+        if rate <= 0 {
+            return;
+        }
+        let interval = Duration::from_secs_f64(1.0 / f64::from(rate));
+        let timer = Timer::from_duration(Duration::from_millis(delay as u64));
+        let inserted = self.loop_handle.insert_source(timer, move |_, _, state| {
+            if state.lock.is_active() {
+                state.bind_repeat = None;
+                return TimeoutAction::Drop;
+            }
+            state.run_action(action.clone());
+            TimeoutAction::ToDuration(interval)
+        });
+        match inserted {
+            Ok(token) => self.bind_repeat = Some(token),
+            Err(err) => tracing::warn!(error = %err.error, "failed to repeat a bind"),
+        }
+    }
+
+    /// For anything that can end a key press without a release, like leaving the VT.
+    pub fn stop_bind_repeat(&mut self) {
+        if let Some(token) = self.bind_repeat.take() {
+            self.loop_handle.remove(token);
         }
     }
 
@@ -292,8 +359,39 @@ impl Wirbel {
         }
     }
 
+    /// A bound wheel never scrolls, but it acts only once per `axis_bind_timeout`: one notch of a
+    /// fine wheel or a swipe arrives as many events.
+    fn axis_bind(&mut self, scroll: &Scroll) -> bool {
+        let Some(direction) = scroll.direction() else {
+            return false;
+        };
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return false;
+        };
+        if self.lock.is_active() {
+            return false;
+        }
+        let modifiers = (&keyboard.modifier_state()).into();
+        let Some(action) = self.config.action_for_axis(modifiers, direction).cloned() else {
+            return false;
+        };
+        let timeout = Duration::from_millis(self.config.axis_bind_timeout as u64);
+        let now = Instant::now();
+        if self
+            .last_axis_bind
+            .is_none_or(|last| now.duration_since(last) >= timeout)
+        {
+            self.last_axis_bind = Some(now);
+            self.run_action(action);
+        }
+        true
+    }
+
     pub fn on_pointer_axis(&mut self, scroll: Scroll) {
         self.note_activity();
+        if self.axis_bind(&scroll) {
+            return;
+        }
         let mut frame = AxisFrame::new(scroll.time).source(scroll.source);
         for (axis, amount, discrete) in [
             (Axis::Horizontal, scroll.horizontal.0, scroll.horizontal.1),
@@ -344,6 +442,20 @@ impl Scroll {
             time,
             horizontal: (None, None),
             vertical: (None, None),
+        }
+    }
+
+    /// Where this scrolls to, up or down if it does both.
+    fn direction(&self) -> Option<Direction> {
+        let value = |(amount, v120): (Option<f64>, Option<f64>)| {
+            amount.or(v120).filter(|value| *value != 0.0)
+        };
+        match (value(self.vertical), value(self.horizontal)) {
+            (Some(value), _) if value < 0.0 => Some(Direction::Up),
+            (Some(_), _) => Some(Direction::Down),
+            (None, Some(value)) if value < 0.0 => Some(Direction::Left),
+            (None, Some(_)) => Some(Direction::Right),
+            (None, None) => None,
         }
     }
 

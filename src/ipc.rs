@@ -1,4 +1,4 @@
-//! The control socket behind `wirbel pos` and `wirbel move`.
+//! The control socket behind `wirbel pos`, `wirbel move` and `wirbel mmsg`.
 //!
 //! The protocol is line based, one request per line:
 //!
@@ -7,9 +7,12 @@
 //! - `move X Y` and `move-rel DX DY` answer with `ok` or `error MESSAGE`.
 //!
 //! A position line is `position X Y OUTPUT`, without `OUTPUT` if the pointer is on no output.
+//! - `tags` and `monitors` answer with one line of JSON, in the format of Mango's `mmsg`.
+//! - `watch-tags` and `watch-monitors` do so now and again whenever that line changes.
+//! - `workspace N`, `quit` and `reload` act like the bind and answer with `ok`.
 //!
-//! Nothing here may block the compositor. A client that stops reading only misses positions: its
-//! next line is the latest one, sent as soon as it reads again.
+//! Nothing here may block the compositor. A client that stops reading only misses lines: its next
+//! one is the latest one, sent as soon as it reads again.
 
 use std::{
     collections::HashMap,
@@ -27,7 +30,10 @@ use smithay::{
     reexports::calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic},
 };
 
-use crate::Wirbel;
+use crate::{
+    Wirbel,
+    config::{Action, WORKSPACES, WorkspaceTarget},
+};
 
 /// Longest request a client may send.
 const MAX_REQUEST: usize = 4096;
@@ -89,12 +95,92 @@ fn json_string(text: &str) -> String {
     json
 }
 
+/// What the bars of Mango want to know about an output.
+#[derive(Debug, Clone, PartialEq)]
+struct MonitorState {
+    name: String,
+    focused: bool,
+    area: (i32, i32, i32, i32),
+    scale: f64,
+    active_workspace: usize,
+    windows: [usize; WORKSPACES],
+}
+
+fn tags_json(monitor: &MonitorState) -> String {
+    let tags: Vec<String> = monitor
+        .windows
+        .iter()
+        .enumerate()
+        .map(|(index, windows)| {
+            let (number, active) = (index + 1, index == monitor.active_workspace);
+            format!(
+                r#"{{"index":{number},"is_active":{active},"is_urgent":false,"layout":"DW","client_count":{windows}}}"#
+            )
+        })
+        .collect();
+    tags.join(",")
+}
+
+fn all_tags_json(monitors: &[MonitorState]) -> String {
+    let monitors: Vec<String> = monitors
+        .iter()
+        .map(|monitor| {
+            let (name, tags) = (json_string(&monitor.name), tags_json(monitor));
+            format!(r#"{{"monitor":{name},"tags":[{tags}]}}"#)
+        })
+        .collect();
+    format!(r#"{{"all_tags":[{}]}}"#, monitors.join(","))
+}
+
+fn all_monitors_json(monitors: &[MonitorState]) -> String {
+    let monitors: Vec<String> = monitors
+        .iter()
+        .map(|monitor| {
+            let (name, tags) = (json_string(&monitor.name), tags_json(monitor));
+            let (active, scale) = (monitor.focused, monitor.scale);
+            let (x, y, width, height) = monitor.area;
+            format!(
+                r#"{{"name":{name},"active":{active},"x":{x},"y":{y},"width":{width},"height":{height},"scale":{scale},"layout_symbol":"DW","tags":[{tags}]}}"#
+            )
+        })
+        .collect();
+    format!(r#"{{"monitors":[{}]}}"#, monitors.join(","))
+}
+
+/// The two views of the workspaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Tags,
+    Monitors,
+}
+
+impl View {
+    fn render(self, monitors: &[MonitorState]) -> String {
+        match self {
+            Self::Tags => all_tags_json(monitors),
+            Self::Monitors => all_monitors_json(monitors),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Request {
     Position,
     Watch,
-    Move { x: f64, y: f64 },
-    MoveRelative { dx: f64, dy: f64 },
+    Move {
+        x: f64,
+        y: f64,
+    },
+    MoveRelative {
+        dx: f64,
+        dy: f64,
+    },
+    Get(View),
+    WatchView(View),
+    /// One-based.
+    Workspace(usize),
+    Quit,
+    Reload,
 }
 
 impl Request {
@@ -104,6 +190,13 @@ impl Request {
             Self::Watch => "watch".into(),
             Self::Move { x, y } => format!("move {x:?} {y:?}"),
             Self::MoveRelative { dx, dy } => format!("move-rel {dx:?} {dy:?}"),
+            Self::Get(View::Tags) => "tags".into(),
+            Self::Get(View::Monitors) => "monitors".into(),
+            Self::WatchView(View::Tags) => "watch-tags".into(),
+            Self::WatchView(View::Monitors) => "watch-monitors".into(),
+            Self::Workspace(number) => format!("workspace {number}"),
+            Self::Quit => "quit".into(),
+            Self::Reload => "reload".into(),
         }
     }
 
@@ -117,6 +210,21 @@ impl Request {
         match command {
             "position" => simple(Self::Position),
             "watch" => simple(Self::Watch),
+            "tags" => simple(Self::Get(View::Tags)),
+            "monitors" => simple(Self::Get(View::Monitors)),
+            "watch-tags" => simple(Self::WatchView(View::Tags)),
+            "watch-monitors" => simple(Self::WatchView(View::Monitors)),
+            "quit" => simple(Self::Quit),
+            "reload" => simple(Self::Reload),
+            "workspace" => {
+                let number = words.next().and_then(|word| word.parse().ok());
+                match number {
+                    Some(number @ 1..=WORKSPACES) if words.next().is_none() => {
+                        Ok(Self::Workspace(number))
+                    }
+                    _ => Err("expected a workspace from 1 to 9"),
+                }
+            }
             "move" | "move-rel" => {
                 let mut number = || {
                     let word = words.next().ok_or("expected two numbers")?;
@@ -151,6 +259,10 @@ struct Peer {
     /// Whether the client watches, and the last position it was given.
     watching: bool,
     last_position: Option<Position>,
+    /// The view of the workspaces this client watches.
+    view: Option<View>,
+    /// The line of that view to send once `output` is empty. Newer ones replace it.
+    next_view: Option<String>,
     /// Whether a source waits for the socket to take more data.
     waiting: bool,
 }
@@ -160,9 +272,13 @@ impl Peer {
     fn write_out(&mut self) -> io::Result<bool> {
         loop {
             if self.output.is_empty() {
-                match self.next_position.take() {
-                    Some(position) => queue_line(&mut self.output, &position.to_line()),
-                    None => return Ok(true),
+                match (self.next_position.take(), self.next_view.take()) {
+                    (Some(position), view) => {
+                        queue_line(&mut self.output, &position.to_line());
+                        self.next_view = view;
+                    }
+                    (None, Some(view)) => queue_line(&mut self.output, &view),
+                    (None, None) => return Ok(true),
                 }
             }
             match (&self.stream).write(&self.output) {
@@ -192,6 +308,8 @@ pub struct Ipc {
     path: Option<PathBuf>,
     peers: HashMap<u64, Peer>,
     next_id: u64,
+    /// What the watchers of the workspaces know.
+    monitors: Vec<MonitorState>,
 }
 
 impl Ipc {
@@ -202,6 +320,7 @@ impl Ipc {
             path: None,
             peers: HashMap::new(),
             next_id: 0,
+            monitors: Vec::new(),
         };
         match ipc.listen(wayland_display) {
             Ok(path) => {
@@ -273,6 +392,8 @@ impl Ipc {
                 next_position: None,
                 watching: false,
                 last_position: None,
+                view: None,
+                next_view: None,
                 waiting: false,
             },
         );
@@ -292,6 +413,20 @@ impl Ipc {
                 peer.next_position = Some(position.clone());
             }
             self.flush(id);
+        }
+    }
+
+    /// Tells everyone watching a view about a change.
+    fn publish_view(&mut self) {
+        let ids: Vec<u64> = self.peers.keys().copied().collect();
+        for id in ids {
+            let peer = self.peers.get_mut(&id);
+            if let Some(peer) = peer
+                && let Some(view) = peer.view
+            {
+                peer.next_view = Some(view.render(&self.monitors));
+                self.flush(id);
+            }
         }
     }
 
@@ -420,6 +555,61 @@ impl Wirbel {
             }
             Request::Move { x, y } => self.ipc_move(id, |_, _| (x, y)),
             Request::MoveRelative { dx, dy } => self.ipc_move(id, |x, y| (x + dx, y + dy)),
+            Request::Get(view) => {
+                let line = view.render(&self.monitor_states());
+                self.ipc.reply(id, &line);
+            }
+            Request::WatchView(view) => {
+                self.ipc.monitors = self.monitor_states();
+                if let Some(peer) = self.ipc.peers.get_mut(&id) {
+                    peer.view = Some(view);
+                    peer.next_view = Some(view.render(&self.ipc.monitors));
+                }
+                self.ipc.flush(id);
+            }
+            Request::Workspace(number) => {
+                let target = WorkspaceTarget::Index(number - 1);
+                self.run_action(Action::Workspace(target));
+                self.ipc.reply(id, "ok");
+            }
+            Request::Quit => {
+                self.ipc.reply(id, "ok");
+                self.run_action(Action::Quit);
+            }
+            Request::Reload => {
+                self.run_action(Action::Reload);
+                self.ipc.reply(id, "ok");
+            }
+        }
+    }
+
+    fn monitor_states(&self) -> Vec<MonitorState> {
+        self.monitors
+            .iter()
+            .enumerate()
+            .map(|(index, monitor)| {
+                let area = self.monitor_area(index);
+                MonitorState {
+                    name: monitor.output.name(),
+                    focused: index == self.active_monitor,
+                    area: area.map_or((0, 0, 0, 0), |area| (area.x, area.y, area.w, area.h)),
+                    scale: monitor.output.current_scale().fractional_scale(),
+                    active_workspace: monitor.active,
+                    windows: std::array::from_fn(|index| monitor.workspaces[index].windows().len()),
+                }
+            })
+            .collect()
+    }
+
+    /// Runs after every loop iteration. Looks only if somebody wants to know.
+    pub fn publish_workspaces(&mut self) {
+        if !self.ipc.peers.values().any(|peer| peer.view.is_some()) {
+            return;
+        }
+        let monitors = self.monitor_states();
+        if monitors != self.ipc.monitors {
+            self.ipc.monitors = monitors;
+            self.ipc.publish_view();
         }
     }
 
@@ -454,6 +644,13 @@ mod tests {
                 dx: 0.1 + 0.2,
                 dy: 1e-7,
             },
+            Request::Get(View::Tags),
+            Request::Get(View::Monitors),
+            Request::WatchView(View::Tags),
+            Request::WatchView(View::Monitors),
+            Request::Workspace(9),
+            Request::Quit,
+            Request::Reload,
         ] {
             assert_eq!(Request::parse(&request.to_line()), Ok(request));
         }
@@ -474,6 +671,11 @@ mod tests {
             "move-rel 1",
             "watch now",
             "position 1",
+            "workspace",
+            "workspace 0",
+            "workspace 10",
+            "workspace 1 2",
+            "quit now",
         ] {
             assert!(Request::parse(line).is_err(), "accepted {line:?}");
         }
@@ -483,6 +685,35 @@ mod tests {
     fn requests_accept_a_trailing_line_end() {
         assert_eq!(Request::parse("watch\n"), Ok(Request::Watch));
         assert_eq!(Request::parse("position\r\n"), Ok(Request::Position));
+    }
+
+    #[test]
+    fn views_have_the_format_of_mmsg() {
+        let monitors = [MonitorState {
+            name: "DP-4".into(),
+            focused: true,
+            area: (0, 0, 2560, 1440),
+            scale: 1.0,
+            active_workspace: 1,
+            windows: [2, 0, 0, 0, 0, 0, 0, 0, 0],
+        }];
+        let tags = all_tags_json(&monitors);
+        assert!(
+            tags.starts_with(
+                r#"{"all_tags":[{"monitor":"DP-4","tags":[{"index":1,"is_active":false,"is_urgent":false,"layout":"DW","client_count":2},{"index":2,"is_active":true,"#
+            ),
+            "{tags}"
+        );
+        assert!(tags.ends_with(
+            r#""index":9,"is_active":false,"is_urgent":false,"layout":"DW","client_count":0}]}]}"#
+        ));
+        let all = all_monitors_json(&monitors);
+        assert!(
+            all.starts_with(
+                r#"{"monitors":[{"name":"DP-4","active":true,"x":0,"y":0,"width":2560,"height":1440,"scale":1,"layout_symbol":"DW","tags":[{"index":1,"#
+            ),
+            "{all}"
+        );
     }
 
     #[test]

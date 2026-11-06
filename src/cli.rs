@@ -1,4 +1,4 @@
-//! The commands that talk to a running compositor: `wirbel pos` and `wirbel move`.
+//! The commands that talk to a running compositor: `wirbel pos`, `wirbel move`, `wirbel mmsg`.
 
 use std::{
     env,
@@ -7,13 +7,15 @@ use std::{
     time::Duration,
 };
 
-use crate::ipc::{Position, Request, socket_path};
+use crate::ipc::{Position, Request, View, socket_path};
 
 /// How long a single answer may take. A compositor that long away is stuck.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 
 const POS_USAGE: &str = "usage: wirbel pos [--once] [--json]";
 const MOVE_USAGE: &str = "usage: wirbel move [--rel] X Y";
+const MMSG_USAGE: &str =
+    "usage: mmsg get|watch all-tags|all-monitors, or mmsg dispatch view,N|quit|reload_config";
 
 fn connect() -> Result<UnixStream, String> {
     let display = env::var_os("WAYLAND_DISPLAY").ok_or("WAYLAND_DISPLAY is not set")?;
@@ -143,4 +145,55 @@ pub fn move_pointer(args: &[String]) -> Result<(), String> {
         Some(line) => Err(line.strip_prefix("error ").unwrap_or(line).to_string()),
         None => Err("the compositor went away".into()),
     }
+}
+
+/// The single line that answers `request`.
+fn ask(request: Request) -> Result<String, String> {
+    let mut reader = send(request)?;
+    let timeout = reader.get_ref().set_read_timeout(Some(ANSWER_TIMEOUT));
+    timeout.map_err(|err| format!("failed to set a timeout: {err}"))?;
+    read_line(&mut reader)?.ok_or("the compositor went away".to_string())
+}
+
+/// Stands in for the `mmsg` of Mango, for the bars written against it. What they do not ask for
+/// is refused, a caller sees that like a Mango that does not know the command.
+pub fn mmsg(args: &[String]) -> Result<(), String> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let view = |name| match name {
+        "all-tags" => Ok(View::Tags),
+        "all-monitors" => Ok(View::Monitors),
+        _ => Err(MMSG_USAGE.to_string()),
+    };
+    match args.as_slice() {
+        ["get", "version"] => println!(r#"{{"version":"wirbel"}}"#),
+        ["get", name] => {
+            let line = ask(Request::Get(view(name)?))?;
+            print_all(&format!("{line}\n")).map_err(|err| err.to_string())?;
+        }
+        ["watch", name] => {
+            let mut reader = send(Request::WatchView(view(name)?))?;
+            while let Some(line) = read_line(&mut reader)? {
+                if print_all(&format!("{line}\n")).is_err() {
+                    break;
+                }
+            }
+        }
+        ["dispatch", command] => {
+            let mut fields = command.split(',');
+            let request = match (fields.next(), fields.next()) {
+                (Some("quit"), None) => Request::Quit,
+                (Some("reload_config"), None) => Request::Reload,
+                (Some("view"), Some(number)) => {
+                    Request::Workspace(number.parse().map_err(|_| MMSG_USAGE)?)
+                }
+                _ => return Err(format!("{command} does not exist in wirbel")),
+            };
+            let answer = ask(request)?;
+            if answer != "ok" {
+                return Err(answer);
+            }
+        }
+        _ => return Err(MMSG_USAGE.into()),
+    }
+    Ok(())
 }

@@ -24,6 +24,7 @@ const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]... [--timeout SE
        wirbel check [CONFIG]
        wirbel pos [--once] [--json]
        wirbel move [--rel] X Y
+       wirbel mmsg ARGUMENTS
 
       --config FILE      read this file instead of ~/.config/wirbel/config
   -c, --command COMMAND  run a shell command inside the compositor (repeatable)
@@ -50,7 +51,10 @@ move sets the pointer, clamped to the outputs. It works like moving the mouse: a
 dragged follows it.
       --rel              X and Y are relative to the current position
 
-Both talk to the compositor of WAYLAND_DISPLAY.";
+mmsg answers what the bars of Mango ask of its `mmsg`: get or watch all-tags and all-monitors, dispatch
+view,N and quit and reload_config. Called as `mmsg` through a symbolic link it does the same.
+
+All three talk to the compositor of WAYLAND_DISPLAY.";
 
 #[derive(Debug, Default)]
 struct Options {
@@ -187,7 +191,7 @@ fn run(options: Options, kind: backend::Kind) -> Result<(), Box<dyn std::error::
 
     state.start_xwayland();
     tracing::info!(socket = ?state.socket_name, "compositor ready");
-    for command in &options.commands {
+    for command in options.commands.iter().chain(&state.config.exec_once) {
         state.spawn(command);
     }
 
@@ -197,13 +201,25 @@ fn run(options: Options, kind: backend::Kind) -> Result<(), Box<dyn std::error::
 }
 
 fn main() {
+    let called_as_mmsg = env::args_os()
+        .next()
+        .is_some_and(|name| Path::new(&name).file_name() == Some("mmsg".as_ref()));
+    if called_as_mmsg {
+        let args: Vec<String> = env::args().skip(1).collect();
+        if let Err(err) = wirbel::cli::mmsg(&args) {
+            eprintln!("mmsg: {err}");
+            process::exit(1);
+        }
+        return;
+    }
     let mut args = env::args().skip(1).peekable();
-    if let Some(command @ ("pos" | "move")) = args.peek().map(String::as_str) {
+    if let Some(command @ ("pos" | "move" | "mmsg")) = args.peek().map(String::as_str) {
         let command = command.to_string();
         args.next();
         let args: Vec<String> = args.collect();
         let result = match command.as_str() {
             "pos" => wirbel::cli::pos(&args),
+            "mmsg" => wirbel::cli::mmsg(&args),
             _ => wirbel::cli::move_pointer(&args),
         };
         if let Err(err) = result {

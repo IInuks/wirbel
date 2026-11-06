@@ -7207,3 +7207,344 @@ fn a_subsurface_moves_with_the_commit_of_its_parent() {
         assert!(entered, "desync: {desync}");
     }
 }
+
+const KEY_RIGHTSHIFT: u32 = 54;
+const KEY_RIGHTALT: u32 = 100; // AltGr on a German keyboard
+
+#[test]
+fn a_modifier_key_can_be_bound() {
+    let compositor = Compositor::start_with("bind = CTRL, Shift_R, workspace, 3\n");
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.take_input();
+
+    compositor.chord(&[KEY_LEFTSHIFT], KEY_RIGHTSHIFT);
+    assert_eq!(compositor.active_workspace(), 0, "Shift instead of Ctrl");
+    compositor.tap_key(KEY_RIGHTSHIFT);
+    assert_eq!(compositor.active_workspace(), 0, "no Ctrl held");
+
+    compositor.key(KEY_LEFTCTRL, KeyState::Pressed);
+    assert_eq!(compositor.active_workspace(), 0, "Ctrl alone");
+    compositor.tap_key(KEY_RIGHTSHIFT);
+    compositor.key(KEY_LEFTCTRL, KeyState::Released);
+    assert_eq!(compositor.active_workspace(), 2);
+}
+
+#[test]
+fn clients_see_a_bound_modifier_key_go_down_and_up() {
+    let compositor = Compositor::start_with("bind = CTRL, Shift_R, focus_next\n");
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.take_input();
+    compositor.chord(&[KEY_LEFTCTRL], KEY_RIGHTSHIFT);
+    let input = client.take_input();
+    for wanted in [
+        Input::Key(KEY_RIGHTSHIFT, wl_keyboard::KeyState::Pressed),
+        Input::Key(KEY_RIGHTSHIFT, wl_keyboard::KeyState::Released),
+    ] {
+        assert!(input.contains(&wanted), "{input:?}");
+    }
+}
+
+#[test]
+fn the_wheel_can_be_bound() {
+    let compositor = Compositor::start_with(
+        "axis_bind_apply_timeout = 0
+         axisbind = SUPER, UP, workspace, 2
+         axisbind = SUPER, DOWN, workspace, 3
+         axisbind = SUPER, LEFT, workspace, 4
+         axisbind = SUPER, RIGHT, workspace, 5\n",
+    );
+    let scroll = |horizontal: f64, vertical: f64| {
+        compositor.with(move |state| {
+            let mut scroll = Scroll::new(AxisSource::Wheel, InputTime::now());
+            scroll.set(Axis::Horizontal, Some(horizontal), None);
+            scroll.set(Axis::Vertical, Some(vertical), Some(vertical * 8.0));
+            state.on_pointer_axis(scroll);
+        });
+    };
+    scroll(0.0, -15.0);
+    assert_eq!(compositor.active_workspace(), 0, "no modifier held");
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    for (horizontal, vertical, workspace) in [
+        (0.0, -15.0, 1),
+        (0.0, 15.0, 2),
+        (-15.0, 0.0, 3),
+        (15.0, 0.0, 4),
+    ] {
+        scroll(horizontal, vertical);
+        assert_eq!(compositor.active_workspace(), workspace);
+    }
+}
+
+#[test]
+fn a_bound_wheel_does_not_scroll_and_acts_once_per_timeout() {
+    let compositor = Compositor::start_with(
+        "axis_bind_apply_timeout = 60000
+         axisbind = SUPER, DOWN, workspace, next\n",
+    );
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(RED);
+    client.draw(a, RED);
+    compositor.pointer_at(100.0, 100.0);
+    client.take_input();
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    for _ in 0..5 {
+        compositor.with(|state| {
+            let mut scroll = Scroll::new(AxisSource::Wheel, InputTime::now());
+            scroll.set(Axis::Vertical, Some(15.0), Some(120.0));
+            state.on_pointer_axis(scroll);
+        });
+    }
+    assert_eq!(compositor.active_workspace(), 1);
+    let input = client.take_input();
+    assert!(
+        !input.iter().any(|event| matches!(event, Input::Axis(..))),
+        "{input:?}"
+    );
+}
+
+#[test]
+fn a_locked_session_has_no_axis_binds() {
+    let compositor = Compositor::start_with("axisbind = SUPER, DOWN, workspace, next\n");
+    let mut locker = Client::connect(&compositor);
+    let _lock = locker.lock();
+    locker.sync();
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.with(|state| {
+        let mut scroll = Scroll::new(AxisSource::Wheel, InputTime::now());
+        scroll.set(Axis::Vertical, Some(15.0), Some(120.0));
+        state.on_pointer_axis(scroll);
+    });
+    assert_eq!(compositor.active_workspace(), 0);
+}
+
+#[test]
+fn used_workspaces_skip_the_empty_ones_and_stop_at_the_ends() {
+    let compositor = Compositor::start_with(
+        "bind = SUPER, Left, workspace, prev_used
+         bind = SUPER, Right, workspace, next_used
+         bind = SUPER, 4, workspace, 4
+         bind = SUPER+SHIFT, 7, move_to_workspace, 7\n",
+    );
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.open_window(GREEN);
+    compositor.chord(&[KEY_LEFTMETA, KEY_LEFTSHIFT], 8); // 7
+    assert_eq!(compositor.active_workspace(), 6);
+    compositor.chord(&[KEY_LEFTMETA], KEY_LEFT);
+    assert_eq!(compositor.active_workspace(), 0);
+    compositor.chord(&[KEY_LEFTMETA], KEY_LEFT);
+    assert_eq!(compositor.active_workspace(), 0, "no wrapping");
+    compositor.chord(&[KEY_LEFTMETA], KEY_RIGHT);
+    assert_eq!(compositor.active_workspace(), 6);
+    compositor.chord(&[KEY_LEFTMETA], KEY_RIGHT);
+    assert_eq!(compositor.active_workspace(), 6, "no wrapping");
+}
+
+const REPEATING: &str = "repeat_delay = 40
+    repeat_rate = 200
+    bind = SUPER, Right, workspace, next
+    bind = SUPER, Return, spawn, true
+    bind = SUPER, w, close\n";
+
+#[test]
+fn a_held_bind_repeats_until_its_key_goes_up() {
+    let compositor = Compositor::start_with(REPEATING);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.key(KEY_RIGHT, KeyState::Pressed);
+    assert_eq!(compositor.active_workspace(), 1, "at once on the press");
+    wait_for(|| compositor.active_workspace() >= 3);
+    compositor.key(KEY_RIGHT, KeyState::Released);
+    let stopped = compositor.active_workspace();
+    thread::sleep(Duration::from_millis(60));
+    assert_eq!(compositor.active_workspace(), stopped);
+    assert!(!compositor.with(|state| state.bind_repeat.is_some()));
+}
+
+#[test]
+fn releasing_the_modifier_ends_the_repeat_as_well() {
+    let compositor = Compositor::start_with(REPEATING);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.key(KEY_RIGHT, KeyState::Pressed);
+    compositor.key(KEY_LEFTMETA, KeyState::Released);
+    thread::sleep(Duration::from_millis(90));
+    assert_eq!(compositor.active_workspace(), 1);
+    compositor.key(KEY_RIGHT, KeyState::Released);
+}
+
+#[test]
+fn the_repeat_waits_for_the_delay() {
+    let compositor = Compositor::start_with(
+        "repeat_delay = 60000
+         bind = SUPER, Right, workspace, next\n",
+    );
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.key(KEY_RIGHT, KeyState::Pressed);
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(compositor.active_workspace(), 1);
+}
+
+#[test]
+fn holding_a_bind_that_is_no_step_runs_it_once() {
+    let compositor = Compositor::start_with(REPEATING);
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.open_window(GREEN);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.key(KEY_W, KeyState::Pressed);
+    assert!(!compositor.with(|state| state.bind_repeat.is_some()));
+    thread::sleep(Duration::from_millis(70));
+    client.sync();
+    assert_eq!(client.state.closed.len(), 1);
+}
+
+#[test]
+fn a_lock_ends_the_repeat() {
+    let compositor = Compositor::start_with(REPEATING);
+    let mut locker = Client::connect(&compositor);
+    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
+    compositor.key(KEY_RIGHT, KeyState::Pressed);
+    let _lock = locker.lock();
+    locker.sync();
+    let locked = compositor.active_workspace();
+    thread::sleep(Duration::from_millis(70));
+    assert_eq!(compositor.active_workspace(), locked);
+}
+
+#[test]
+fn altgr_reaches_the_client_and_fires_no_bind() {
+    // ALT, q closes the window by default. AltGr+Q is the @ of a German keyboard.
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(RED);
+    client.take_input();
+    compositor.chord(&[KEY_RIGHTALT], KEY_Q);
+    let input = client.take_input();
+    for wanted in [
+        Input::Key(KEY_RIGHTALT, wl_keyboard::KeyState::Pressed),
+        Input::Key(KEY_Q, wl_keyboard::KeyState::Pressed),
+        Input::Key(KEY_Q, wl_keyboard::KeyState::Released),
+        Input::Key(KEY_RIGHTALT, wl_keyboard::KeyState::Released),
+    ] {
+        assert!(input.contains(&wanted), "{input:?}");
+    }
+    client.sync();
+    assert!(client.state.closed.is_empty());
+}
+
+#[test]
+fn altgr_keeps_binds_of_the_plain_key_out_of_it() {
+    let compositor = Compositor::start_with("bind = SUPER, 2, workspace, 2\n");
+    compositor.chord(&[KEY_LEFTMETA, KEY_RIGHTALT], KEY_2);
+    assert_eq!(compositor.active_workspace(), 0);
+}
+
+#[test]
+fn altgr_can_be_part_of_a_bind() {
+    let compositor = Compositor::start_with(
+        "bind = ALTGR, q, workspace, 2
+         bind = SUPER+ALTGR, a, workspace, 3\n",
+    );
+    compositor.chord(&[KEY_RIGHTALT], KEY_Q);
+    assert_eq!(compositor.active_workspace(), 1);
+    compositor.chord(&[KEY_LEFTMETA, KEY_RIGHTALT], KEY_A);
+    assert_eq!(compositor.active_workspace(), 2);
+}
+
+#[test]
+fn a_symbol_behind_altgr_can_be_bound_by_that_modifier() {
+    let compositor = Compositor::start_with("bind = ALTGR, at, workspace, 2\n");
+    compositor.chord(&[KEY_RIGHTALT], KEY_Q);
+    assert_eq!(compositor.active_workspace(), 1);
+}
+
+#[test]
+fn exec_once_keeps_its_command_as_written() {
+    let (config, errors) = Config::parse("exec-once=touch a b, c=d\nexec-once = x &\n");
+    assert_eq!(errors, []);
+    assert_eq!(config.exec_once, ["touch a b, c=d", "x &"]);
+    let (_, errors) = Config::parse("exec-once =\n");
+    assert_eq!(errors.len(), 1);
+}
+
+#[test]
+fn mango_lines_for_binds_work_as_they_are() {
+    let (config, errors) = Config::parse(
+        "bind=CTRL,Shift_R,spawn,qs -p /a/menu ipc call wizard blob
+         axisbind=SUPER,UP,workspace,prev_used\n",
+    );
+    assert_eq!(errors, []);
+    assert_eq!(config.binds.len(), 2, "plus the quit bind");
+    assert_eq!(config.axis_binds.len(), 1);
+}
+
+fn ipc_lines(compositor: &Compositor, request: &str) -> BufReader<UnixStream> {
+    let socket = compositor.with(|state| state.socket_name.clone());
+    let path = wirbel::ipc::socket_path(socket.as_ref()).unwrap();
+    let mut stream = UnixStream::connect(path).unwrap();
+    writeln!(stream, "{request}").unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    BufReader::new(stream)
+}
+
+fn next_line(reader: &mut BufReader<UnixStream>) -> String {
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    line
+}
+
+#[test]
+fn bars_can_follow_the_workspaces() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let mut tags = ipc_lines(&compositor, "watch-tags");
+    let first = next_line(&mut tags);
+    assert!(
+        first.contains(
+            r#""index":1,"is_active":true,"is_urgent":false,"layout":"DW","client_count":0"#
+        ),
+        "{first}"
+    );
+
+    client.open_window(RED);
+    let opened = next_line(&mut tags);
+    assert!(
+        opened.contains(
+            r#""index":1,"is_active":true,"is_urgent":false,"layout":"DW","client_count":1"#
+        ),
+        "{opened}"
+    );
+
+    let mut answer = ipc_lines(&compositor, "workspace 3");
+    assert_eq!(next_line(&mut answer), "ok\n");
+    let moved = next_line(&mut tags);
+    assert!(moved.contains(r#""index":3,"is_active":true"#), "{moved}");
+    assert!(
+        moved.contains(
+            r#""index":1,"is_active":false,"is_urgent":false,"layout":"DW","client_count":1"#
+        ),
+        "{moved}"
+    );
+}
+
+#[test]
+fn bars_can_ask_for_the_monitors() {
+    let compositor = Compositor::start();
+    let mut monitors = ipc_lines(&compositor, "monitors");
+    let line = next_line(&mut monitors);
+    assert!(
+        line.starts_with(r#"{"monitors":[{"name":"test","active":true,"x":0,"y":0,"#),
+        "{line}"
+    );
+}
+
+#[test]
+fn a_bar_can_end_the_session() {
+    let mut compositor = Compositor::start();
+    let mut quit = ipc_lines(&compositor, "quit");
+    assert_eq!(next_line(&mut quit), "ok\n");
+    compositor.thread.take().unwrap().join().unwrap();
+}

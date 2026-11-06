@@ -27,6 +27,8 @@ pub struct Modifiers {
     pub alt: bool,
     pub shift: bool,
     pub logo: bool,
+    /// AltGr on most layouts. It picks characters, so without it in a bind it must not match.
+    pub altgr: bool,
 }
 
 impl From<&ModifiersState> for Modifiers {
@@ -36,7 +38,24 @@ impl From<&ModifiersState> for Modifiers {
             alt: state.alt,
             shift: state.shift,
             logo: state.logo,
+            altgr: state.iso_level3_shift,
         }
+    }
+}
+
+impl Modifiers {
+    /// Without what `key` contributes itself. In the state a press reports, a modifier key already
+    /// counts as held.
+    fn without_key(mut self, key: Keysym) -> Self {
+        match key {
+            Keysym::Shift_L | Keysym::Shift_R => self.shift = false,
+            Keysym::Control_L | Keysym::Control_R => self.ctrl = false,
+            Keysym::Alt_L | Keysym::Alt_R | Keysym::Meta_L | Keysym::Meta_R => self.alt = false,
+            Keysym::Super_L | Keysym::Super_R => self.logo = false,
+            Keysym::ISO_Level3_Shift => self.altgr = false,
+            _ => {}
+        }
+        self
     }
 }
 
@@ -46,6 +65,9 @@ pub enum WorkspaceTarget {
     Index(usize),
     Previous,
     Next,
+    /// The nearest one with windows in that direction, stopping at the first and the last.
+    PreviousUsed,
+    NextUsed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +93,29 @@ pub enum Action {
     ChangeVt(i32),
 }
 
+impl Action {
+    /// Whether holding the key repeats this. Only for steps. Holding Super+Return is no reason for
+    /// a dozen terminals, nor Super+W for an empty workspace.
+    pub fn repeats(&self) -> bool {
+        matches!(
+            self,
+            Self::Focus(_)
+                | Self::FocusNext
+                | Self::FocusPrevious
+                | Self::Swap(_)
+                | Self::SplitRatio(_)
+                | Self::FocusOutput(_)
+                | Self::MoveToOutput(_)
+                | Self::Workspace(
+                    WorkspaceTarget::Previous
+                        | WorkspaceTarget::Next
+                        | WorkspaceTarget::PreviousUsed
+                        | WorkspaceTarget::NextUsed
+                )
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseAction {
     Move,
@@ -81,6 +126,14 @@ pub enum MouseAction {
 pub struct Bind {
     pub modifiers: Modifiers,
     pub key: Keysym,
+    pub action: Action,
+}
+
+/// What the wheel does while `modifiers` are held. `direction` is where it scrolls to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AxisBind {
+    pub modifiers: Modifiers,
+    pub direction: Direction,
     pub action: Action,
 }
 
@@ -134,6 +187,11 @@ pub struct Config {
     pub monitor_rules: Vec<MonitorRule>,
     pub binds: Vec<Bind>,
     pub mouse_binds: Vec<MouseBind>,
+    pub axis_binds: Vec<AxisBind>,
+    /// Least time between two runs of an axis bind, in milliseconds.
+    pub axis_bind_timeout: i32,
+    /// Shell commands to run once when the compositor starts, not on a reload.
+    pub exec_once: Vec<String>,
 }
 
 /// A line of the configuration that could not be used.
@@ -188,6 +246,9 @@ impl Config {
             monitor_rules: Vec::new(),
             binds: Vec::new(),
             mouse_binds: Vec::new(),
+            axis_binds: Vec::new(),
+            axis_bind_timeout: 0,
+            exec_once: Vec::new(),
         }
     }
 
@@ -287,6 +348,10 @@ impl Config {
             "monitorrule" => self.monitor_rules.push(parse_monitor_rule(value)?),
             "bind" => self.binds.push(parse_bind(value)?),
             "mousebind" => self.mouse_binds.push(parse_mouse_bind(value)?),
+            "axisbind" => self.axis_binds.push(parse_axis_bind(value)?),
+            "axis_bind_apply_timeout" => self.axis_bind_timeout = parse_size(value)?,
+            "exec-once" if value.is_empty() => return Err("exec-once needs a command".into()),
+            "exec-once" => self.exec_once.push(value.to_string()),
             other => return Err(format!("unknown option `{other}`")),
         }
         Ok(())
@@ -310,7 +375,7 @@ impl Config {
 
     /// The action bound to a key press. Keys match by the symbol they produce with the active
     /// modifiers or by their unshifted symbol, so `SUPER+SHIFT, 1` does not depend on what the
-    /// layout puts on Shift+1.
+    /// layout puts on Shift+1. A modifier key can be the key of a bind: `CTRL, Shift_R`.
     pub fn action_for_key(
         &self,
         modifiers: Modifiers,
@@ -321,9 +386,18 @@ impl Config {
         self.binds
             .iter()
             .find(|bind| {
-                bind.modifiers == modifiers
-                    && (produced.contains(&bind.key) || raw.contains(&bind.key))
+                (produced.contains(&bind.key) || raw.contains(&bind.key))
+                    && (bind.modifiers == modifiers
+                        || bind.modifiers == modifiers.without_key(bind.key))
             })
+            .map(|bind| &bind.action)
+    }
+
+    /// The action of a wheel step to `direction`.
+    pub fn action_for_axis(&self, modifiers: Modifiers, direction: Direction) -> Option<&Action> {
+        self.axis_binds
+            .iter()
+            .find(|bind| bind.modifiers == modifiers && bind.direction == direction)
             .map(|bind| &bind.action)
     }
 
@@ -380,6 +454,7 @@ fn parse_modifiers(value: &str) -> Result<Modifiers, String> {
             "ctrl" | "control" => modifiers.ctrl = true,
             "alt" | "mod1" => modifiers.alt = true,
             "shift" => modifiers.shift = true,
+            "altgr" | "mod5" => modifiers.altgr = true,
             "none" => {}
             _ => return Err(format!("unknown modifier `{name}`")),
         }
@@ -438,6 +513,8 @@ fn parse_action(name: &str, argument: &str) -> Result<Action, String> {
             return Ok(Action::Workspace(match argument {
                 "prev" => WorkspaceTarget::Previous,
                 "next" => WorkspaceTarget::Next,
+                "prev_used" => WorkspaceTarget::PreviousUsed,
+                "next_used" => WorkspaceTarget::NextUsed,
                 _ => WorkspaceTarget::Index(parse_workspace(argument)?),
             }));
         }
@@ -476,6 +553,20 @@ fn parse_bind(value: &str) -> Result<Bind, String> {
     Ok(Bind {
         modifiers: parse_modifiers(modifiers)?,
         key: parse_key(key)?,
+        action: parse_action(action, fields.next().unwrap_or(""))?,
+    })
+}
+
+fn parse_axis_bind(value: &str) -> Result<AxisBind, String> {
+    let mut fields = value.splitn(4, ',').map(str::trim);
+    let (Some(modifiers), Some(direction), Some(action)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        return Err("expected `axisbind = MODIFIERS, DIRECTION, ACTION[, ARGUMENT]`".into());
+    };
+    Ok(AxisBind {
+        modifiers: parse_modifiers(modifiers)?,
+        direction: parse_direction(&direction.to_ascii_lowercase())?,
         action: parse_action(action, fields.next().unwrap_or(""))?,
     })
 }
@@ -562,6 +653,7 @@ mod tests {
         alt: false,
         shift: false,
         logo: true,
+        altgr: false,
     };
 
     fn parse_clean(text: &str) -> Config {
@@ -729,7 +821,8 @@ mod tests {
                 ctrl: true,
                 alt: true,
                 shift: true,
-                logo: true
+                logo: true,
+                altgr: false,
             }
         );
     }
