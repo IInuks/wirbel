@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     config::WORKSPACES,
-    ipc::{Position, Request, View, socket_path},
+    ipc::{Position, Request, View, parse_step, socket_path},
 };
 
 /// How long a single answer may take. A compositor that long away is stuck.
@@ -23,7 +23,9 @@ const DISTANCE_USAGE: &str = "usage: wirbel distance [SECONDS|loop] [DECIMALS|ma
 const MOVE_USAGE: &str = "usage: wirbel move [--rel] X Y [SECONDS]";
 /// How often a slow `wirbel move` sets the pointer, more often than any screen shows a frame.
 const MOVE_STEP: Duration = Duration::from_millis(4);
-const WS_USAGE: &str = "usage: wirbel ws N, with N from 1 to 9";
+const WS_USAGE: &str = "usage: wirbel ws N|next|prev|next_used|prev_used, with N from 1 to 9";
+const OUTDATED: &str =
+    "the running wirbel is older than this command, log out and in again to update it";
 const CLICK_USAGE: &str = "usage: wirbel click [COUNT|loop] [SECONDS]";
 /// Between the clicks of `wirbel click COUNT`, if nobody says.
 const DEFAULT_CLICK_GAP: Duration = Duration::from_secs(1);
@@ -384,6 +386,13 @@ pub fn workspace(args: &[String]) -> Result<(), String> {
     let [number] = args else {
         return Err(WS_USAGE.into());
     };
+    if let Some(target) = parse_step(number) {
+        // A wirbel from before these words takes them for a bad number.
+        return match command(Request::WorkspaceStep(target)) {
+            Err(err) if err.starts_with("expected a workspace") => Err(OUTDATED.into()),
+            result => result,
+        };
+    }
     match number.parse() {
         Ok(number @ 1..=WORKSPACES) => command(Request::Workspace(number)),
         _ => Err(WS_USAGE.into()),
@@ -409,10 +418,7 @@ fn command(request: Request) -> Result<(), String> {
 fn check_answer(line: &str) -> Result<(), String> {
     match line {
         "ok" => Ok(()),
-        "error unknown request" => Err(
-            "the running wirbel is older than this command, log out and in again to update it"
-                .into(),
-        ),
+        "error unknown request" => Err(OUTDATED.into()),
         line => Err(line.strip_prefix("error ").unwrap_or(line).to_string()),
     }
 }

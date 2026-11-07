@@ -11,7 +11,8 @@
 //! A position line is `position X Y OUTPUT`, without `OUTPUT` if the pointer is on no output.
 //! - `tags` and `monitors` answer with one line of JSON, in the format of Mango's `mmsg`.
 //! - `watch-tags` and `watch-monitors` do so now and again whenever that line changes.
-//! - `workspace N`, `quit` and `reload` act like the bind and answer with `ok`.
+//! - `workspace N`, `workspace next|prev|next_used|prev_used`, `quit` and `reload` act like the
+//!   bind and answer with `ok`.
 //!
 //! Nothing here may block the compositor. A client that stops reading only misses lines: its next
 //! one is the latest one, sent as soon as it reads again.
@@ -191,6 +192,8 @@ pub enum Request {
     WatchView(View),
     /// One-based.
     Workspace(usize),
+    /// One of the relative targets, never `Index`: that is `Workspace`.
+    WorkspaceStep(WorkspaceTarget),
     Quit,
     Reload,
 }
@@ -208,6 +211,7 @@ impl Request {
             Self::WatchView(View::Tags) => "watch-tags".into(),
             Self::WatchView(View::Monitors) => "watch-monitors".into(),
             Self::Workspace(number) => format!("workspace {number}"),
+            Self::WorkspaceStep(target) => format!("workspace {}", step_name(target)),
             Self::Quit => "quit".into(),
             Self::Reload => "reload".into(),
         }
@@ -231,11 +235,15 @@ impl Request {
             "quit" => simple(Self::Quit),
             "reload" => simple(Self::Reload),
             "workspace" => {
-                let number = words.next().and_then(|word| word.parse().ok());
-                match number {
-                    Some(number @ 1..=WORKSPACES) if words.next().is_none() => {
-                        Ok(Self::Workspace(number))
-                    }
+                let word = words.next().unwrap_or_default();
+                if words.next().is_some() {
+                    return Err("expected a workspace from 1 to 9");
+                }
+                if let Some(target) = parse_step(word) {
+                    return Ok(Self::WorkspaceStep(target));
+                }
+                match word.parse() {
+                    Ok(number @ 1..=WORKSPACES) => Ok(Self::Workspace(number)),
                     _ => Err("expected a workspace from 1 to 9"),
                 }
             }
@@ -259,6 +267,28 @@ impl Request {
             }
             _ => Err("unknown request"),
         }
+    }
+}
+
+/// The words of the config for the relative workspaces.
+pub fn parse_step(word: &str) -> Option<WorkspaceTarget> {
+    Some(match word {
+        "next" => WorkspaceTarget::Next,
+        "prev" => WorkspaceTarget::Previous,
+        "next_used" => WorkspaceTarget::NextUsed,
+        "prev_used" => WorkspaceTarget::PreviousUsed,
+        _ => return None,
+    })
+}
+
+fn step_name(target: WorkspaceTarget) -> &'static str {
+    match target {
+        WorkspaceTarget::Next => "next",
+        WorkspaceTarget::Previous => "prev",
+        WorkspaceTarget::NextUsed => "next_used",
+        WorkspaceTarget::PreviousUsed => "prev_used",
+        // Has no name, `Request::Workspace` is for it.
+        WorkspaceTarget::Index(_) => "none",
     }
 }
 
@@ -588,6 +618,10 @@ impl Wirbel {
                 self.run_action(Action::Workspace(target));
                 self.ipc.reply(id, "ok");
             }
+            Request::WorkspaceStep(target) => {
+                self.run_action(Action::Workspace(target));
+                self.ipc.reply(id, "ok");
+            }
             Request::Quit => {
                 self.ipc.reply(id, "ok");
                 self.run_action(Action::Quit);
@@ -698,6 +732,10 @@ mod tests {
             Request::WatchView(View::Tags),
             Request::WatchView(View::Monitors),
             Request::Workspace(9),
+            Request::WorkspaceStep(WorkspaceTarget::Next),
+            Request::WorkspaceStep(WorkspaceTarget::Previous),
+            Request::WorkspaceStep(WorkspaceTarget::NextUsed),
+            Request::WorkspaceStep(WorkspaceTarget::PreviousUsed),
             Request::Quit,
             Request::Reload,
         ] {
@@ -725,6 +763,9 @@ mod tests {
             "workspace 0",
             "workspace 10",
             "workspace 1 2",
+            "workspace next 2",
+            "workspace none",
+            "workspace last",
             "quit now",
         ] {
             assert!(Request::parse(line).is_err(), "accepted {line:?}");

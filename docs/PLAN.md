@@ -49,7 +49,8 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
   `loop` oder ohne Argument hält eine Zeile aktuell wie `pos`. Dahinter `0` bis `17` oder `max` wie bei
   `pos`. Summiert im CLI aus dem `watch`-Abo, hin und zurück zählt also doppelt, und wer nicht mitliest, kürzt
   Kurven ab. Ein gesperrter Zeiger (Spiele) bewegt sich nicht und zählt nicht.
-- `wirbel ws N` wechselt wie der Bind auf Workspace N (1 bis 9) des Ausgangs mit dem Zeiger.
+- `wirbel ws N` wechselt wie der Bind auf Workspace N (1 bis 9) des Ausgangs mit dem Zeiger, `next`/`prev`
+  reihum, `next_used`/`prev_used` zum nächsten mit Fenstern, wie die gleichnamigen Bind-Argumente.
 - `wirbel pos`, `distance`, `move`, `click` und `ws` sprechen den Compositor von `WAYLAND_DISPLAY` an, aus Programmen
   in wirbel also von selbst den richtigen. Ohne Compositor: Exit 1 und Meldung auf stderr.
 - Gesperrt (`ext-session-lock`) gibt es nur noch die Lock-Surfaces: Der Bildschirm zeigt nichts sonst,

@@ -26,7 +26,7 @@ const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]... [--timeout SE
        wirbel distance [SECONDS|loop] [DECIMALS|max]
        wirbel move [--rel] X Y [SECONDS]
        wirbel click [COUNT|loop] [SECONDS]
-       wirbel ws N
+       wirbel ws N|next|prev|next_used|prev_used
        wirbel mmsg ARGUMENTS
 
       --config FILE      read this file instead of ~/.config/wirbel/config
@@ -74,6 +74,8 @@ the pointer gets the focus. If that is not the terminal, Ctrl+C there has to wai
       ... SECONDS        after one of these: the time between clicks, default 1, such as 2 or 0.5
 
 ws switches to workspace N, 1 to 9, on the output with the pointer.
+      next, prev         the one after or before, from 9 on to 1 and back
+      next_used, prev_used  the nearest one with windows that way, stops at 1 and 9
 
 mmsg answers what the bars of Mango ask of its `mmsg`: get or watch all-tags and all-monitors, dispatch
 view,N and quit and reload_config. Called as `mmsg` through a symbolic link it does the same.
