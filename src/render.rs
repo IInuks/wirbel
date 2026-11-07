@@ -183,6 +183,8 @@ impl Wirbel {
             }
             return elements;
         }
+        let lines = self.line_elements(renderer, origin, scale);
+        elements.extend(lines.into_iter().map(SceneElement::Cursor));
 
         let tiers = self
             .monitor_of_output(output)
@@ -194,27 +196,34 @@ impl Wirbel {
                 continue;
             };
             let location = location - window.geometry().loc;
+            // What plugins did to it moves the picture, window and border alike, and nothing else.
+            let effect = self.plugin_state.effect(window).unwrap_or_default();
+            let shift = Point::<i32, Logical>::from((
+                effect.offset.0.round() as i32,
+                effect.offset.1.round() as i32,
+            ));
+            let alpha = effect.opacity;
             match self.overflow_clip(window, location) {
                 None => {
-                    let location = (location - origin).to_physical_precise_round(scale);
-                    elements.extend(window.render_elements(renderer, location, scale, 1.0));
+                    let location = (location + shift - origin).to_physical_precise_round(scale);
+                    elements.extend(window.render_elements(renderer, location, scale, alpha));
                 }
                 Some(clip) => {
-                    let clip = Rectangle::new(clip.loc - origin, clip.size);
-                    let at = location - origin;
-                    elements.extend(self.clipped_window(renderer, window, at, clip, scale));
+                    let clip = Rectangle::new(clip.loc + shift - origin, clip.size);
+                    let at = location + shift - origin;
+                    elements.extend(self.clipped_window(renderer, window, at, clip, scale, alpha));
                 }
             }
 
             let border = self.borders.iter().find(|(owner, _)| owner == window);
             let edges = border.into_iter().flat_map(|(_, edges)| edges);
             elements.extend(edges.map(|edge| {
-                let location = (edge.location - origin).to_physical_precise_round(scale);
+                let location = (edge.location + shift - origin).to_physical_precise_round(scale);
                 SceneElement::Solid(SolidColorRenderElement::from_buffer(
                     &edge.buffer,
                     location,
                     scale,
-                    1.0,
+                    alpha,
                     Kind::Unspecified,
                 ))
             }));
@@ -253,6 +262,7 @@ impl Wirbel {
         location: Point<i32, Logical>,
         clip: Rectangle<i32, Logical>,
         scale: Scale<f64>,
+        alpha: f32,
     ) -> Vec<SceneElement<R>>
     where
         R: Renderer + ImportAll + ImportMem,
@@ -269,7 +279,7 @@ impl Wirbel {
                 popup.wl_surface(),
                 (location + offset).to_physical_precise_round(scale),
                 scale,
-                1.0,
+                alpha,
                 Kind::Unspecified,
             ));
         }
@@ -279,7 +289,7 @@ impl Wirbel {
             &surface,
             location.to_physical_precise_round::<_, i32>(scale),
             scale,
-            1.0,
+            alpha,
             Kind::Unspecified,
         );
         elements.extend(tree.into_iter().filter_map(|element| {

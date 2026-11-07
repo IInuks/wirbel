@@ -100,6 +100,24 @@ fn announce(
     }
 }
 
+/// The title and app id of a window, empty where it has none. X11 windows give their class.
+pub(crate) fn window_names(window: &Window) -> (String, String) {
+    if let Some(toplevel) = window.toplevel() {
+        return with_states(toplevel.wl_surface(), |states| {
+            let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() else {
+                return Default::default();
+            };
+            let data = data.lock().unwrap();
+            let title = data.title.clone().unwrap_or_default();
+            (title, data.app_id.clone().unwrap_or_default())
+        });
+    }
+    match window.x11_surface() {
+        Some(surface) => (surface.title(), surface.class()),
+        None => Default::default(),
+    }
+}
+
 impl Wirbel {
     fn foreign_info(&self, window: &Window) -> Info {
         let mut info = Info {
@@ -112,21 +130,13 @@ impl Wirbel {
                 .map(|monitor| monitor.output.clone()),
             ..Info::default()
         };
+        (info.title, info.app_id) = window_names(window);
         if let Some(toplevel) = window.toplevel() {
-            with_states(toplevel.wl_surface(), |states| {
-                if let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() {
-                    let data = data.lock().unwrap();
-                    info.title = data.title.clone().unwrap_or_default();
-                    info.app_id = data.app_id.clone().unwrap_or_default();
-                }
-            });
             info.parent = toplevel
                 .parent()
                 .and_then(|parent| self.find_window(&parent));
         }
         if let Some(surface) = window.x11_surface() {
-            info.title = surface.title();
-            info.app_id = surface.class();
             info.parent = surface.is_transient_for().and_then(|parent| {
                 let mut windows = self.listed_windows().into_iter();
                 windows.find(|window| {
@@ -140,7 +150,7 @@ impl Wirbel {
     }
 
     /// Windows with something on the screen, those on hidden workspaces too.
-    fn listed_windows(&self) -> Vec<Window> {
+    pub(crate) fn listed_windows(&self) -> Vec<Window> {
         let workspaces = self.monitors.iter().flat_map(|monitor| &monitor.workspaces);
         workspaces
             .flat_map(|workspace| workspace.windows())

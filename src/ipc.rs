@@ -11,8 +11,9 @@
 //! A position line is `position X Y OUTPUT`, without `OUTPUT` if the pointer is on no output.
 //! - `tags` and `monitors` answer with one line of JSON, in the format of Mango's `mmsg`.
 //! - `watch-tags` and `watch-monitors` do so now and again whenever that line changes.
-//! - `workspace N`, `workspace next|prev|next_used|prev_used`, `quit` and `reload` act like the
+//! - `workspace N`, `workspace next|prev|next_used|prev_used`, `quit`, `restart` and `reload` act like the
 //!   bind and answer with `ok`.
+//! - What plugins ask for, see `plugin_api`.
 //!
 //! Nothing here may block the compositor. A client that stops reading only misses lines: its next
 //! one is the latest one, sent as soon as it reads again.
@@ -41,6 +42,7 @@ use smithay::{
 use crate::{
     Wirbel,
     config::{Action, BTN_LEFT, WORKSPACES, WorkspaceTarget},
+    plugin_api::PluginRequest,
 };
 
 /// Longest request a client may send.
@@ -91,7 +93,7 @@ impl Position {
     }
 }
 
-fn json_string(text: &str) -> String {
+pub(crate) fn json_string(text: &str) -> String {
     let mut json = String::from("\"");
     for c in text.chars() {
         match c {
@@ -195,6 +197,7 @@ pub enum Request {
     /// One of the relative targets, never `Index`: that is `Workspace`.
     WorkspaceStep(WorkspaceTarget),
     Quit,
+    Restart,
     Reload,
 }
 
@@ -213,6 +216,7 @@ impl Request {
             Self::Workspace(number) => format!("workspace {number}"),
             Self::WorkspaceStep(target) => format!("workspace {}", step_name(target)),
             Self::Quit => "quit".into(),
+            Self::Restart => "restart".into(),
             Self::Reload => "reload".into(),
         }
     }
@@ -233,6 +237,7 @@ impl Request {
             "watch-tags" => simple(Self::WatchView(View::Tags)),
             "watch-monitors" => simple(Self::WatchView(View::Monitors)),
             "quit" => simple(Self::Quit),
+            "restart" => simple(Self::Restart),
             "reload" => simple(Self::Reload),
             "workspace" => {
                 let word = words.next().unwrap_or_default();
@@ -309,6 +314,8 @@ struct Peer {
     next_view: Option<String>,
     /// Whether a source waits for the socket to take more data.
     waiting: bool,
+    /// Whether the client gets the `event` lines of `plugin_api`.
+    events: bool,
 }
 
 impl Peer {
@@ -440,6 +447,7 @@ impl Ipc {
                 view: None,
                 next_view: None,
                 waiting: false,
+                events: false,
             },
         );
     }
@@ -475,7 +483,7 @@ impl Ipc {
         }
     }
 
-    fn reply(&mut self, id: u64, line: &str) {
+    pub(crate) fn reply(&mut self, id: u64, line: &str) {
         let Some(peer) = self.peers.get_mut(&id) else {
             return;
         };
@@ -530,6 +538,34 @@ impl Ipc {
         }
     }
 
+    /// The socket, if there is one.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub(crate) fn subscribe(&mut self, id: u64) {
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.events = true;
+        }
+    }
+
+    pub(crate) fn has_subscribers(&self) -> bool {
+        self.peers.values().any(|peer| peer.events)
+    }
+
+    /// Sends a line to every subscriber.
+    pub(crate) fn send_event(&mut self, line: &str) {
+        let ids: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.events)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.reply(id, line);
+        }
+    }
+
     pub fn client_count(&self) -> usize {
         self.peers.len()
     }
@@ -560,6 +596,7 @@ impl Wirbel {
         match (&peer.stream).read(&mut buffer) {
             Ok(0) => {
                 self.ipc.peers.remove(&id);
+                self.forget_peer(id);
                 return PostAction::Remove;
             }
             Ok(count) => peer.input.extend_from_slice(&buffer[..count]),
@@ -567,13 +604,18 @@ impl Wirbel {
             Err(err) if err.kind() == io::ErrorKind::Interrupted => return PostAction::Continue,
             Err(_) => {
                 self.ipc.peers.remove(&id);
+                self.forget_peer(id);
                 return PostAction::Remove;
             }
         }
         while let Some(line) = self.ipc.next_line(id) {
             match Request::parse(&line) {
                 Ok(request) => self.handle_request(id, request),
-                Err(err) => self.ipc.reply(id, &format!("error {err}")),
+                Err(err) => match PluginRequest::parse(&line) {
+                    Some(Ok(request)) => self.handle_plugin_request(id, request),
+                    Some(Err(err)) => self.ipc.reply(id, &format!("error {err}")),
+                    None => self.ipc.reply(id, &format!("error {err}")),
+                },
             }
         }
         if let Some(peer) = self.ipc.peers.get_mut(&id)
@@ -625,6 +667,10 @@ impl Wirbel {
             Request::Quit => {
                 self.ipc.reply(id, "ok");
                 self.run_action(Action::Quit);
+            }
+            Request::Restart => {
+                self.ipc.reply(id, "ok");
+                self.run_action(Action::Restart);
             }
             Request::Reload => {
                 self.run_action(Action::Reload);
@@ -737,6 +783,7 @@ mod tests {
             Request::WorkspaceStep(WorkspaceTarget::NextUsed),
             Request::WorkspaceStep(WorkspaceTarget::PreviousUsed),
             Request::Quit,
+            Request::Restart,
             Request::Reload,
         ] {
             assert_eq!(Request::parse(&request.to_line()), Ok(request));
@@ -767,6 +814,7 @@ mod tests {
             "workspace none",
             "workspace last",
             "quit now",
+            "restart now",
         ] {
             assert!(Request::parse(line).is_err(), "accepted {line:?}");
         }

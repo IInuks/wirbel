@@ -86,6 +86,8 @@ use crate::{
     handlers::{ForeignToplevelState, ScreencopyState, SessionLock},
     ipc::{Ipc, Position},
     layout::Rect,
+    plugin::PluginHost,
+    plugin_api::PluginState,
     render::{LayerEntry, LayerPart, LayerTiers},
     safety::{self, Chord},
     stats::Stats,
@@ -242,11 +244,19 @@ pub struct Wirbel {
     pub last_press: Serial,
     /// Whether the left button is down, by hand or by `wirbel click`.
     pub left_held: bool,
+    /// Buttons and lines of the plugins, see `crate::plugin_input`.
+    pub plugin_input: crate::plugin_input::PluginInput,
     pub ipc: Ipc,
+    /// The plugins that run, see `crate::plugin`.
+    pub plugins: PluginHost,
+    /// What they did to the windows, see `crate::plugin_api`.
+    pub plugin_state: PluginState,
     /// Asks the renderer whether it can use a dmabuf. Set by a backend that offers dmabufs.
     pub import_dmabuf: Box<dyn FnMut(&Dmabuf) -> bool>,
 
     pub needs_redraw: bool,
+    /// Set by `restart`: once the loop stopped, the session starts again.
+    pub restart: bool,
     pub stats: Stats,
     /// Asks the backend for a new frame. Set by the backend.
     pub redraw: Box<dyn Fn()>,
@@ -354,10 +364,14 @@ impl Wirbel {
             urgent: Vec::new(),
             last_press: Serial::from(0),
             left_held: false,
+            plugin_input: Default::default(),
             ipc,
+            plugins: PluginHost::default(),
+            plugin_state: PluginState::default(),
             import_dmabuf: Box::new(|_| false),
 
             needs_redraw: true,
+            restart: false,
             stats: Stats::default(),
             redraw: Box::new(|| {}),
             change_vt: None,
@@ -415,6 +429,7 @@ impl Wirbel {
         self.update_idle_inhibit();
         self.refresh_foreign_toplevels();
         self.publish_workspaces();
+        self.plugin_housekeeping();
         if std::mem::take(&mut self.needs_redraw) {
             (self.redraw)();
         }
@@ -465,7 +480,12 @@ impl Wirbel {
         child
             .args(["-c", command])
             .env("WAYLAND_DISPLAY", &self.socket_name)
+            .env_remove(safety::SESSION_ENV)
             .stdin(Stdio::null());
+        // So that `wirbel plug` in a terminal edits the config this compositor reads.
+        if let Some(config) = &self.config_path {
+            child.env("WIRBEL_CONFIG", config);
+        }
         // Programs start at home, not in whatever folder wirbel itself was started from.
         if let Some(home) = env::var_os("HOME").filter(|h| Path::new(h).is_dir()) {
             child.current_dir(home);
@@ -528,6 +548,7 @@ impl Wirbel {
         keyboard.change_repeat_info(config.repeat_rate, config.repeat_delay);
         self.config = config;
         self.retile();
+        self.sync_plugins();
         tracing::info!("configuration reloaded");
     }
 
@@ -966,10 +987,16 @@ impl Wirbel {
             })
     }
 
-    fn update_borders(&mut self) {
+    pub(crate) fn update_borders(&mut self) {
         self.borders.clear();
         for frame in self.frames.iter().filter(|frame| frame.has_border) {
-            let color = if self.focused.as_ref() == Some(&frame.window) {
+            let own = self
+                .plugin_state
+                .effect(&frame.window)
+                .and_then(|effect| effect.border);
+            let color = if let Some(color) = own {
+                color
+            } else if self.focused.as_ref() == Some(&frame.window) {
                 self.config.focus_color
             } else {
                 self.config.border_color

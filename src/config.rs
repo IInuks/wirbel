@@ -10,7 +10,10 @@ use smithay::input::keyboard::{
     xkb::{self, KEYSYM_CASE_INSENSITIVE, KEYSYM_NO_FLAGS},
 };
 
-use crate::layout::{Direction, Gaps};
+use crate::{
+    layout::{Direction, Gaps},
+    plugin::PluginEntry,
+};
 
 const DEFAULTS: &str = include_str!("default.conf");
 
@@ -75,6 +78,8 @@ pub enum Action {
     Spawn(String),
     Close,
     Quit,
+    /// Ends the session and starts it again, as a logout and login would.
+    Restart,
     Reload,
     Focus(Direction),
     FocusNext,
@@ -194,6 +199,8 @@ pub struct Config {
     pub axis_bind_timeout: i32,
     /// Shell commands to run once when the compositor starts, not on a reload.
     pub exec_once: Vec<String>,
+    /// Programs that run with the session and change it from outside, see `crate::plugin`.
+    pub plugins: Vec<PluginEntry>,
 }
 
 /// A line of the configuration that could not be used.
@@ -252,6 +259,7 @@ impl Config {
             axis_binds: Vec::new(),
             axis_bind_timeout: 0,
             exec_once: Vec::new(),
+            plugins: Vec::new(),
         }
     }
 
@@ -356,6 +364,18 @@ impl Config {
             "axis_bind_apply_timeout" => self.axis_bind_timeout = parse_size(value)?,
             "exec-once" if value.is_empty() => return Err("exec-once needs a command".into()),
             "exec-once" => self.exec_once.push(value.to_string()),
+            "plugin" => {
+                let entry = PluginEntry::parse(value)?;
+                let (location, name) = (entry.location(), entry.name.as_deref());
+                let twice = self.plugins.iter().find(|other| {
+                    other.location() == location
+                        || (name.is_some() && other.name.as_deref() == name)
+                });
+                if let Some(other) = twice {
+                    return Err(format!("plugin {} is in the config twice", other.label()));
+                }
+                self.plugins.push(entry);
+            }
             other => return Err(format!("unknown option `{other}`")),
         }
         Ok(())
@@ -420,7 +440,7 @@ fn parse_size(value: &str) -> Result<i32, String> {
         .map_err(|_| format!("expected a number from 0 to 65535, got `{value}`"))
 }
 
-fn parse_bool(value: &str) -> Result<bool, String> {
+pub(crate) fn parse_bool(value: &str) -> Result<bool, String> {
     match value {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
@@ -429,7 +449,7 @@ fn parse_bool(value: &str) -> Result<bool, String> {
 }
 
 /// Returns premultiplied RGBA, which is what the renderer wants.
-fn parse_color(value: &str) -> Result<[f32; 4], String> {
+pub(crate) fn parse_color(value: &str) -> Result<[f32; 4], String> {
     let error = || format!("expected a colour like 0xRRGGBB, got `{value}`");
     let digits = value
         .strip_prefix("0x")
@@ -450,7 +470,7 @@ fn parse_color(value: &str) -> Result<[f32; 4], String> {
     ])
 }
 
-fn parse_modifiers(value: &str) -> Result<Modifiers, String> {
+pub(crate) fn parse_modifiers(value: &str) -> Result<Modifiers, String> {
     let mut modifiers = Modifiers::default();
     for name in value.split('+').map(str::trim) {
         match name.to_ascii_lowercase().as_str() {
@@ -504,7 +524,7 @@ fn parse_workspace(value: &str) -> Result<usize, String> {
     }
 }
 
-fn parse_action(name: &str, argument: &str) -> Result<Action, String> {
+pub(crate) fn parse_action(name: &str, argument: &str) -> Result<Action, String> {
     let action = match name {
         "spawn" if argument.is_empty() => return Err("spawn needs a command".into()),
         "spawn" => return Ok(Action::Spawn(argument.to_string())),
@@ -532,6 +552,7 @@ fn parse_action(name: &str, argument: &str) -> Result<Action, String> {
         }
         "close" => Action::Close,
         "quit" => Action::Quit,
+        "restart" => Action::Restart,
         "reload" => Action::Reload,
         "focus_next" => Action::FocusNext,
         "focus_prev" => Action::FocusPrevious,
@@ -627,6 +648,15 @@ fn parse_monitor_rule(value: &str) -> Result<MonitorRule, String> {
     Ok(rule)
 }
 
+pub(crate) fn parse_button(button: &str) -> Result<u32, String> {
+    match button {
+        "btn_left" => Ok(BTN_LEFT),
+        "btn_right" => Ok(BTN_RIGHT),
+        "btn_middle" => Ok(BTN_MIDDLE),
+        _ => Err(format!("unknown button `{button}`")),
+    }
+}
+
 fn parse_mouse_bind(value: &str) -> Result<MouseBind, String> {
     let fields: Vec<&str> = value.split(',').map(str::trim).collect();
     let &[modifiers, button, action] = fields.as_slice() else {
@@ -634,12 +664,7 @@ fn parse_mouse_bind(value: &str) -> Result<MouseBind, String> {
     };
     Ok(MouseBind {
         modifiers: parse_modifiers(modifiers)?,
-        button: match button {
-            "btn_left" => BTN_LEFT,
-            "btn_right" => BTN_RIGHT,
-            "btn_middle" => BTN_MIDDLE,
-            _ => return Err(format!("unknown button `{button}`")),
-        },
+        button: parse_button(button)?,
         action: match action {
             "move" => MouseAction::Move,
             "resize" => MouseAction::Resize,
@@ -677,10 +702,18 @@ mod tests {
     /// `setup.sh` builds a configuration from these two files.
     #[test]
     fn the_template_of_setup_sh_has_only_valid_lines() {
-        let text = concat!(include_str!("default.conf"), include_str!("../session/config.extra"));
+        let text = concat!(
+            include_str!("default.conf"),
+            include_str!("../session/config.extra")
+        );
         let (config, errors) = Config::parse(text);
         assert!(errors.is_empty(), "{errors:?}");
-        assert!(config.binds.iter().any(|bind| bind.action == Action::Spawn("fuzzel".into())));
+        assert!(
+            config
+                .binds
+                .iter()
+                .any(|bind| bind.action == Action::Spawn("fuzzel".into()))
+        );
     }
 
     #[test]
@@ -786,6 +819,7 @@ mod tests {
         let cases = [
             ("close", Action::Close),
             ("quit", Action::Quit),
+            ("restart", Action::Restart),
             ("reload", Action::Reload),
             ("focus, left", Action::Focus(Direction::Left)),
             ("focus_next", Action::FocusNext),

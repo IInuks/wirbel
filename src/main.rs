@@ -17,7 +17,7 @@ use smithay::reexports::{
 use wirbel::{
     Wirbel, backend,
     config::Config,
-    safety::{self, CHORD_NAME, EXIT_EMERGENCY, HEARTBEAT, Watchdog},
+    safety::{self, CHORD_NAME, EXIT_EMERGENCY, EXIT_RESTART, HEARTBEAT, SESSION_ENV, Watchdog},
 };
 
 const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]... [--timeout SECONDS] [--log FILE]
@@ -27,7 +27,9 @@ const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]... [--timeout SE
        wirbel move [--rel] X Y [SECONDS]
        wirbel click [COUNT|loop] [SECONDS]
        wirbel ws N|next|prev|next_used|prev_used
+       wirbel restart
        wirbel mmsg ARGUMENTS
+       wirbel plug [list | add PATH [NAME] | remove PLUGIN | PLUGIN true|false | define PLUGIN [NAME]]
 
       --config FILE      read this file instead of ~/.config/wirbel/config
   -c, --command COMMAND  run a shell command inside the compositor (repeatable)
@@ -77,8 +79,22 @@ ws switches to workspace N, 1 to 9, on the output with the pointer.
       next, prev         the one after or before, from 9 on to 1 and back
       next_used, prev_used  the nearest one with windows that way, stops at 1 and 9
 
+restart ends the session and starts it again, as if you logged out and in: all programs close,
+the autostart and the plugins start anew, under wirbel-session also D-Bus, PipeWire and the portals.
+Windows do not survive it. The bind action for it is `restart`.
+
 mmsg answers what the bars of Mango ask of its `mmsg`: get or watch all-tags and all-monitors, dispatch
 view,N and quit and reload_config. Called as `mmsg` through a symbolic link it does the same.
+
+plug manages plugins: programs that start with wirbel and change it through its socket, see
+docs/PLUGINS.md. PLUGIN is the path of one or the name it was given.
+      list               show them: on or off, the name if there is one, the path, if it runs
+      add PATH [NAME]    add an executable file, or a folder with an executable `run`, switched on
+      remove PLUGIN      take it out of the config
+      PLUGIN true|false  switch it on or off
+      define PLUGIN NAME give it a name to use instead of the path, without NAME take it away
+The changes go to the config as `plugin = PATH[, NAME][, true|false]` lines, which can be written by
+hand as well, and a running wirbel reloads it.
 
 All of these talk to the compositor of WAYLAND_DISPLAY.";
 
@@ -174,7 +190,8 @@ fn arm_failures(event_loop: &EventLoop<'static, Wirbel>, options: &Options) {
     }
 }
 
-fn run(options: Options, kind: backend::Kind) -> Result<(), Box<dyn std::error::Error>> {
+/// Runs the compositor. True means it ended for a restart.
+fn run(options: Options, kind: backend::Kind) -> Result<bool, Box<dyn std::error::Error>> {
     let mut event_loop = EventLoop::try_new()?;
     let display = Display::new()?;
     let config_path = options.config_path.clone().or_else(Config::default_path);
@@ -220,11 +237,24 @@ fn run(options: Options, kind: backend::Kind) -> Result<(), Box<dyn std::error::
     for command in options.commands.iter().chain(&state.config.exec_once) {
         state.autostart(command);
     }
+    state.sync_plugins();
 
     event_loop.run(None, &mut state, Wirbel::after_dispatch)?;
     safety::end_autostart();
     tracing::info!("stopped");
-    Ok(())
+    Ok(state.restart)
+}
+
+/// Starts wirbel again in place of this process, after everything of this one is closed. The name
+/// it was started by finds the newest binary, as a login would.
+fn restart_in_place() -> ! {
+    use std::os::unix::process::CommandExt;
+    let mut args = env::args_os();
+    let program = args.next().unwrap_or_else(|| "wirbel".into());
+    safety::restore_stderr();
+    let err = process::Command::new(&program).args(args).exec();
+    safety::say(&format!("wirbel: restart failed: {err}\n"));
+    process::exit(1);
 }
 
 fn main() {
@@ -240,8 +270,9 @@ fn main() {
         return;
     }
     let mut args = env::args().skip(1).peekable();
-    if let Some(command @ ("pos" | "distance" | "move" | "click" | "ws" | "mmsg")) =
-        args.peek().map(String::as_str)
+    if let Some(
+        command @ ("pos" | "distance" | "move" | "click" | "ws" | "mmsg" | "plug" | "restart"),
+    ) = args.peek().map(String::as_str)
     {
         let command = command.to_string();
         args.next();
@@ -252,6 +283,8 @@ fn main() {
             "click" => wirbel::cli::click(&args),
             "ws" => wirbel::cli::workspace(&args),
             "mmsg" => wirbel::cli::mmsg(&args),
+            "plug" => wirbel::plugin::plug(&args),
+            "restart" => wirbel::cli::restart(&args),
             _ => wirbel::cli::move_pointer(&args),
         };
         if let Err(err) = result {
@@ -303,9 +336,15 @@ fn main() {
 
     let result = run(options, kind);
     safety::restore_terminal();
-    if let Err(err) = result {
-        tracing::error!(%err, "wirbel failed");
-        safety::say(&format!("wirbel: {err}\n"));
-        process::exit(1);
+    match result {
+        Err(err) => {
+            tracing::error!(%err, "wirbel failed");
+            safety::say(&format!("wirbel: {err}\n"));
+            process::exit(1);
+        }
+        // wirbel-session starts the whole session again, its bus and portals too.
+        Ok(true) if env::var_os(SESSION_ENV).is_some() => process::exit(EXIT_RESTART),
+        Ok(true) => restart_in_place(),
+        Ok(false) => {}
     }
 }

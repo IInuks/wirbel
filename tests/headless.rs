@@ -4172,6 +4172,33 @@ fn ws_switches_the_workspace() {
     assert_eq!(active(&compositor), 8);
     compositor.run(&["ws", "1"]);
     assert_eq!(active(&compositor), 0);
+
+    compositor.run(&["ws", "next"]);
+    assert_eq!(active(&compositor), 1);
+    compositor.run(&["ws", "prev"]);
+    compositor.run(&["ws", "prev"]);
+    assert_eq!(active(&compositor), 8);
+    compositor.run(&["ws", "next"]);
+    assert_eq!(active(&compositor), 0);
+}
+
+#[test]
+fn ws_next_used_skips_empty_workspaces() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let active = |compositor: &Compositor| compositor.with(|state| state.monitors[0].active);
+    client.open_window(0x00ff_0000);
+    compositor.run(&["ws", "5"]);
+    client.open_window(0x0000_ff00);
+    compositor.run(&["ws", "3"]);
+
+    compositor.run(&["ws", "next_used"]);
+    assert_eq!(active(&compositor), 4);
+    // Nothing further on: it stays.
+    compositor.run(&["ws", "next_used"]);
+    assert_eq!(active(&compositor), 4);
+    compositor.run(&["ws", "prev_used"]);
+    assert_eq!(active(&compositor), 0);
 }
 
 #[test]
@@ -4182,7 +4209,8 @@ fn bad_command_lines_are_refused() {
         &["ws"][..],
         &["ws", "0"],
         &["ws", "10"],
-        &["ws", "next"],
+        &["ws", "last"],
+        &["ws", "next", "2"],
         &["ws", "1", "2"],
         &["click", "0"],
         &["click", "-1"],
@@ -8260,4 +8288,530 @@ fn nothing_stays_behind_when_windows_and_clients_go() {
         assert!(state.borders.is_empty());
         assert_eq!(state.space.elements().count(), 0);
     });
+}
+
+// Plugins: what they ask for on the socket, and `wirbel plug`.
+
+/// Waits until `done` holds, or fails the test.
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(start.elapsed() < ANSWER, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn first_window_id(ipc: &mut RawIpc) -> u64 {
+    let windows = ipc.request("windows");
+    let start = windows.find(r#""id":"#).expect("no window") + 5;
+    let digits: String = windows[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().unwrap()
+}
+
+#[test]
+fn plugins_list_windows_as_json() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let mut ipc = compositor.raw_ipc();
+    assert_eq!(ipc.request("windows"), "[]");
+    client.open_window(0x00ff_0000);
+    let id = first_window_id(&mut ipc);
+    assert_eq!(
+        ipc.request("windows"),
+        format!(
+            r#"[{{"id":{id},"app_id":"","title":"","output":"test","workspace":1,"focused":true,"floating":false,"visible":true,"x":14,"y":14,"width":972,"height":572}}]"#
+        )
+    );
+}
+
+#[test]
+fn subscribers_hear_about_windows_focus_and_workspaces() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let mut events = compositor.raw_ipc();
+    assert_eq!(events.request("subscribe"), "ok");
+
+    client.open_window(0x00ff_0000);
+    let mut ipc = compositor.raw_ipc();
+    let id = first_window_id(&mut ipc);
+    assert_eq!(events.line(), format!("event open {id} -"));
+    assert_eq!(events.line(), format!("event focus {id}"));
+
+    compositor.run(&["ws", "2"]);
+    assert_eq!(events.line(), "event focus none");
+    assert_eq!(events.line(), "event workspace test 2");
+    compositor.run(&["ws", "1"]);
+    assert_eq!(events.line(), format!("event focus {id}"));
+    assert_eq!(events.line(), "event workspace test 1");
+
+    client.sync();
+    client.close(0);
+    assert_eq!(events.line(), format!("event close {id}"));
+    assert_eq!(events.line(), "event focus none");
+}
+
+#[test]
+fn effects_move_fade_and_colour_a_window_until_the_plugin_leaves() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(0x00ff_0000);
+    let background = rgb(Config::default().background_color);
+    let focus = rgb(Config::default().focus_color);
+    let shot = compositor.screenshot();
+    assert_eq!(shot.at(14, 300), 0xff_0000);
+    assert_eq!(shot.at(11, 300), focus);
+
+    let mut plugin = compositor.raw_ipc();
+    let id = first_window_id(&mut plugin);
+    assert_eq!(plugin.request(&format!("offset {id} 100 0")), "ok");
+    let shot = compositor.screenshot();
+    assert_eq!(shot.at(14, 300), background, "the window moved away");
+    assert_eq!(shot.at(111, 300), focus, "its border moved along");
+    assert_eq!(shot.at(114, 300), 0xff_0000, "and is drawn further right");
+
+    assert_eq!(plugin.request("border focused 0x00ff00"), "ok");
+    assert_eq!(compositor.screenshot().at(111, 300), 0x00_ff00);
+    // Only the border shows it here: pixman draws a buffer without alpha with `Src`, so a window
+    // of the test client turns black instead of see-through. GL blends it.
+    assert_eq!(plugin.request(&format!("opacity {id} 0")), "ok");
+    assert_eq!(compositor.screenshot().at(111, 300), background);
+    let opacity = compositor.with(|state| {
+        let window = state.focused.clone().unwrap();
+        state.plugin_state.effect(&window).unwrap().opacity
+    });
+    assert_eq!(opacity, 0.0);
+
+    // The input stays where the layout put it.
+    compositor.pointer_at(50.0, 300.0);
+    assert!(compositor.with(|state| state.window_at((50.0, 300.0).into()).is_some()));
+
+    assert_eq!(plugin.request("offset 999 1 1"), "error no window 999");
+    assert_eq!(plugin.request(&format!("reset {id}")), "ok");
+    assert_eq!(compositor.screenshot().at(14, 300), 0xff_0000);
+
+    assert_eq!(plugin.request(&format!("offset {id} 0 100")), "ok");
+    assert_eq!(compositor.screenshot().at(300, 50), background);
+    drop(plugin);
+    wait_until("the effects to go with their connection", || {
+        compositor.screenshot().at(300, 50) == 0xff_0000
+    });
+}
+
+#[test]
+fn effects_of_two_plugins_add_up() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(0x00ff_0000);
+    let (mut one, mut two) = (compositor.raw_ipc(), compositor.raw_ipc());
+    assert_eq!(one.request("offset focused 50 0"), "ok");
+    assert_eq!(two.request("offset focused 50 0"), "ok");
+    let shot = compositor.screenshot();
+    assert_eq!(shot.at(109, 300), rgb(Config::default().background_color));
+    assert_eq!(shot.at(110, 300), rgb(Config::default().focus_color));
+    assert_eq!(shot.at(114, 300), 0xff_0000);
+    assert_eq!(two.request("reset all"), "ok");
+    assert_eq!(compositor.screenshot().at(64, 300), 0xff_0000);
+}
+
+#[test]
+fn plugins_dispatch_bind_actions() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(0x00ff_0000);
+    let mut ipc = compositor.raw_ipc();
+    assert_eq!(ipc.request("dispatch move_to_workspace 3"), "ok");
+    assert_eq!(
+        compositor.with(|state| state.monitors[0].workspaces[2].windows().len()),
+        1
+    );
+    assert_eq!(ipc.request("dispatch workspace 3"), "ok");
+    assert_eq!(compositor.active_workspace(), 2);
+    assert_eq!(
+        ipc.request("dispatch explode"),
+        "error unknown action `explode`"
+    );
+    assert_eq!(
+        ipc.request("opacity 1 2"),
+        "error opacity goes from 0 to 1, got 2"
+    );
+}
+
+/// A config file and a plugin script for the `wirbel plug` tests. The script notes that it ran,
+/// then waits to be stopped.
+struct PlugSetup {
+    folder: PathBuf,
+    config: PathBuf,
+    plugin: PathBuf,
+    marker: PathBuf,
+}
+
+impl PlugSetup {
+    fn new(name: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = scratch_path(name);
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).unwrap();
+        let config = folder.join("config");
+        fs::write(&config, "# mine\nsloppy_focus = 0\n").unwrap();
+        let plugin = folder.join("marker.sh");
+        let marker = folder.join("ran");
+        fs::write(
+            &plugin,
+            format!(
+                "#!/bin/sh\necho \"$WIRBEL_PLUGIN $WIRBEL_SOCKET\" > '{}'\nexec sleep 60\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&plugin, fs::Permissions::from_mode(0o755)).unwrap();
+        Self {
+            folder,
+            config,
+            plugin,
+            marker,
+        }
+    }
+
+    fn plug(&self, compositor: &Compositor, args: &[&str]) -> String {
+        let output = compositor
+            .cli(&[&["plug"], args].concat())
+            .env("WIRBEL_CONFIG", &self.config)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn plug_failing(&self, compositor: &Compositor, args: &[&str]) -> String {
+        let output = compositor
+            .cli(&[&["plug"], args].concat())
+            .env("WIRBEL_CONFIG", &self.config)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        String::from_utf8(output.stderr).unwrap()
+    }
+
+    fn running(&self, compositor: &Compositor) -> bool {
+        let plugin = self.plugin.clone();
+        compositor.with(move |state| state.plugins.running().any(|path| path == plugin))
+    }
+}
+
+impl Drop for PlugSetup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.folder);
+    }
+}
+
+#[test]
+fn wirbel_plug_edits_the_config_and_starts_and_stops_plugins() {
+    let setup = PlugSetup::new("plug");
+    let compositor = Compositor::start();
+    let config = setup.config.clone();
+    compositor.with(move |state| state.config_path = Some(config));
+    let path = setup.plugin.to_str().unwrap();
+
+    assert!(setup.plug(&compositor, &["list"]).starts_with("no plugins"));
+    assert_eq!(
+        setup.plug(&compositor, &["add", path]),
+        format!("added {path}, on\n")
+    );
+    wait_until("the plugin to start", || setup.marker.exists());
+    assert!(setup.running(&compositor));
+    let ran = fs::read_to_string(&setup.marker).unwrap();
+    assert!(ran.starts_with(&format!("{path} ")), "{ran}");
+    assert!(ran.trim_end().ends_with(".sock"), "{ran}");
+    assert_eq!(
+        setup.plug(&compositor, &["list"]),
+        format!("on   {path}  running\n")
+    );
+
+    setup.plug(&compositor, &["define", path, "marker"]);
+    assert_eq!(
+        setup.plug(&compositor, &["list"]),
+        format!("on   marker  {path}  running\n")
+    );
+    assert!(
+        setup
+            .plug_failing(&compositor, &["add", path])
+            .contains("added already")
+    );
+    assert!(
+        setup
+            .plug_failing(&compositor, &["define", "marker", "true"])
+            .contains("cannot be a name")
+    );
+    assert!(
+        setup
+            .plug_failing(&compositor, &["nothing", "true"])
+            .contains("no plugin nothing")
+    );
+
+    assert_eq!(
+        setup.plug(&compositor, &["marker", "false"]),
+        "marker is off\n"
+    );
+    wait_until("the plugin to stop", || !setup.running(&compositor));
+    assert_eq!(
+        setup.plug(&compositor, &["list"]),
+        format!("off  marker  {path}\n")
+    );
+    assert_eq!(
+        fs::read_to_string(&setup.config).unwrap(),
+        format!("# mine\nsloppy_focus = 0\nplugin = {path}, marker, false\n")
+    );
+
+    fs::remove_file(&setup.marker).unwrap();
+    setup.plug(&compositor, &[path, "on"]);
+    wait_until("the plugin to start again", || setup.marker.exists());
+    setup.plug(&compositor, &["define", "marker"]);
+    assert_eq!(
+        setup.plug(&compositor, &["remove", path]),
+        format!("removed {path}\n")
+    );
+    wait_until("the plugin to stop for good", || {
+        !setup.running(&compositor)
+    });
+    assert_eq!(
+        fs::read_to_string(&setup.config).unwrap(),
+        "# mine\nsloppy_focus = 0\n"
+    );
+}
+
+#[test]
+fn wirbel_plug_refuses_what_cannot_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let setup = PlugSetup::new("plug-refuse");
+    let compositor = Compositor::start();
+    fs::set_permissions(&setup.plugin, fs::Permissions::from_mode(0o644)).unwrap();
+    let path = setup.plugin.to_str().unwrap();
+    assert!(
+        setup
+            .plug_failing(&compositor, &["add", path])
+            .contains("chmod +x")
+    );
+    assert!(
+        setup
+            .plug_failing(&compositor, &["add", "/does/not/exist"])
+            .contains("No such file")
+    );
+    assert!(
+        setup
+            .plug_failing(&compositor, &["frobnicate"])
+            .contains("usage")
+    );
+    assert_eq!(
+        fs::read_to_string(&setup.config).unwrap(),
+        "# mine\nsloppy_focus = 0\n"
+    );
+}
+
+#[test]
+fn wirbel_restart_ends_the_compositor_for_the_session_to_start_again() {
+    let compositor = Compositor::start();
+    let socket = compositor.ipc_path();
+    assert_eq!(compositor.run(&["restart"]), "");
+    // The loop stopped and took everything with it. What comes next is up to main or the script.
+    wait_until("the compositor to stop", || !socket.exists());
+    assert!(
+        compositor
+            .run_failing(&["restart", "now"])
+            .contains("usage")
+    );
+}
+
+const CTRL_ALT: &[u32] = &[KEY_LEFTCTRL, KEY_LEFTALT];
+const KEY_ESC: u32 = 1;
+
+fn hold(compositor: &Compositor, keys: &[u32], key_state: KeyState) {
+    for key in keys {
+        compositor.key(*key, key_state);
+    }
+}
+
+/// A plugin connection that took Ctrl+Alt+left, with events on it.
+fn grabbing_plugin(compositor: &Compositor) -> RawIpc {
+    let mut plugin = compositor.raw_ipc();
+    assert_eq!(plugin.request("grab ctrl+alt btn_left"), "ok");
+    plugin
+}
+
+/// A closed connection is noticed in its own time.
+fn wait_until_plugin_input_unused(compositor: &Compositor) {
+    for _ in 0..500 {
+        if !compositor.with(|state| state.plugin_input.in_use()) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    panic!("the grabs and lines of a closed connection stay");
+}
+
+/// Moves to `from`, presses, moves to `to` in a few steps and lets go.
+fn stroke(compositor: &Compositor, from: (f64, f64), to: (f64, f64)) {
+    compositor.pointer_at(from.0, from.1);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    for step in 1..=4 {
+        let t = f64::from(step) / 4.0;
+        compositor.pointer_at(from.0 + t * (to.0 - from.0), from.1 + t * (to.1 - from.1));
+    }
+    compositor.button(BTN_LEFT, ButtonState::Released);
+}
+
+#[test]
+fn a_grab_takes_the_button_for_a_whole_session_until_the_modifiers_go_up() {
+    let (compositor, mut client, _, _) = two_windows();
+    let mut plugin = grabbing_plugin(&compositor);
+    hold(&compositor, CTRL_ALT, KeyState::Pressed);
+    client.sync();
+    client.take_input();
+    stroke(&compositor, (100.0, 100.0), (300.0, 300.0));
+    stroke(&compositor, (300.0, 100.0), (100.0, 300.0));
+    hold(&compositor, CTRL_ALT, KeyState::Released);
+
+    let mut lines = vec![plugin.line()];
+    while lines.last().unwrap().starts_with("event grab") && !lines.last().unwrap().contains("end")
+    {
+        lines.push(plugin.line());
+    }
+    assert_eq!(lines[0], "event grab press 100.0 100.0");
+    assert_eq!(lines[1], "event grab motion 150.0 150.0");
+    assert_eq!(lines[4], "event grab motion 300.0 300.0");
+    assert_eq!(lines[5], "event grab release 300.0 300.0");
+    assert_eq!(lines[6], "event grab motion 300.0 100.0");
+    assert_eq!(lines[7], "event grab press 300.0 100.0");
+    assert_eq!(lines[12], "event grab release 100.0 300.0");
+    assert_eq!(lines.last().unwrap(), "event grab end 100.0 300.0");
+
+    client.sync();
+    let input = client.take_input();
+    assert!(
+        !input.iter().any(|input| matches!(input, Input::Button(..))),
+        "{input:?}"
+    );
+    // Without the modifiers a click is a click.
+    compositor.click();
+    client.sync();
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::Button(BTN_LEFT, wl_pointer::ButtonState::Pressed))
+    );
+}
+
+#[test]
+fn the_button_may_go_up_after_the_session() {
+    let (compositor, mut client, _, _) = two_windows();
+    let mut plugin = grabbing_plugin(&compositor);
+    hold(&compositor, CTRL_ALT, KeyState::Pressed);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    client.sync();
+    client.take_input();
+    hold(&compositor, CTRL_ALT, KeyState::Released);
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(plugin.line(), "event grab press 100.0 100.0");
+    assert_eq!(plugin.line(), "event grab end 100.0 100.0");
+    client.sync();
+    let input = client.take_input();
+    assert!(
+        !input.iter().any(|input| matches!(input, Input::Button(..))),
+        "{input:?}"
+    );
+}
+
+#[test]
+fn escape_cancels_a_session_and_stays_with_wirbel() {
+    let (compositor, mut client, _, _) = two_windows();
+    let mut plugin = grabbing_plugin(&compositor);
+    hold(&compositor, CTRL_ALT, KeyState::Pressed);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    client.sync();
+    client.take_input();
+    compositor.tap_key(KEY_ESC);
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    hold(&compositor, CTRL_ALT, KeyState::Released);
+    assert_eq!(plugin.line(), "event grab press 100.0 100.0");
+    assert_eq!(plugin.line(), "event grab cancel");
+    client.sync();
+    let input = client.take_input();
+    assert!(
+        !input
+            .iter()
+            .any(|input| matches!(input, Input::Key(KEY_ESC, _) | Input::Button(..))),
+        "{input:?}"
+    );
+}
+
+#[test]
+fn a_grab_ends_with_its_connection_and_belongs_to_one_plugin() {
+    let (compositor, mut client, _, _) = two_windows();
+    let plugin = grabbing_plugin(&compositor);
+    let mut other = compositor.raw_ipc();
+    assert!(other.request("grab ctrl+alt btn_left").starts_with("error"));
+    assert!(other.request("grab none btn_left").starts_with("error"));
+    assert_eq!(other.request("grab ctrl+alt btn_right"), "ok");
+    assert_eq!(other.request("ungrab ctrl+alt btn_right"), "ok");
+    drop(plugin);
+    other.request("ungrab ctrl+alt btn_right");
+    wait_until_plugin_input_unused(&compositor);
+    compositor.pointer_at(200.0, 300.0);
+    hold(&compositor, CTRL_ALT, KeyState::Pressed);
+    client.sync();
+    client.take_input();
+    compositor.click();
+    client.sync();
+    assert!(
+        client
+            .take_input()
+            .contains(&Input::Button(BTN_LEFT, wl_pointer::ButtonState::Pressed))
+    );
+    hold(&compositor, CTRL_ALT, KeyState::Released);
+}
+
+#[test]
+fn plugins_draw_lines_that_fade_and_leave_with_them() {
+    let (compositor, _client, _, _) = two_windows();
+    let mut plugin = compositor.raw_ipc();
+    assert_eq!(plugin.request("line 100 300 400 300 6 0x00ffff"), "ok");
+    assert_eq!(compositor.screenshot().at(250, 300), 0x00_ffff);
+    assert_eq!(compositor.screenshot().at(250, 310), 0xff_0000);
+    assert_eq!(plugin.request("clear"), "ok");
+    assert_eq!(compositor.screenshot().at(250, 300), 0xff_0000);
+
+    assert_eq!(plugin.request("line 100 300 400 300 6 0x00ffff"), "ok");
+    assert_eq!(plugin.request("clear 10000 0xffffff"), "ok");
+    assert_eq!(
+        compositor.screenshot().at(250, 300) >> 16,
+        0xff,
+        "fading in white"
+    );
+    drop(plugin);
+    wait_until_plugin_input_unused(&compositor);
+    let mut ipc = compositor.raw_ipc();
+    assert_eq!(compositor.screenshot().at(250, 300), 0xff_0000);
+    assert!(ipc.request("line 0 0 1 1 0 0xffffff").starts_with("error"));
+}
+
+#[test]
+fn plugins_find_focus_and_close_the_window_at_a_place() {
+    let (compositor, mut client, a, b) = two_windows();
+    let mut plugin = compositor.raw_ipc();
+    let left = plugin.request("window_at 200 300");
+    let right = plugin.request(&format!("window_at {} 300", RIGHT_X + 50.0));
+    assert_ne!(left, right);
+    assert_eq!(plugin.request("window_at 500 2"), "none");
+    assert_eq!(plugin.request(&format!("focus {left}")), "ok");
+    client.sync();
+    assert!(client.activated(a));
+    assert_eq!(plugin.request(&format!("close {right}")), "ok");
+    client.sync();
+    assert_eq!(client.state.closed, [b]);
+    assert!(plugin.request("close 99999").starts_with("error"));
 }

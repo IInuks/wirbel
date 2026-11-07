@@ -148,6 +148,14 @@ impl Wirbel {
                     FilterResult::Intercept(Some(Action::ChangeVt(vt)))
                 }
                 KeyState::Pressed if wirbel.lock.is_active() => FilterResult::Forward,
+                KeyState::Pressed
+                    if wirbel.plugin_input.in_session()
+                        && handle.modified_sym() == Keysym::Escape =>
+                {
+                    wirbel.end_session(false);
+                    wirbel.swallowed_keys.push(key);
+                    FilterResult::Intercept(None)
+                }
                 KeyState::Pressed => {
                     let action = wirbel.config.action_for_key(modifiers.into(), &handle);
                     match action.cloned() {
@@ -183,6 +191,7 @@ impl Wirbel {
         if let Some(action) = self.modifier_action.take() {
             self.run_action(action);
         }
+        self.grab_check_modifiers();
     }
 
     /// Runs `action` again while its key stays down. Every key event ends that.
@@ -290,7 +299,9 @@ impl Wirbel {
             self.update_keyboard_focus();
         }
 
-        if self.drag.is_some() {
+        if self.grab_motion(location) {
+            // A plugin has the mouse, the focus stays where it was.
+        } else if self.drag.is_some() {
             self.drag_motion(location);
         } else if self.config.sloppy_focus
             && !pointer.is_grabbed()
@@ -316,6 +327,9 @@ impl Wirbel {
         }
         if button == BTN_LEFT {
             self.left_held = pressed;
+        }
+        if self.grab_button(button, pressed) {
+            return;
         }
         let popup_grab = self.popup_grab.is_some();
         if pressed && !pointer.is_grabbed() {

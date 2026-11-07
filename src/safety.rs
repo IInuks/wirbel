@@ -47,6 +47,10 @@ pub const EXIT_PANIC: i32 = 101;
 pub const EXIT_EMERGENCY: i32 = 70;
 /// Exit status when a clean stop did not finish within [`GRACE`].
 pub const EXIT_HUNG: i32 = 71;
+/// Exit status of `wirbel restart` under wirbel-session, which then starts the session anew.
+pub const EXIT_RESTART: i32 = 75;
+/// Set by wirbel-session for its wirbel: a restart is the job of the script then.
+pub const SESSION_ENV: &str = "WIRBEL_SESSION";
 
 const KEY_BACKSPACE: u16 = 14;
 const KEY_LEFTCTRL: u16 = 29;
@@ -157,6 +161,15 @@ pub fn remember_terminal() {
 /// Returns the terminal to text mode. Only uses ioctls, so any thread may call it at any time.
 /// elogind does the same once the session loses its controller, this is for the cases where that
 /// is slow or the process does not get to die.
+/// Points stderr back at the console it was before the log took it, for a program that comes next.
+pub fn restore_stderr() {
+    let console = CONSOLE.load(Ordering::Relaxed);
+    if console != 2 {
+        // Safety: plain descriptor shuffling, failing leaves stderr at the log.
+        unsafe { libc::dup2(console, 2) };
+    }
+}
+
 pub fn restore_terminal() {
     let Some(terminal) = TERMINAL.get() else {
         return;

@@ -122,6 +122,19 @@ fn format_position(position: &Position, fields: Fields, decimals: Decimals) -> S
     }
 }
 
+/// Sends a request that `Request` does not know and reads up to the `ok` that ends its answer.
+pub(crate) fn ask_lines(request: &str) -> Result<Vec<String>, String> {
+    let mut stream = connect()?;
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .map_err(|err| format!("failed to send: {err}"))?;
+    stream
+        .set_read_timeout(Some(ANSWER_TIMEOUT))
+        .map_err(|err| format!("failed to set a timeout: {err}"))?;
+    let mut reader = BufReader::new(stream);
+    crate::plugin::read_list(|| read_line(&mut reader))
+}
+
 /// Prints what `wirbel pos` prints. A reader that went away is the normal way to end a pipe.
 fn print_all(text: &str) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
@@ -378,6 +391,14 @@ pub fn click(args: &[String]) -> Result<(), String> {
         }
         let next = start + gap.saturating_mul(done);
         thread::sleep(next.saturating_duration_since(Instant::now()));
+    }
+}
+
+/// Ends the session and starts it again, like the bind `restart`.
+pub fn restart(args: &[String]) -> Result<(), String> {
+    match args {
+        [] => command(Request::Restart),
+        _ => Err("usage: wirbel restart".into()),
     }
 }
 

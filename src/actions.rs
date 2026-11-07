@@ -19,6 +19,11 @@ impl Wirbel {
                 }
             }
             Action::Quit => self.loop_signal.stop(),
+            Action::Restart => {
+                tracing::info!("restarting the session");
+                self.restart = true;
+                self.loop_signal.stop();
+            }
             Action::Reload => self.reload_config(),
             Action::Focus(direction) => self.focus_direction(direction),
             Action::FocusNext => self.focus_cycle(1),

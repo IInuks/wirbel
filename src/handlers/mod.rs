@@ -42,6 +42,7 @@ use smithay::{
 use crate::{Wirbel, focus::KeyboardFocus, state::apply_output_scale};
 
 pub use foreign_toplevel::ForeignToplevelState;
+pub(crate) use foreign_toplevel::window_names;
 pub use screencopy::{Capturer, ScreencopyState};
 pub use session_lock::SessionLock;
 

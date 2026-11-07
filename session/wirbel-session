@@ -179,7 +179,7 @@ run_session() {
     start_pipewire
     # A background job gets /dev/null as stdin, wirbel needs the VT there.
     exec 3<&0
-    wirbel -c "$SELF --portals" "$@" <&3 3<&- &
+    WIRBEL_SESSION=1 wirbel -c "$SELF --portals" "$@" <&3 3<&- &
     compositor=$!
     exec 3<&-
     # A signal ends this wait early.
@@ -190,6 +190,25 @@ run_session() {
     done
     say "wirbel ended with $code"
     return "$code"
+}
+
+# What `wirbel restart` leaves to the script: everything it started ends, and it waits for that,
+# so the next start finds no bus, PipeWire or document portal of the last one.
+end_for_restart() {
+    trap - EXIT
+    kill $STARTED 2>/dev/null
+    for pid in $STARTED; do
+        i=0
+        while kill -0 "$pid" 2>/dev/null && [ $i -lt 50 ]; do
+            sleep 0.1
+            i=$((i + 1))
+        done
+    done
+    i=0
+    while [ -z "$WIRBEL_GAST" ] && mountpoint -q "$XDG_RUNTIME_DIR/doc" && [ $i -lt 50 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
 }
 
 status() {
@@ -261,7 +280,8 @@ done
 
 state=${XDG_STATE_HOME:-$HOME/.local/state}/wirbel
 mkdir -p "$state"
-[ -f "$state/session.log" ] && mv -f "$state/session.log" "$state/session.log.old"
+# A restart goes on in the same log.
+[ -z "$WIRBEL_RESTARTED" ] && [ -f "$state/session.log" ] && mv -f "$state/session.log" "$state/session.log.old"
 exec >>"$state/session.log" 2>&1
 date
 
@@ -270,8 +290,22 @@ date
 # for the programs that test for it, like flameshot.
 export XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=wirbel:wlroots XDG_SESSION_DESKTOP=wirbel
 
-if [ -z "$WIRBEL_GAST" ] && other_session; then
+# After a restart the document portal may still be on its way out. This session was there first.
+if [ -z "$WIRBEL_GAST" ] && [ -z "$WIRBEL_RESTARTED" ] && other_session; then
     say "another session of this user is running, going on as a guest"
     WIRBEL_GAST=1
 fi
+unset WIRBEL_RESTARTED
 run_session "$@"
+code=$?
+# 75 is `wirbel restart`: the whole session again, as after a logout and login.
+if [ "$code" = 75 ]; then
+    say "restarting the session"
+    end_for_restart
+    export WIRBEL_RESTARTED=1
+    if [ -n "$WIRBEL_GAST" ]; then
+        exec "$SELF" --gast -- "$@"
+    fi
+    exec "$SELF" -- "$@"
+fi
+exit "$code"
