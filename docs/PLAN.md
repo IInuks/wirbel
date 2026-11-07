@@ -25,9 +25,15 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
 - `wirbel pos` zeigt die Mausposition in EINER Zeile, die sich bei jeder Bewegung sofort
   aktualisiert (`\r`, kein Scrollen), bis Ctrl+C. Push über IPC-Abo, kein Polling. Globale
   Layout-Koordinaten mit Nachkommastellen (exakt), dazu Ausgang (`-`, wenn es keinen gibt).
-  `--once` einmal ausgeben; ohne TTY (Pipe) eine Zeile pro Änderung; `--json` eine Zeile JSON pro
+  `--once` oder `now` einmal ausgeben, eine Zahl N wartet N ms und gibt dann einmal aus; `loop`
+  folgt wie ohne Argument; hinter `now`, N oder `loop` zeigt `x|y|xy` nur die Achse(n) ohne Ausgang,
+  dahinter runden `0` bis `17` auf so viele Nachkommastellen, `max` zeigt alle (Standard); neu
+  ausgegeben wird nur,
+  wenn sich der Text ändert; ohne TTY (Pipe) eine Zeile pro Änderung; `--json` eine Zeile JSON pro
   Änderung. Wer nicht mitliest, verpasst Zwischenstände, bekommt aber zuletzt die aktuelle Position.
-- `wirbel move X Y` setzt die Maus absolut, `wirbel move --rel DX DY` relativ. Wird an den
+- `wirbel move X Y` setzt die Maus absolut, `wirbel move --rel DX DY` relativ. Eine Zahl S dahinter fährt in
+  S Sekunden gleichmäßig auf gerader Linie hin, alle 4 ms ein absolutes `move` über eine Verbindung; Ctrl+C
+  hält unterwegs an. Wird an den
   sichtbaren Bereich geklemmt (nächster Punkt auf einem Ausgang, jenseits einer Kante deren letztes
   ganzes Pixel), funktioniert über Ausgänge hinweg und schickt den Clients normale
   Enter/Motion-Events (Hover/Fokus stimmen danach).
@@ -35,7 +41,16 @@ Keybinds in Config-Datei, vom WM selbst verarbeitet. Wallpaper über vorhandenes
   und landet beim Loslassen dort, ein Teiler oder eine Fenstergröße ändert sich mit. Bei gehaltener
   Taste über einem Client bleibt der Zeiger bei diesem Client, bis die Taste losgelassen wird. Der
   Befehl wird nie abgelehnt, solange ein Ausgang existiert; nur `warp_cursor` wartet einen Grab ab.
-- `wirbel pos` und `wirbel move` sprechen den Compositor von `WAYLAND_DISPLAY` an, aus Programmen
+- `wirbel click` klickt links an der Mausposition, über denselben Weg wie die echte Taste (Fokus,
+  Popups, Maus-Binds). Die Taste bleibt 30 ms unten, die Antwort kommt nach dem Loslassen. `wirbel click N S`
+  klickt N-mal im Abstand von S Sekunden (Standard 1, Bruchteile erlaubt), `loop` statt N bis zum Abbruch. Ist
+  die linke Taste schon unten, ist das ein Fehler und die Serie endet.
+- `wirbel distance S` zählt S Sekunden lang den Weg des Zeigers in Layout-Pixeln und gibt die Summe aus,
+  `loop` oder ohne Argument hält eine Zeile aktuell wie `pos`. Dahinter `0` bis `17` oder `max` wie bei
+  `pos`. Summiert im CLI aus dem `watch`-Abo, hin und zurück zählt also doppelt, und wer nicht mitliest, kürzt
+  Kurven ab. Ein gesperrter Zeiger (Spiele) bewegt sich nicht und zählt nicht.
+- `wirbel ws N` wechselt wie der Bind auf Workspace N (1 bis 9) des Ausgangs mit dem Zeiger.
+- `wirbel pos`, `distance`, `move`, `click` und `ws` sprechen den Compositor von `WAYLAND_DISPLAY` an, aus Programmen
   in wirbel also von selbst den richtigen. Ohne Compositor: Exit 1 und Meldung auf stderr.
 - Gesperrt (`ext-session-lock`) gibt es nur noch die Lock-Surfaces: Der Bildschirm zeigt nichts sonst,
   Tasten und Zeiger erreichen nur sie, keine Binds, keine Fokuswechsel. `wirbel pos` und `wirbel move`
@@ -121,7 +136,7 @@ am 5.11.2026 entschieden, auch bei der Migration von Mango nicht nachbauen.
 - `src/ipc.rs`: Steuer-Socket `$XDG_RUNTIME_DIR/wirbel-<WAYLAND_DISPLAY>.sock`, Zeilenprotokoll
   (oben in der Datei beschrieben), läuft nicht blockierend in der Event-Loop. `publish_workspaces` vergleicht nach
   jeder Loop-Iteration die Workspaces, aber nur, wenn jemand zusieht. `src/cli.rs`: die
-  Befehle `wirbel pos`, `wirbel move` und `wirbel mmsg`.
+  Befehle `wirbel pos`, `distance`, `move`, `click`, `ws` und `mmsg`.
 - `Wirbel::under` (`src/state.rs`) ist die eine Antwort auf "was liegt an diesem Punkt", gesperrt nur
   Lock-Surfaces. `surface_under` und `window_at` lesen daraus, Hover, Klick, sloppy focus und
   `wirbel move` stimmen also von selbst.

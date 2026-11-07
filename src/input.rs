@@ -24,7 +24,12 @@ use smithay::{
     },
 };
 
-use crate::{Wirbel, config::Action, layout::Direction, state::Target};
+use crate::{
+    Wirbel,
+    config::{Action, BTN_LEFT},
+    layout::Direction,
+    state::Target,
+};
 
 /// xkb codes are evdev codes shifted by this.
 const XKB_OFFSET: u32 = 8;
@@ -308,6 +313,9 @@ impl Wirbel {
         let pressed = state == ButtonState::Pressed;
         if pressed {
             self.last_press = serial;
+        }
+        if button == BTN_LEFT {
+            self.left_held = pressed;
         }
         let popup_grab = self.popup_grab.is_some();
         if pressed && !pointer.is_grabbed() {

@@ -22,8 +22,11 @@ use wirbel::{
 
 const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]... [--timeout SECONDS] [--log FILE]
        wirbel check [CONFIG]
-       wirbel pos [--once] [--json]
-       wirbel move [--rel] X Y
+       wirbel pos [(now|MILLISECONDS|loop) [x|y|xy] [DECIMALS|max]] [--once] [--json]
+       wirbel distance [SECONDS|loop] [DECIMALS|max]
+       wirbel move [--rel] X Y [SECONDS]
+       wirbel click [COUNT|loop] [SECONDS]
+       wirbel ws N
        wirbel mmsg ARGUMENTS
 
       --config FILE      read this file instead of ~/.config/wirbel/config
@@ -44,17 +47,38 @@ check looks at session, GPUs, outputs and input without taking over anything. It
 at any time, also inside another compositor.
 
 pos prints the pointer position in one line that follows the pointer, until Ctrl+C.
+      now                print it once and exit, same as --once
+      MILLISECONDS       wait this long, then print it once and exit
+      loop               follow the pointer, same as without an argument
+      ... x|y|xy         after one of these: only this axis or both, without the output
+      ... DECIMALS       after one of these: round to this many decimal places, 0 to 17
+      ... max            after one of these: every decimal place, the default
       --once             print it once and exit
       --json             print one JSON object per line
+
+distance prints how far the pointer has moved, in pixels along its way. With SECONDS, such as 2 or
+0.5, it counts for that long and prints the result. With `loop` or without an argument it keeps
+one line up to date, until Ctrl+C.
+      ... DECIMALS       after one of these: round to this many decimal places, 0 to 17
+      ... max            after one of these: every decimal place, the default
 
 move sets the pointer, clamped to the outputs. It works like moving the mouse: a window being
 dragged follows it.
       --rel              X and Y are relative to the current position
+      SECONDS            get there on a straight line in this time, such as 4 or 0.5
+
+click clicks the left button where the pointer is. It works like the real button: the window under
+the pointer gets the focus. If that is not the terminal, Ctrl+C there has to wait until you click it.
+      COUNT              click this many times
+      loop               click until stopped
+      ... SECONDS        after one of these: the time between clicks, default 1, such as 2 or 0.5
+
+ws switches to workspace N, 1 to 9, on the output with the pointer.
 
 mmsg answers what the bars of Mango ask of its `mmsg`: get or watch all-tags and all-monitors, dispatch
 view,N and quit and reload_config. Called as `mmsg` through a symbolic link it does the same.
 
-All three talk to the compositor of WAYLAND_DISPLAY.";
+All of these talk to the compositor of WAYLAND_DISPLAY.";
 
 #[derive(Debug, Default)]
 struct Options {
@@ -214,12 +238,17 @@ fn main() {
         return;
     }
     let mut args = env::args().skip(1).peekable();
-    if let Some(command @ ("pos" | "move" | "mmsg")) = args.peek().map(String::as_str) {
+    if let Some(command @ ("pos" | "distance" | "move" | "click" | "ws" | "mmsg")) =
+        args.peek().map(String::as_str)
+    {
         let command = command.to_string();
         args.next();
         let args: Vec<String> = args.collect();
         let result = match command.as_str() {
             "pos" => wirbel::cli::pos(&args),
+            "distance" => wirbel::cli::distance(&args),
+            "click" => wirbel::cli::click(&args),
+            "ws" => wirbel::cli::workspace(&args),
             "mmsg" => wirbel::cli::mmsg(&args),
             _ => wirbel::cli::move_pointer(&args),
         };

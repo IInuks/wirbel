@@ -1,10 +1,12 @@
-//! The control socket behind `wirbel pos`, `wirbel move` and `wirbel mmsg`.
+//! The control socket behind `wirbel pos`, `wirbel distance`, `wirbel move`, `wirbel click` and
+//! `wirbel mmsg`.
 //!
 //! The protocol is line based, one request per line:
 //!
 //! - `position` answers with one position line.
 //! - `watch` answers with a position line now and again whenever the position changes.
 //! - `move X Y` and `move-rel DX DY` answer with `ok` or `error MESSAGE`.
+//! - `click` presses the left button and answers the same way once it is up again.
 //!
 //! A position line is `position X Y OUTPUT`, without `OUTPUT` if the pointer is on no output.
 //! - `tags` and `monitors` answer with one line of JSON, in the format of Mango's `mmsg`.
@@ -23,22 +25,29 @@ use std::{
     net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use smithay::{
-    backend::input::InputTime,
-    reexports::calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic},
+    backend::input::{ButtonState, InputTime},
+    reexports::calloop::{
+        Interest, LoopHandle, Mode, PostAction,
+        generic::Generic,
+        timer::{TimeoutAction, Timer},
+    },
 };
 
 use crate::{
     Wirbel,
-    config::{Action, WORKSPACES, WorkspaceTarget},
+    config::{Action, BTN_LEFT, WORKSPACES, WorkspaceTarget},
 };
 
 /// Longest request a client may send.
 const MAX_REQUEST: usize = 4096;
 /// Answers a client may leave unread before it is dropped.
 const MAX_BACKLOG: usize = 64 * 1024;
+/// How long `wirbel click` holds the button. A game that looks once per frame has to see it down.
+const CLICK_HOLD: Duration = Duration::from_millis(30);
 
 /// The socket of the compositor with the given Wayland socket, which is what makes it unique.
 pub fn socket_path(wayland_display: &OsStr) -> Option<PathBuf> {
@@ -177,6 +186,7 @@ pub enum Request {
         dx: f64,
         dy: f64,
     },
+    Click,
     Get(View),
     WatchView(View),
     /// One-based.
@@ -192,6 +202,7 @@ impl Request {
             Self::Watch => "watch".into(),
             Self::Move { x, y } => format!("move {x:?} {y:?}"),
             Self::MoveRelative { dx, dy } => format!("move-rel {dx:?} {dy:?}"),
+            Self::Click => "click".into(),
             Self::Get(View::Tags) => "tags".into(),
             Self::Get(View::Monitors) => "monitors".into(),
             Self::WatchView(View::Tags) => "watch-tags".into(),
@@ -212,6 +223,7 @@ impl Request {
         match command {
             "position" => simple(Self::Position),
             "watch" => simple(Self::Watch),
+            "click" => simple(Self::Click),
             "tags" => simple(Self::Get(View::Tags)),
             "monitors" => simple(Self::Get(View::Monitors)),
             "watch-tags" => simple(Self::WatchView(View::Tags)),
@@ -558,6 +570,7 @@ impl Wirbel {
             }
             Request::Move { x, y } => self.ipc_move(id, |_, _| (x, y)),
             Request::MoveRelative { dx, dy } => self.ipc_move(id, |x, y| (x + dx, y + dy)),
+            Request::Click => self.ipc_click(id),
             Request::Get(view) => {
                 let line = view.render(&self.monitor_states());
                 self.ipc.reply(id, &line);
@@ -633,6 +646,34 @@ impl Wirbel {
         self.on_pointer_motion((x, y).into(), InputTime::now());
         self.ipc.reply(id, "ok");
     }
+
+    /// Takes the path of a real button, so a click focuses, ends popups and starts mouse binds.
+    /// A button that is down already cannot go down again, and letting it go is up to its owner.
+    fn ipc_click(&mut self, id: u64) {
+        if self.left_held {
+            self.ipc.reply(id, "error the left button is held down");
+            return;
+        }
+        self.on_pointer_button(BTN_LEFT, ButtonState::Pressed, InputTime::now());
+        let timer = Timer::from_duration(CLICK_HOLD);
+        let release = self.ipc.handle.insert_source(timer, move |_, _, state| {
+            state.release_click();
+            state.ipc.reply(id, "ok");
+            TimeoutAction::Drop
+        });
+        if let Err(err) = release {
+            tracing::warn!(error = %err.error, "failed to time a click");
+            self.release_click();
+            self.ipc.reply(id, "ok");
+        }
+    }
+
+    /// The hand on the mouse may have been faster.
+    fn release_click(&mut self) {
+        if self.left_held {
+            self.on_pointer_button(BTN_LEFT, ButtonState::Released, InputTime::now());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -651,6 +692,7 @@ mod tests {
                 dx: 0.1 + 0.2,
                 dy: 1e-7,
             },
+            Request::Click,
             Request::Get(View::Tags),
             Request::Get(View::Monitors),
             Request::WatchView(View::Tags),
@@ -676,6 +718,7 @@ mod tests {
             "move 0 inf",
             "move 1e999 0",
             "move-rel 1",
+            "click 2",
             "watch now",
             "position 1",
             "workspace",

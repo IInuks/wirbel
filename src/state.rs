@@ -240,6 +240,8 @@ pub struct Wirbel {
     pub urgent: Vec<Window>,
     /// The latest press of a key or button: what a popup may take its grab with.
     pub last_press: Serial,
+    /// Whether the left button is down, by hand or by `wirbel click`.
+    pub left_held: bool,
     pub ipc: Ipc,
     /// Asks the renderer whether it can use a dmabuf. Set by a backend that offers dmabufs.
     pub import_dmabuf: Box<dyn FnMut(&Dmabuf) -> bool>,
@@ -351,6 +353,7 @@ impl Wirbel {
             dnd_offset: Point::default(),
             urgent: Vec::new(),
             last_press: Serial::from(0),
+            left_held: false,
             ipc,
             import_dmabuf: Box::new(|_| false),
 

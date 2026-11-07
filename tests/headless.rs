@@ -3671,7 +3671,7 @@ impl RawIpc {
     }
 }
 
-/// A running `wirbel pos` with its output on a pipe.
+/// A running `wirbel pos` or `wirbel distance` with its output on a pipe.
 struct Watcher {
     child: Child,
     lines: mpsc::Receiver<String>,
@@ -3679,11 +3679,11 @@ struct Watcher {
 
 impl Watcher {
     fn start(compositor: &Compositor, args: &[&str]) -> Self {
-        let mut child = compositor
-            .cli(&[&["pos"], args].concat())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+        Self::start_command(compositor, &[&["pos"], args].concat())
+    }
+
+    fn start_command(compositor: &Compositor, args: &[&str]) -> Self {
+        let mut child = compositor.cli(args).stdout(Stdio::piped()).spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let (tx, lines) = mpsc::channel();
         thread::spawn(move || {
@@ -3717,6 +3717,101 @@ fn pos_prints_the_exact_position_and_output_once() {
         compositor.run(&["pos", "--once", "--json"]),
         "{\"x\":123.25,\"y\":45.0625,\"output\":\"test\"}\n"
     );
+}
+
+#[test]
+fn pos_now_prints_once_like_once() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(123.25, 45.0625);
+    assert_eq!(compositor.run(&["pos", "now"]), "123.25 45.0625 test\n");
+    assert_eq!(compositor.run(&["pos", "0"]), "123.25 45.0625 test\n");
+    assert_eq!(
+        compositor.run(&["pos", "now", "--json"]),
+        "{\"x\":123.25,\"y\":45.0625,\"output\":\"test\"}\n"
+    );
+}
+
+#[test]
+fn pos_once_takes_the_axis_and_decimals_like_loop() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(123.25, 45.5);
+    assert_eq!(compositor.run(&["pos", "now", "x", "0"]), "123\n");
+    assert_eq!(compositor.run(&["pos", "now", "y"]), "45.5\n");
+    assert_eq!(compositor.run(&["pos", "now", "xy", "1"]), "123.2 45.5\n");
+    assert_eq!(compositor.run(&["pos", "now", "max"]), "123.25 45.5 test\n");
+    assert_eq!(compositor.run(&["pos", "now", "2"]), "123.25 45.50 test\n");
+    assert_eq!(compositor.run(&["pos", "0", "xy", "0"]), "123 46\n");
+    assert_eq!(compositor.run(&["pos", "1", "y", "2"]), "45.50\n");
+}
+
+#[test]
+fn pos_with_a_delay_prints_where_the_pointer_is_after_it() {
+    const DELAY: Duration = Duration::from_millis(1500);
+    let compositor = Compositor::start();
+    compositor.pointer_at(1.0, 2.0);
+    let start = Instant::now();
+    let child = compositor
+        .cli(&["pos", &DELAY.as_millis().to_string()])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    compositor.pointer_at(30.5, 40.0);
+    let output = child.wait_with_output().unwrap();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= DELAY, "printed after {elapsed:?}");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "30.5 40.0 test\n"
+    );
+}
+
+#[test]
+fn pos_loop_follows_like_pos() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(10.0, 20.0);
+    let watcher = Watcher::start(&compositor, &["loop"]);
+    assert_eq!(watcher.next(), "10.0 20.0 test");
+    compositor.pointer_at(11.5, 20.0);
+    assert_eq!(watcher.next(), "11.5 20.0 test");
+}
+
+#[test]
+fn pos_loop_shows_one_axis_and_only_its_changes() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(10.5, 20.25);
+    let x = Watcher::start(&compositor, &["loop", "x"]);
+    let y = Watcher::start(&compositor, &["loop", "y"]);
+    let xy = Watcher::start(&compositor, &["loop", "xy", "max"]);
+    assert_eq!(x.next(), "10.5");
+    assert_eq!(y.next(), "20.25");
+    assert_eq!(xy.next(), "10.5 20.25");
+
+    // Moving along one axis shows nothing on the other.
+    compositor.pointer_at(10.5, 30.0);
+    assert_eq!(y.next(), "30.0");
+    assert_eq!(xy.next(), "10.5 30.0");
+    compositor.pointer_at(11.5, 30.0);
+    assert_eq!(x.next(), "11.5");
+    assert_eq!(xy.next(), "11.5 30.0");
+}
+
+#[test]
+fn pos_loop_rounds_to_the_decimals_and_skips_what_does_not_show() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(10.125, 20.75);
+    let none = Watcher::start(&compositor, &["loop", "xy", "0"]);
+    let two = Watcher::start(&compositor, &["loop", "x", "2"]);
+    let with_output = Watcher::start(&compositor, &["loop", "1"]);
+    assert_eq!(none.next(), "10 21");
+    assert_eq!(two.next(), "10.12");
+    assert_eq!(with_output.next(), "10.1 20.8 test");
+
+    compositor.pointer_at(10.25, 20.75);
+    assert_eq!(two.next(), "10.25");
+    assert_eq!(with_output.next(), "10.2 20.8 test");
+    compositor.pointer_at(12.0, 20.75);
+    assert_eq!(none.next(), "12 21");
 }
 
 #[test]
@@ -3879,13 +3974,259 @@ fn commands_explain_a_missing_compositor() {
 }
 
 #[test]
+fn click_clicks_where_the_pointer_is() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    let a = client.open_window(0x00ff_0000);
+    let b = client.open_window(0x0000_ff00);
+    compositor.pointer_at(100.0, 100.0);
+    client.take_input();
+    assert!(client.activated(b));
+
+    assert_eq!(compositor.run(&["click"]), "");
+    client.sync();
+    assert_eq!(
+        client.take_input(),
+        [
+            Input::KeyboardLeave(b),
+            Input::KeyboardEnter(a),
+            Input::Button(BTN_LEFT, wl_pointer::ButtonState::Pressed),
+            Input::Button(BTN_LEFT, wl_pointer::ButtonState::Released),
+        ]
+    );
+}
+
+fn presses(input: &[Input]) -> usize {
+    let press = Input::Button(BTN_LEFT, wl_pointer::ButtonState::Pressed);
+    input.iter().filter(|event| **event == press).count()
+}
+
+#[test]
+fn click_repeats_with_the_given_gap() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(0x00ff_0000);
+    compositor.pointer_at(100.0, 100.0);
+    client.take_input();
+
+    let start = Instant::now();
+    compositor.run(&["click", "3", "0.25"]);
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(500), "took {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    client.sync();
+    assert_eq!(presses(&client.take_input()), 3);
+
+    compositor.run(&["click", "2", "0"]);
+    client.sync();
+    assert_eq!(presses(&client.take_input()), 2);
+}
+
+#[test]
+fn click_loop_goes_on_until_stopped() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(0x00ff_0000);
+    compositor.pointer_at(100.0, 100.0);
+    client.take_input();
+
+    let mut child = compositor.cli(&["click", "loop", "0.05"]).spawn().unwrap();
+    let start = Instant::now();
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        child.try_wait().unwrap(),
+        None,
+        "after {:?}",
+        start.elapsed()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    thread::sleep(Duration::from_millis(100));
+    client.sync();
+    assert!(presses(&client.take_input()) >= 3);
+
+    // Whatever click was on its way, nothing stays down.
+    assert!(!compositor.with(|state| state.left_held));
+}
+
+#[test]
+fn click_leaves_a_held_button_alone() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(0x00ff_0000);
+    compositor.pointer_at(100.0, 100.0);
+    compositor.button(BTN_LEFT, ButtonState::Pressed);
+    client.sync();
+    client.take_input();
+
+    assert!(compositor.run_failing(&["click"]).contains("held down"));
+    client.sync();
+    assert_eq!(client.take_input(), []);
+    assert!(compositor.with(|state| state.left_held));
+    compositor.button(BTN_LEFT, ButtonState::Released);
+}
+
+#[test]
+fn a_click_does_not_release_twice_if_the_hand_was_faster() {
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(0x00ff_0000);
+    compositor.pointer_at(100.0, 100.0);
+    client.take_input();
+
+    let mut ipc = compositor.raw_ipc();
+    ipc.send("click\n");
+    while !compositor.with(|state| state.left_held) {
+        thread::yield_now();
+    }
+    compositor.button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(ipc.line(), "ok");
+    client.sync();
+    let released = Input::Button(BTN_LEFT, wl_pointer::ButtonState::Released);
+    let input = client.take_input();
+    assert_eq!(input.iter().filter(|event| **event == released).count(), 1);
+}
+
+#[test]
+fn distance_adds_up_the_way_over_the_time() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(10.0, 10.0);
+    let child = compositor
+        .cli(&["distance", "1", "2"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    compositor.pointer_at(13.0, 14.0);
+    compositor.pointer_at(10.0, 10.0);
+    compositor.pointer_at(10.0, 10.5);
+    let start = Instant::now();
+    let output = child.wait_with_output().unwrap();
+    assert!(start.elapsed() < Duration::from_millis(900));
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "10.50\n");
+}
+
+#[test]
+fn distance_of_a_pointer_at_rest_is_zero() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(10.0, 10.0);
+    assert_eq!(compositor.run(&["distance", "0.1"]), "0.0\n");
+    assert_eq!(compositor.run(&["distance", "0", "3"]), "0.000\n");
+    assert_eq!(compositor.run(&["distance", "0", "0"]), "0\n");
+    assert_eq!(compositor.run(&["distance", "0", "max"]), "0.0\n");
+}
+
+#[test]
+fn distance_loop_keeps_a_running_total() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(0.0, 0.0);
+    let watcher = Watcher::start_command(&compositor, &["distance", "loop", "1"]);
+    assert_eq!(watcher.next(), "0.0");
+    compositor.pointer_at(3.0, 4.0);
+    assert_eq!(watcher.next(), "5.0");
+    compositor.pointer_at(3.0, 5.5);
+    assert_eq!(watcher.next(), "6.5");
+    // Too little to show.
+    compositor.pointer_at(3.0, 5.51);
+    compositor.pointer_at(3.0, 7.5);
+    assert_eq!(watcher.next(), "8.5");
+
+    let bare = Watcher::start_command(&compositor, &["distance"]);
+    assert_eq!(bare.next(), "0.0");
+    compositor.pointer_at(3.0, 8.5);
+    assert_eq!(bare.next(), "1.0");
+}
+
+#[test]
+fn move_with_a_time_goes_there_on_a_straight_line() {
+    let compositor = Compositor::start();
+    compositor.pointer_at(100.0, 100.0);
+    let start = Instant::now();
+    let mut child = compositor
+        .cli(&["move", "500", "300", "0.6"])
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let (x, y) = compositor.pointer();
+    assert!(x > 150.0 && x < 450.0, "at {x} {y}");
+    // On the line from the start to the target.
+    assert!((y - (100.0 + (x - 100.0) / 2.0)).abs() < 1e-6, "at {x} {y}");
+    assert!(child.wait().unwrap().success());
+    assert!(start.elapsed() >= Duration::from_millis(600));
+    assert_eq!(compositor.pointer(), (500.0, 300.0));
+
+    compositor.run(&["move", "--rel", "-50", "20", "0.1"]);
+    assert_eq!(compositor.pointer(), (450.0, 320.0));
+    compositor.run(&["move", "7", "8", "0"]);
+    assert_eq!(compositor.pointer(), (7.0, 8.0));
+}
+
+#[test]
+fn ws_switches_the_workspace() {
+    let compositor = Compositor::start();
+    let active = |compositor: &Compositor| compositor.with(|state| state.monitors[0].active);
+    assert_eq!(compositor.run(&["ws", "3"]), "");
+    assert_eq!(active(&compositor), 2);
+    compositor.run(&["ws", "9"]);
+    assert_eq!(active(&compositor), 8);
+    compositor.run(&["ws", "1"]);
+    assert_eq!(active(&compositor), 0);
+}
+
+#[test]
 fn bad_command_lines_are_refused() {
     let compositor = Compositor::start();
     compositor.pointer_at(7.0, 8.0);
     for args in [
-        &["move"][..],
+        &["ws"][..],
+        &["ws", "0"],
+        &["ws", "10"],
+        &["ws", "next"],
+        &["ws", "1", "2"],
+        &["click", "0"],
+        &["click", "-1"],
+        &["click", "two"],
+        &["click", "1.5"],
+        &["click", "2", "soon"],
+        &["click", "2", "-1"],
+        &["click", "2", "NaN"],
+        &["click", "2", "inf"],
+        &["click", "2", "1", "1"],
+        &["distance", "soon"],
+        &["distance", "-1"],
+        &["distance", "1", "18"],
+        &["distance", "1", "x"],
+        &["distance", "loop", "-1"],
+        &["distance", "1", "2", "3"],
+        &["pos", "soon"],
+        &["pos", "-5"],
+        &["pos", "1.5"],
+        &["pos", "now", "100"],
+        &["pos", "x"],
+        &["pos", "max"],
+        &["pos", "now", "loop"],
+        &["pos", "100", "loop"],
+        &["pos", "loop", "now"],
+        &["pos", "loop", "yx"],
+        &["pos", "loop", "x", "y"],
+        &["pos", "loop", "2", "x"],
+        &["pos", "loop", "max", "2"],
+        &["pos", "loop", "18"],
+        &["pos", "loop", "-1"],
+        &["pos", "loop", "--once"],
+        &["pos", "loop", "x", "--json"],
+        &["pos", "now", "18"],
+        &["pos", "now", "2", "x"],
+        &["pos", "now", "x", "y"],
+        &["pos", "now", "x", "--json"],
+        &["pos", "100", "1", "x"],
+        &["move"],
         &["move", "1"],
-        &["move", "1", "2", "3"],
+        &["move", "1", "2", "3", "4"],
+        &["move", "1", "2", "-1"],
+        &["move", "1", "2", "soon"],
+        &["move", "--rel", "1", "2", "inf"],
         &["move", "a", "2"],
         &["move", "--rel", "1"],
         &["move", "1", "--rel", "2"],
