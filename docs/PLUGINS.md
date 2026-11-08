@@ -18,7 +18,12 @@ wirbel plug wackeln true                             # and on again
 wirbel plug define wackeln                           # take the name away
 wirbel plug remove wackeln                           # out of the config
 wirbel plug list
+wirbel plug create ~/plugins                         # make a folder ready for plugins
 ```
+
+`create` makes the folder if it is not there and puts `wirbel.py` (a small Python helper, so
+`import wirbel` works) and `beispiel.py` (an example to start from) into it. Files that are already
+there stay as they are, and the config is not touched: switch the example on with `wirbel plug add`.
 
 Wherever a plugin is meant, its path or its name works. `list` shows the state, the name if there
 is one, the path, and whether it runs:

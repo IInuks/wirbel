@@ -10,6 +10,8 @@
 //! - `wirbel plug remove PATH|NAME` takes it out of the config.
 //! - `wirbel plug PATH|NAME true|false` switches it on or off.
 //! - `wirbel plug define PATH|NAME [NAME]` names it, or takes the name away.
+//! - `wirbel plug create FOLDER` makes a folder ready for plugins: the Python helper `wirbel.py`
+//!   and an example, without touching the config.
 //!
 //! After a change it asks a running wirbel to reload, which starts and stops plugins to match.
 //! Every plugin runs in a process group of its own, which ends when it is switched off and with
@@ -35,13 +37,14 @@ use crate::{
 };
 
 const PLUG_USAGE: &str = "usage: wirbel plug list
+       wirbel plug create FOLDER
        wirbel plug add PATH [NAME]
        wirbel plug remove PATH|NAME
        wirbel plug PATH|NAME true|false
        wirbel plug define PATH|NAME [NAME]";
 
 /// Words of `wirbel plug` that a name must not be, or the command line would mean two things.
-const RESERVED: &[&str] = &["add", "remove", "list", "define", "help"];
+const RESERVED: &[&str] = &["add", "remove", "list", "define", "create", "help"];
 
 /// The file a folder plugin starts with.
 const FOLDER_ENTRY: &str = "run";
@@ -330,6 +333,19 @@ fn edit_file(path: &Path, edit: &Edit) -> Result<(), String> {
 /// `wirbel plug`.
 pub fn plug(args: &[String]) -> Result<(), String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let ["create", folder] = args.as_slice() {
+        let cwd = env::current_dir().ok();
+        let folder = resolve(folder, cwd.as_deref());
+        for (file, made) in create(&folder)? {
+            let what = if made { "made" } else { "kept, it was there" };
+            println!("{}: {what}", folder.join(file).display());
+        }
+        println!(
+            "switch the example on with: wirbel plug add {} beispiel",
+            folder.join("beispiel.py").display()
+        );
+        return Ok(());
+    }
     let config = config_file()?;
     let edit = match args.as_slice() {
         [] | ["list"] => return list(&config),
@@ -352,6 +368,45 @@ pub fn plug(args: &[String]) -> Result<(), String> {
     println!("{}", done(&edit));
     reload(&config);
     Ok(())
+}
+
+/// What `wirbel plug create` puts into a folder: name, content, executable.
+const TEMPLATE: &[(&str, &str, bool)] = &[
+    ("wirbel.py", include_str!("../plugins/wirbel.py"), false),
+    ("beispiel.py", include_str!("../plugins/beispiel.py"), true),
+];
+
+/// Makes `folder` (and the folders above it) if needed and writes the template files into it.
+/// A file that is already there stays as it is. Says for each file whether it was made.
+pub fn create(folder: &Path) -> Result<Vec<(&'static str, bool)>, String> {
+    let shown = folder.display();
+    if folder.exists() && !folder.is_dir() {
+        return Err(format!("{shown} is not a folder"));
+    }
+    fs::create_dir_all(folder).map_err(|err| format!("{shown}: {err}"))?;
+    let mut report = Vec::new();
+    for &(name, content, executable) in TEMPLATE {
+        let path = folder.join(name);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        let mut file = match file {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                report.push((name, false));
+                continue;
+            }
+            Err(err) => return Err(format!("{}: {err}", path.display())),
+        };
+        file.write_all(content.as_bytes())
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        let mode = if executable { 0o755 } else { 0o644 };
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        report.push((name, true));
+    }
+    Ok(report)
 }
 
 /// What `wirbel plug` says about an edit it made.
@@ -632,6 +687,23 @@ mod tests {
             name: name.map(Into::into),
             enabled,
         }
+    }
+
+    #[test]
+    fn create_makes_missing_folders_and_keeps_existing_files() {
+        let root = env::temp_dir().join(format!("wirbel-create-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let folder = root.join("a/b");
+        let report = create(&folder).unwrap();
+        assert_eq!(report, vec![("wirbel.py", true), ("beispiel.py", true)]);
+        assert!(executable(&folder.join("beispiel.py")).is_ok());
+        fs::write(folder.join("wirbel.py"), "mine").unwrap();
+        fs::remove_file(folder.join("beispiel.py")).unwrap();
+        let report = create(&folder).unwrap();
+        assert_eq!(report, vec![("wirbel.py", false), ("beispiel.py", true)]);
+        assert_eq!(fs::read_to_string(folder.join("wirbel.py")).unwrap(), "mine");
+        assert!(create(&folder.join("beispiel.py")).is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
