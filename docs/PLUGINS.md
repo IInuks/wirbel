@@ -17,6 +17,10 @@ wirbel plug wackeln false                            # switch it off, it stops
 wirbel plug wackeln true                             # and on again
 wirbel plug define wackeln                           # take the name away
 wirbel plug remove wackeln                           # out of the config
+wirbel plug add ~/wirbel-plugins/*.py                # several at once
+wirbel plug add a.py eins b.py zwei c.py             # a, b named eins and zwei, c without a name
+wirbel plug wackeln regenbogen false                 # switch several off (or on) at once
+wirbel plug remove wackeln regenbogen                # take several out
 wirbel plug list
 wirbel plug create ~/plugins                         # make a folder ready for plugins
 ```
@@ -25,7 +29,9 @@ wirbel plug create ~/plugins                         # make a folder ready for p
 `import wirbel` works) and `beispiel.py` (an example to start from) into it. Files that are already
 there stay as they are, and the config is not touched: switch the example on with `wirbel plug add`.
 
-Wherever a plugin is meant, its path or its name works. `list` shows the state, the name if there
+Wherever a plugin is meant, its path or its name works. After `add`, a word without a slash that is
+not a file or folder in the working folder is the name of the path before it. With several
+plugins at once, either all changes are made or, if one fails (a typo, an unknown plugin), none. `list` shows the state, the name if there
 is one, the path, and whether it runs:
 
 ```

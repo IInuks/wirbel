@@ -8509,6 +8509,52 @@ impl Drop for PlugSetup {
 }
 
 #[test]
+fn wirbel_plug_does_several_plugins_at_once_or_none() {
+    use std::os::unix::fs::PermissionsExt;
+    let setup = PlugSetup::new("plug-several");
+    let compositor = Compositor::start();
+    let second = setup.folder.join("zwei.sh");
+    fs::write(&second, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o755)).unwrap();
+    let (one, two) = (setup.plugin.to_str().unwrap(), second.to_str().unwrap());
+
+    assert_eq!(
+        setup.plug(&compositor, &["add", one, "eins", two]),
+        format!("added eins ({one}), on\nadded {two}, on\n")
+    );
+    let before = fs::read_to_string(&setup.config).unwrap();
+    assert!(before.contains(&format!(
+        "plugin = {one}, eins, true\nplugin = {two}, true\n"
+    )));
+
+    assert_eq!(
+        setup.plug(&compositor, &["eins", two, "false"]),
+        format!("eins is off\n{two} is off\n")
+    );
+    let off = fs::read_to_string(&setup.config).unwrap();
+    assert!(off.contains(&format!(
+        "plugin = {one}, eins, false\nplugin = {two}, false\n"
+    )));
+
+    // One unknown plugin, and nothing changes.
+    assert!(
+        setup
+            .plug_failing(&compositor, &["eins", "nichts", "true"])
+            .contains("no plugin nichts")
+    );
+    assert_eq!(fs::read_to_string(&setup.config).unwrap(), off);
+
+    assert_eq!(
+        setup.plug(&compositor, &["remove", "eins", two]),
+        format!("removed eins\nremoved {two}\n")
+    );
+    assert_eq!(
+        fs::read_to_string(&setup.config).unwrap(),
+        "# mine\nsloppy_focus = 0\n"
+    );
+}
+
+#[test]
 fn wirbel_plug_edits_the_config_and_starts_and_stops_plugins() {
     let setup = PlugSetup::new("plug");
     let compositor = Compositor::start();

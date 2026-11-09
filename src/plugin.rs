@@ -38,9 +38,9 @@ use crate::{
 
 const PLUG_USAGE: &str = "usage: wirbel plug list
        wirbel plug create FOLDER
-       wirbel plug add PATH [NAME]
-       wirbel plug remove PATH|NAME
-       wirbel plug PATH|NAME true|false
+       wirbel plug add PATH [NAME] [PATH [NAME]]...
+       wirbel plug remove PATH|NAME...
+       wirbel plug PATH|NAME... true|false
        wirbel plug define PATH|NAME [NAME]";
 
 /// Words of `wirbel plug` that a name must not be, or the command line would mean two things.
@@ -297,9 +297,10 @@ fn config_file() -> Result<PathBuf, String> {
         .ok_or("cannot tell where the config is, HOME is not set".into())
 }
 
-/// Writes the config with `edit` done to it. Writes through a symbolic link, so a config kept
+/// Writes the config with `edits` done to it, one after the other. If one of them fails, none is
+/// written. Writes through a symbolic link, so a config kept
 /// with the dotfiles stays there, and replaces the file at once, so wirbel never reads half of it.
-fn edit_file(path: &Path, edit: &Edit) -> Result<(), String> {
+fn edit_file(path: &Path, edits: &[Edit]) -> Result<(), String> {
     let shown = path.display();
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -307,7 +308,10 @@ fn edit_file(path: &Path, edit: &Edit) -> Result<(), String> {
         Err(err) => return Err(format!("{shown}: {err}")),
     };
     let cwd = env::current_dir().ok();
-    let text = apply_edit(&text, edit, cwd.as_deref())?;
+    let mut text = text;
+    for edit in edits {
+        text = apply_edit(&text, edit, cwd.as_deref())?;
+    }
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if let Some(folder) = target.parent() {
         fs::create_dir_all(folder).map_err(|err| format!("{}: {err}", folder.display()))?;
@@ -347,27 +351,56 @@ pub fn plug(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let config = config_file()?;
-    let edit = match args.as_slice() {
+    let edits = match args.as_slice() {
         [] | ["list"] => return list(&config),
         ["help" | "-h" | "--help"] => {
             println!("{PLUG_USAGE}");
             return Ok(());
         }
-        ["add", path] => add(path, None)?,
-        ["add", path, name] => add(path, Some(name))?,
-        ["remove", id] => Edit::Remove(id.to_string()),
-        ["define", id] => Edit::Define(id.to_string(), None),
-        ["define", id, name] => Edit::Define(id.to_string(), Some(name.to_string())),
-        [id, state] if !RESERVED.contains(id) => match parse_bool(state) {
-            Ok(enabled) => Edit::Enable(id.to_string(), enabled),
-            Err(_) => return Err(PLUG_USAGE.into()),
-        },
+        ["add", rest @ ..] if !rest.is_empty() => {
+            let cwd = env::current_dir().ok();
+            let mut edits = Vec::new();
+            for (path, name) in add_pairs(rest, cwd.as_deref()) {
+                edits.push(add(path, name)?);
+            }
+            edits
+        }
+        ["remove", ids @ ..] if !ids.is_empty() => {
+            ids.iter().map(|id| Edit::Remove(id.to_string())).collect()
+        }
+        ["define", id] => vec![Edit::Define(id.to_string(), None)],
+        ["define", id, name] => vec![Edit::Define(id.to_string(), Some(name.to_string()))],
+        [ids @ .., state] if !ids.is_empty() && !RESERVED.contains(&ids[0]) => {
+            match parse_bool(state) {
+                Ok(enabled) => ids
+                    .iter()
+                    .map(|id| Edit::Enable(id.to_string(), enabled))
+                    .collect(),
+                Err(_) => return Err(PLUG_USAGE.into()),
+            }
+        }
         _ => return Err(PLUG_USAGE.into()),
     };
-    edit_file(&config, &edit)?;
-    println!("{}", done(&edit));
+    edit_file(&config, &edits)?;
+    for edit in &edits {
+        println!("{}", done(edit));
+    }
     reload(&config);
     Ok(())
+}
+
+/// The arguments of `wirbel plug add`, split into paths, each with the name after it if there is
+/// one. A word is a name when it has no slash and is not a file or folder in `cwd`, otherwise it is
+/// the next path. So `add a.py wackeln b.py` adds two, the first named, and `add *.py` adds them all.
+pub fn add_pairs<'a>(args: &[&'a str], cwd: Option<&Path>) -> Vec<(&'a str, Option<&'a str>)> {
+    let is_name = |word: &str| !word.contains('/') && !resolve(word, cwd).exists();
+    let mut pairs = Vec::new();
+    let mut words = args.iter().copied().peekable();
+    while let Some(path) = words.next() {
+        let name = words.next_if(|word| is_name(word));
+        pairs.push((path, name));
+    }
+    pairs
 }
 
 /// What `wirbel plug create` puts into a folder: name, content, executable.
@@ -701,9 +734,37 @@ mod tests {
         fs::remove_file(folder.join("beispiel.py")).unwrap();
         let report = create(&folder).unwrap();
         assert_eq!(report, vec![("wirbel.py", false), ("beispiel.py", true)]);
-        assert_eq!(fs::read_to_string(folder.join("wirbel.py")).unwrap(), "mine");
+        assert_eq!(
+            fs::read_to_string(folder.join("wirbel.py")).unwrap(),
+            "mine"
+        );
         assert!(create(&folder.join("beispiel.py")).is_err());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn add_takes_several_paths_each_with_an_optional_name() {
+        let folder = std::env::temp_dir().join(format!("wirbel-add-pairs-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("b.py"), "").unwrap();
+        let pairs = add_pairs(
+            &["a.py", "eins", "b.py", "/x/c", "zwei", "/x/d"],
+            Some(&folder),
+        );
+        assert_eq!(
+            pairs,
+            [
+                ("a.py", Some("eins")),
+                ("b.py", None),
+                ("/x/c", Some("zwei")),
+                ("/x/d", None)
+            ]
+        );
+        assert_eq!(
+            add_pairs(&["/x/a", "/x/b"], None),
+            [("/x/a", None), ("/x/b", None)]
+        );
+        let _ = fs::remove_dir_all(&folder);
     }
 
     #[test]

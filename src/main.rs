@@ -29,7 +29,7 @@ const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]... [--timeout SE
        wirbel ws N|next|prev|next_used|prev_used
        wirbel restart
        wirbel mmsg ARGUMENTS
-       wirbel plug [list | add PATH [NAME] | remove PLUGIN | PLUGIN true|false | define PLUGIN [NAME]]
+       wirbel plug [list | add PATH [NAME]... | remove PLUGIN... | PLUGIN... true|false | define PLUGIN [NAME]]
 
       --config FILE      read this file instead of ~/.config/wirbel/config
   -c, --command COMMAND  run a shell command inside the compositor (repeatable)
@@ -89,9 +89,11 @@ view,N and quit and reload_config. Called as `mmsg` through a symbolic link it d
 plug manages plugins: programs that start with wirbel and change it through its socket, see
 docs/PLUGINS.md. PLUGIN is the path of one or the name it was given.
       list               show them: on or off, the name if there is one, the path, if it runs
-      add PATH [NAME]    add an executable file, or a folder with an executable `run`, switched on
-      remove PLUGIN      take it out of the config
-      PLUGIN true|false  switch it on or off
+      add PATH [NAME]... add an executable file, or a folder with an executable `run`, switched on;
+                         several at once, a word without a slash that is no file is the name of
+                         the path before it
+      remove PLUGIN...   take them out of the config
+      PLUGIN... true|false  switch them on or off
       define PLUGIN NAME give it a name to use instead of the path, without NAME take it away
 The changes go to the config as `plugin = PATH[, NAME][, true|false]` lines, which can be written by
 hand as well, and a running wirbel reloads it.

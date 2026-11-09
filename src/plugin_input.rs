@@ -356,7 +356,10 @@ impl Drawing {
                 let (x0, y0) = (tx * TILE, ty * TILE);
                 let area = Rectangle::<i32, Buffer>::new(
                     (left.max(x0) - x0, top.max(y0) - y0).into(),
-                    (right.min(x0 + TILE) - left.max(x0), bottom.min(y0 + TILE) - top.max(y0))
+                    (
+                        right.min(x0 + TILE) - left.max(x0),
+                        bottom.min(y0 + TILE) - top.max(y0),
+                    )
                         .into(),
                 );
                 if area.size.w <= 0 || area.size.h <= 0 {
