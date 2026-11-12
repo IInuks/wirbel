@@ -24,7 +24,7 @@ use smithay::{
     xwayland::XWaylandClientData,
 };
 
-use crate::{ClientState, Wirbel};
+use crate::{ClientState, Wirbel, window_hook::WindowEvent};
 
 impl CompositorHandler for Wirbel {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -107,6 +107,7 @@ impl CompositorHandler for Wirbel {
         (self.early_import)(surface);
         self.apply_buffer_offset(surface);
 
+        let mut committed = None;
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
@@ -114,12 +115,20 @@ impl CompositorHandler for Wirbel {
             }
             if let Some(window) = self.find_window(&root) {
                 window.on_commit();
+                committed = Some((window, root));
             }
         }
 
         self.toplevel_commit(surface);
         self.layer_commit(surface);
         self.popup_commit(surface);
+        // After the lifecycle above: a commit that unmapped the window has nothing to tell.
+        if let Some((window, root)) = committed
+            && self.find_window(&root).is_some()
+            && !self.awaiting_buffer.contains(&window)
+        {
+            self.window_event(&window, WindowEvent::Committed);
+        }
         // A window that got its first buffer or a new size may now cover the pointer, or no
         // longer do so.
         self.update_pointer_focus();

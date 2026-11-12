@@ -31,7 +31,13 @@ use smithay::{
 };
 use std::{borrow::Cow, sync::Mutex, time::Duration};
 
-use crate::{Wirbel, workspace::FullKind};
+use crate::{
+    Wirbel,
+    config::Config,
+    scene_override::{OutputElement, SceneOverrideSlot},
+    state::{BorderEdge, border_edges},
+    workspace::{Frame, FullKind},
+};
 
 smithay::backend::renderer::element::render_elements! {
     pub SceneElement<R> where R: ImportAll + ImportMem;
@@ -104,50 +110,77 @@ impl Wirbel {
         tiers
     }
 
-    fn layer_elements<R>(
-        &self,
-        renderer: &mut R,
-        entries: &[LayerEntry],
-        origin: Point<i32, Logical>,
-        scale: Scale<f64>,
-    ) -> Vec<SceneElement<R>>
+    /// The render override that draws `output` now: one that works, and the session is not
+    /// locked (the lock screen replaces everything).
+    pub fn shown_override(&self, output: &Output) -> Option<&SceneOverrideSlot> {
+        self.scene_override
+            .as_ref()
+            .filter(|slot| slot.output() == output && !slot.is_broken() && !self.lock.is_active())
+    }
+
+    /// The layer surfaces drawn over the render override of `output` (its
+    /// `SceneOverride::layers_above`), front to back, each with its popups. None without an
+    /// override drawing there.
+    pub fn override_layers(&self, output: &Output) -> Vec<LayerEntry> {
+        let Some(slot) = self.shown_override(output) else {
+            return Vec::new();
+        };
+        let shown = slot.layers_above();
+        let origin = self
+            .space
+            .output_geometry(output)
+            .map(|geometry| geometry.loc)
+            .unwrap_or_default();
+        let map = layer_map_for_output(output);
+        let order = [Layer::Overlay, Layer::Top, Layer::Bottom, Layer::Background];
+        let layers = order.into_iter().filter(|layer| shown.contains(layer));
+        layers
+            .flat_map(|layer| map.layers_on(layer).rev())
+            .map(|surface| LayerEntry {
+                layer: surface.clone(),
+                location: origin + map.layer_geometry(surface).unwrap_or_default().loc,
+                part: LayerPart::Whole,
+            })
+            .collect()
+    }
+
+    /// What a backend draws on `output`: the cursor and the layer surfaces it keeps on top of the
+    /// render override of that output, if there is one that works, otherwise the scene. A locked
+    /// session always gets the scene, which then is the lock surface. Overrides retired from the
+    /// output come first, to release their GL objects (`Wirbel::set_scene_override`).
+    pub fn output_elements<R>(&self, renderer: &mut R, output: &Output) -> Vec<OutputElement<R>>
     where
         R: Renderer + ImportAll + ImportMem,
-        R::TextureId: Clone + Texture + 'static,
+        R::TextureId: Clone + Texture + Send + 'static,
     {
-        let mut elements = Vec::new();
-        for entry in entries {
-            let surface = entry.layer.wl_surface();
-            let location: Point<i32, Physical> =
-                (entry.location - origin).to_physical_precise_round(scale);
-            if entry.part == LayerPart::Whole {
-                elements.extend(entry.layer.render_elements(renderer, location, scale, 1.0));
-                continue;
-            }
-            if entry.part == LayerPart::Popups {
-                for (popup, offset) in PopupManager::popups_for_surface(surface) {
-                    let offset = offset - popup.geometry().loc;
-                    let location =
-                        (entry.location + offset - origin).to_physical_precise_round(scale);
-                    elements.extend(render_elements_from_surface_tree(
-                        renderer,
-                        popup.wl_surface(),
-                        location,
-                        scale,
-                        1.0,
-                        Kind::Unspecified,
-                    ));
+        // Retired overrides clean up first, in front so that nothing hides them.
+        let mut elements: Vec<OutputElement<R>> = self
+            .release_elements(output)
+            .map(OutputElement::Override)
+            .collect();
+        match self.shown_override(output) {
+            Some(slot) => {
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let origin = self
+                    .space
+                    .output_geometry(output)
+                    .map(|geometry| geometry.loc)
+                    .unwrap_or_default();
+                // A filter that holds the input has no pointer to show.
+                if !self.input_held() {
+                    let cursor = self.cursor_elements(renderer, origin, scale);
+                    elements.extend(cursor.into_iter().map(OutputElement::Scene));
                 }
-                continue;
+                let layers = self.override_layers(output);
+                let layers = layer_elements(renderer, &layers, origin, scale);
+                elements.extend(layers.into_iter().map(OutputElement::Scene));
+                elements.push(OutputElement::Override(slot.element()));
             }
-            elements.extend(render_elements_from_surface_tree(
-                renderer,
-                surface,
-                location,
-                scale,
-                1.0,
-                Kind::Unspecified,
-            ));
+            _ => elements.extend(
+                self.scene_elements(renderer, output)
+                    .into_iter()
+                    .map(OutputElement::Scene),
+            ),
         }
         elements
     }
@@ -189,7 +222,7 @@ impl Wirbel {
         let tiers = self
             .monitor_of_output(output)
             .map_or_else(LayerTiers::default, |index| self.layer_tiers(index));
-        elements.extend(self.layer_elements(renderer, &tiers.above, origin, scale));
+        elements.extend(layer_elements(renderer, &tiers.above, origin, scale));
 
         for window in self.space.elements_for_output(output).rev() {
             let Some(location) = self.space.element_location(window) else {
@@ -211,7 +244,7 @@ impl Wirbel {
                 Some(clip) => {
                     let clip = Rectangle::new(clip.loc + shift - origin, clip.size);
                     let at = location + shift - origin;
-                    elements.extend(self.clipped_window(renderer, window, at, clip, scale, alpha));
+                    elements.extend(clipped_window(renderer, window, at, clip, scale, alpha));
                 }
             }
 
@@ -228,7 +261,7 @@ impl Wirbel {
                 ))
             }));
         }
-        elements.extend(self.layer_elements(renderer, &tiers.below, origin, scale));
+        elements.extend(layer_elements(renderer, &tiers.below, origin, scale));
         elements
     }
 
@@ -252,51 +285,6 @@ impl Wirbel {
         let bound = frame.tiled || frame.request.full.is_some();
         let inner = frame.inner;
         bound.then(|| Rectangle::new((inner.x, inner.y).into(), (inner.w, inner.h).into()))
-    }
-
-    /// A window cut off at `clip`. Its popups are not, they are supposed to leave the window.
-    fn clipped_window<R>(
-        &self,
-        renderer: &mut R,
-        window: &Window,
-        location: Point<i32, Logical>,
-        clip: Rectangle<i32, Logical>,
-        scale: Scale<f64>,
-        alpha: f32,
-    ) -> Vec<SceneElement<R>>
-    where
-        R: Renderer + ImportAll + ImportMem,
-        R::TextureId: Clone + Texture + 'static,
-    {
-        let mut elements = Vec::new();
-        let Some(surface) = window.wl_surface() else {
-            return elements;
-        };
-        for (popup, offset) in PopupManager::popups_for_surface(&surface) {
-            let offset = window.geometry().loc + offset - popup.geometry().loc;
-            elements.extend(render_elements_from_surface_tree(
-                renderer,
-                popup.wl_surface(),
-                (location + offset).to_physical_precise_round(scale),
-                scale,
-                alpha,
-                Kind::Unspecified,
-            ));
-        }
-        let clip = clip.to_physical_precise_round(scale);
-        let tree: Vec<WaylandSurfaceRenderElement<R>> = render_elements_from_surface_tree(
-            renderer,
-            &surface,
-            location.to_physical_precise_round::<_, i32>(scale),
-            scale,
-            alpha,
-            Kind::Unspecified,
-        );
-        elements.extend(tree.into_iter().filter_map(|element| {
-            let cropped = CropRenderElement::from_element(element, scale, clip)?;
-            Some(SceneElement::Cropped(cropped))
-        }));
-        elements
     }
 
     /// The cursor and a dragged icon. Named cursors come from `cursors`, nested the host has them.
@@ -469,7 +457,7 @@ impl Wirbel {
                 send_frames_surface_tree(&surface, output, time, throttle, scanout);
             }
         } else {
-            for window in self.space.elements_for_output(output) {
+            for window in self.frame_windows(output) {
                 window.send_frame(output, time, throttle, scanout);
             }
             for layer in layer_map_for_output(output).layers() {
@@ -485,4 +473,194 @@ impl Wirbel {
             send_frames_surface_tree(icon, output, time, throttle, scanout);
         }
     }
+}
+
+/// A desktop drawn into a picture of its own instead of onto an output (a texture, say): the
+/// windows of a workspace at the places `Workspace::frames` gave them, with their borders and
+/// whatever layer surfaces belong to the picture. Frames are in logical pixels from the picture's
+/// top left; layer entries are global, `origin` is where the picture's top left is for them.
+/// Whoever lays the workspace out keeps this up to date; `elements` draws it.
+#[derive(Default)]
+pub struct DesktopScene {
+    /// Layer surfaces over the windows, front to back.
+    pub above: Vec<LayerEntry>,
+    /// Bottom to top, as `Workspace::frames` gives them.
+    frames: Vec<Frame>,
+    borders: Vec<(Window, Vec<BorderEdge>)>,
+    /// Layer surfaces under the windows, front to back.
+    pub below: Vec<LayerEntry>,
+    pub origin: Point<i32, Logical>,
+    /// The colour under everything (an output shows `background_color` there).
+    pub background: [f32; 4],
+}
+
+impl DesktopScene {
+    pub fn frames(&self) -> &[Frame] {
+        &self.frames
+    }
+
+    /// Takes a new layout and makes the borders for it, `focused`'s in the focus colour. Borders
+    /// are made again only when something about them changed: a new border is new damage.
+    pub fn set_frames(&mut self, frames: Vec<Frame>, focused: Option<&Window>, config: &Config) {
+        let colour = |frame: &Frame| {
+            if focused == Some(&frame.window) {
+                config.focus_color
+            } else {
+                config.border_color
+            }
+        };
+        let same = frames.len() == self.frames.len()
+            && frames.iter().zip(&self.frames).all(|(new, old)| {
+                new.window == old.window
+                    && new.outer == old.outer
+                    && new.inner == old.inner
+                    && new.has_border == old.has_border
+            })
+            && self.borders.iter().all(|(window, edges)| {
+                let frame = frames.iter().find(|frame| frame.window == *window);
+                frame.is_some_and(|frame| edges.iter().all(|edge| edge.color == colour(frame)))
+            });
+        // An output has no alpha: what it shows of the colour is opaque.
+        let [r, g, b, _] = config.background_color;
+        self.background = [r, g, b, 1.0];
+        if !same {
+            self.borders = frames
+                .iter()
+                .filter(|frame| frame.has_border)
+                .map(|frame| {
+                    let edges = border_edges(frame.outer, config.border_width, colour(frame));
+                    (frame.window.clone(), edges.collect())
+                })
+                .collect();
+        }
+        self.frames = frames;
+    }
+
+    /// Everything in the picture, front to back, as `Wirbel::scene_elements` has it for an
+    /// output: the layers above, each window on top of its own border, the layers below. A tile
+    /// that draws more than its place is cut off there.
+    pub fn elements<R>(&self, renderer: &mut R, scale: Scale<f64>) -> Vec<SceneElement<R>>
+    where
+        R: Renderer + ImportAll + ImportMem,
+        R::TextureId: Clone + Texture + 'static,
+    {
+        let mut elements = layer_elements(renderer, &self.above, self.origin, scale);
+        for frame in self.frames.iter().rev() {
+            let window = &frame.window;
+            let inner = Point::<i32, Logical>::from((frame.inner.x, frame.inner.y));
+            let location = inner - window.geometry().loc;
+            let mut bbox = window.bbox();
+            bbox.loc += location;
+            let clip = Rectangle::new(inner, (frame.inner.w, frame.inner.h).into());
+            if frame.tiled && !clip.contains_rect(bbox) {
+                elements.extend(clipped_window(renderer, window, location, clip, scale, 1.0));
+            } else {
+                let location = location.to_physical_precise_round(scale);
+                elements.extend(window.render_elements(renderer, location, scale, 1.0));
+            }
+            let border = self.borders.iter().find(|(owner, _)| owner == window);
+            let edges = border.into_iter().flat_map(|(_, edges)| edges);
+            elements.extend(edges.map(|edge| {
+                SceneElement::Solid(SolidColorRenderElement::from_buffer(
+                    &edge.buffer,
+                    edge.location.to_physical_precise_round(scale),
+                    scale,
+                    1.0,
+                    Kind::Unspecified,
+                ))
+            }));
+        }
+        elements.extend(layer_elements(renderer, &self.below, self.origin, scale));
+        elements
+    }
+}
+
+fn layer_elements<R>(
+    renderer: &mut R,
+    entries: &[LayerEntry],
+    origin: Point<i32, Logical>,
+    scale: Scale<f64>,
+) -> Vec<SceneElement<R>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + 'static,
+{
+    let mut elements = Vec::new();
+    for entry in entries {
+        let surface = entry.layer.wl_surface();
+        let location: Point<i32, Physical> =
+            (entry.location - origin).to_physical_precise_round(scale);
+        if entry.part == LayerPart::Whole {
+            elements.extend(entry.layer.render_elements(renderer, location, scale, 1.0));
+            continue;
+        }
+        if entry.part == LayerPart::Popups {
+            for (popup, offset) in PopupManager::popups_for_surface(surface) {
+                let offset = offset - popup.geometry().loc;
+                let location = (entry.location + offset - origin).to_physical_precise_round(scale);
+                elements.extend(render_elements_from_surface_tree(
+                    renderer,
+                    popup.wl_surface(),
+                    location,
+                    scale,
+                    1.0,
+                    Kind::Unspecified,
+                ));
+            }
+            continue;
+        }
+        elements.extend(render_elements_from_surface_tree(
+            renderer,
+            surface,
+            location,
+            scale,
+            1.0,
+            Kind::Unspecified,
+        ));
+    }
+    elements
+}
+
+/// A window cut off at `clip`. Its popups are not, they are supposed to leave the window.
+fn clipped_window<R>(
+    renderer: &mut R,
+    window: &Window,
+    location: Point<i32, Logical>,
+    clip: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Vec<SceneElement<R>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + 'static,
+{
+    let mut elements = Vec::new();
+    let Some(surface) = window.wl_surface() else {
+        return elements;
+    };
+    for (popup, offset) in PopupManager::popups_for_surface(&surface) {
+        let offset = window.geometry().loc + offset - popup.geometry().loc;
+        elements.extend(render_elements_from_surface_tree(
+            renderer,
+            popup.wl_surface(),
+            (location + offset).to_physical_precise_round(scale),
+            scale,
+            alpha,
+            Kind::Unspecified,
+        ));
+    }
+    let clip = clip.to_physical_precise_round(scale);
+    let tree: Vec<WaylandSurfaceRenderElement<R>> = render_elements_from_surface_tree(
+        renderer,
+        &surface,
+        location.to_physical_precise_round::<_, i32>(scale),
+        scale,
+        alpha,
+        Kind::Unspecified,
+    );
+    elements.extend(tree.into_iter().filter_map(|element| {
+        let cropped = CropRenderElement::from_element(element, scale, clip)?;
+        Some(SceneElement::Cropped(cropped))
+    }));
+    elements
 }

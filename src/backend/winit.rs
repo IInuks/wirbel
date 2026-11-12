@@ -18,7 +18,11 @@ use smithay::{
     reexports::{
         calloop::EventLoop,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
-        winit::{cursor::Cursor, dpi::LogicalSize, window::WindowAttributes},
+        winit::{
+            cursor::Cursor,
+            dpi::LogicalSize,
+            window::{CursorGrabMode, WindowAttributes},
+        },
     },
     utils::{DeviceFd, Transform},
     wayland::presentation::Refresh,
@@ -35,6 +39,10 @@ struct Nested {
     output: Output,
     /// Whether a frame went out yet. The surface has no buffer age before that.
     presented: bool,
+    /// Whether the host cursor is kept in the window for an input filter that holds the input.
+    /// The winit backend gives no raw mouse motion, so the filter sees absolute positions and
+    /// the cursor can only be confined, not locked.
+    confined: bool,
 }
 
 pub fn init(
@@ -78,6 +86,7 @@ pub fn init(
         backend,
         output,
         presented: false,
+        confined: false,
     }));
 
     state.redraw = {
@@ -164,7 +173,20 @@ fn offer_syncobj(node: DrmNode, state: &mut Wirbel) {
 impl Nested {
     fn render(&mut self, state: &mut Wirbel) {
         let start = state.stats.start();
+        let held = state.input_held();
+        if held != self.confined {
+            self.confined = held;
+            let mode = if held {
+                CursorGrabMode::Confined
+            } else {
+                CursorGrabMode::None
+            };
+            if let Err(err) = self.backend.window().set_cursor_grab(mode) {
+                tracing::debug!(%err, "failed to confine the host cursor");
+            }
+        }
         match &state.cursor_status {
+            _ if held => self.backend.window().set_cursor_visible(false),
             CursorImageStatus::Named(icon) => {
                 self.backend.window().set_cursor(Cursor::Icon(*icon));
                 self.backend.window().set_cursor_visible(true);
@@ -186,7 +208,7 @@ impl Nested {
                 return;
             }
         };
-        let elements = state.scene_elements(renderer, &self.output);
+        let elements = state.output_elements(renderer, &self.output);
         let (damage, states) = match self.damage_tracker.render_output(
             renderer,
             &mut framebuffer,
@@ -217,8 +239,12 @@ impl Nested {
             wp_presentation_feedback::Kind::empty(),
         );
         state.send_frame_callbacks(&self.output);
-        self.capturer
-            .run(state, self.backend.renderer(), &self.output);
+        self.capturer.run_with(
+            state,
+            self.backend.renderer(),
+            &self.output,
+            Wirbel::output_elements,
+        );
         state.stats.rendered(start);
         state.stats.queued();
         state.stats.vblank(

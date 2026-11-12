@@ -195,8 +195,10 @@ impl Wirbel {
         start: GrabStartData<Self>,
         serial: Serial,
     ) {
-        // Windows outside the workspaces, like X11 menus, cannot be dragged.
+        // Windows outside the workspaces, like X11 menus, cannot be dragged, and while an input
+        // filter routes the input the layout is not what the user sees.
         if self.drag.is_some()
+            || self.input_router().is_some()
             || self.full_kind(&window).is_some()
             || self.locate(&window).is_none()
         {

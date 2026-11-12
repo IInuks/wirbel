@@ -103,7 +103,7 @@ impl Wirbel {
         Some((&keyboard.modifier_state()).into())
     }
 
-    fn pointer_location(&self) -> Point<f64, Logical> {
+    pub(crate) fn pointer_location(&self) -> Point<f64, Logical> {
         let pointer = self.seat.get_pointer();
         pointer.map(|p| p.current_location()).unwrap_or_default()
     }

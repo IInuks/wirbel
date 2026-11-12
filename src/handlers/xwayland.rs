@@ -7,7 +7,10 @@
 
 use std::{
     borrow::Cow,
-    os::{fd::OwnedFd, unix::net::UnixStream},
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+        unix::net::UnixStream,
+    },
     path::Path,
     process::Stdio,
     time::{Duration, Instant},
@@ -57,6 +60,19 @@ use crate::{
 /// A server that dies this often in this time is not coming back.
 const MAX_STARTS: usize = 3;
 const START_WINDOW: Duration = Duration::from_secs(60);
+
+/// Whether nobody holds the write end of `pipe` any more.
+fn writer_gone(pipe: BorrowedFd) -> bool {
+    let mut poll = libc::pollfd {
+        fd: pipe.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, and the descriptor is borrowed for the call.
+    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+    // A failed poll cannot tell; the server is taken for dead as before.
+    ready < 0 || poll.revents & (libc::POLLHUP | libc::POLLERR) != 0
+}
 
 impl XWaylandShellHandler for Wirbel {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
@@ -118,14 +134,18 @@ impl Wirbel {
         self.loop_handle
             .insert_source(
                 Generic::new(pipe, Interest::READ, Mode::Level),
-                move |_, _, state| {
+                move |_, pipe, state| {
+                    let socket = state.xwayland.server.as_mut().map(XWayland::take_socket);
+                    // Xwayland writes the number and the newline separately, and Smithay waits
+                    // for the newline. Only a pipe without a writer means it died.
+                    if matches!(socket, Some(Ok(None))) && !writer_gone(pipe.as_fd()) {
+                        return Ok(PostAction::Continue);
+                    }
                     if let Some(shim) = &shim {
                         let _ = std::fs::remove_dir_all(shim);
                     }
-                    let socket = state.xwayland.server.as_mut().map(XWayland::take_socket);
                     match socket {
                         Some(Ok(Some(socket))) => state.xwayland_ready(socket, client.clone()),
-                        // Readable and nothing to read: the other end is closed.
                         _ => {
                             tracing::error!("Xwayland died while starting");
                             state.xwayland_gone();
@@ -172,6 +192,7 @@ impl Wirbel {
             .iter()
             .flat_map(|monitor| &monitor.workspaces)
             .flat_map(|workspace| workspace.windows())
+            .chain(self.held_windows.iter().cloned())
             .filter(|window| window.x11_surface().is_some())
             .collect();
         for window in &windows {
@@ -239,7 +260,9 @@ impl XwmHandler for Wirbel {
         }
         let window = Window::new_x11_window(surface);
         if self.place_x11_window(window.clone()) {
-            self.awaiting_buffer.push(window);
+            if !self.awaiting_buffer.contains(&window) {
+                self.awaiting_buffer.push(window);
+            }
             self.retile();
         }
     }
@@ -442,5 +465,22 @@ impl XwmHandler for Wirbel {
             tracing::warn!("Xwayland went away");
             self.xwayland_gone();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    #[test]
+    fn half_a_display_number_is_not_a_dead_server() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        assert!(!writer_gone(reader.as_fd()));
+        writer.write_all(b"5").unwrap();
+        assert!(!writer_gone(reader.as_fd()));
+        drop(writer);
+        assert!(writer_gone(reader.as_fd()));
     }
 }

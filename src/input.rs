@@ -27,6 +27,7 @@ use smithay::{
 use crate::{
     Wirbel,
     config::{Action, BTN_LEFT},
+    input_filter::{KeyVerdict, Verdict},
     layout::Direction,
     state::Target,
 };
@@ -114,7 +115,8 @@ impl Wirbel {
         self.idle_notifier_state.notify_activity(&seat);
     }
 
-    /// Binds take the key from clients, press and release alike. A bind on a modifier key leaves
+    /// An input filter sees the key before binds and clients (see `crate::input_filter`). Binds
+    /// take the key from clients, press and release alike. A bind on a modifier key leaves
     /// it to clients: wl_keyboard only sends modifiers along with a key that reaches them, so they
     /// would miss that Shift is down. A locked session has no binds: every key belongs to the lock
     /// screen. The two ways out work regardless, the session stays locked behind them: the
@@ -149,6 +151,19 @@ impl Wirbel {
                 }
                 KeyState::Pressed if wirbel.lock.is_active() => FilterResult::Forward,
                 KeyState::Pressed
+                    if let Some(action) = wirbel.filter_key(modifiers, &handle, true) =>
+                {
+                    // Modifier keys go on regardless, as for binds: a client that gets the
+                    // keyboard later must see them go up.
+                    if is_modifier_key(&handle) {
+                        wirbel.modifier_action = action;
+                        FilterResult::Forward
+                    } else {
+                        wirbel.swallowed_keys.push(key);
+                        FilterResult::Intercept(action)
+                    }
+                }
+                KeyState::Pressed
                     if wirbel.plugin_input.in_session()
                         && handle.modified_sym() == Keysym::Escape =>
                 {
@@ -171,10 +186,14 @@ impl Wirbel {
                     }
                 }
                 KeyState::Released => {
+                    let filtered = wirbel.filter_key(modifiers, &handle, false).is_some();
                     let swallowed = wirbel.swallowed_keys.iter().position(|other| *other == key);
                     match swallowed {
                         Some(index) => {
                             wirbel.swallowed_keys.swap_remove(index);
+                            FilterResult::Intercept(None)
+                        }
+                        None if filtered && !is_modifier_key(&handle) => {
                             FilterResult::Intercept(None)
                         }
                         None => FilterResult::Forward,
@@ -192,6 +211,22 @@ impl Wirbel {
             self.run_action(action);
         }
         self.grab_check_modifiers();
+    }
+
+    /// Asks the input filter about a key. `None` if it passes the key on, else the action to run,
+    /// if any.
+    fn filter_key(
+        &mut self,
+        modifiers: &ModifiersState,
+        handle: &KeysymHandle<'_>,
+        pressed: bool,
+    ) -> Option<Option<Action>> {
+        let filter = self.input_filter()?;
+        match filter.key(self, modifiers.into(), handle, pressed) {
+            KeyVerdict::Pass => None,
+            KeyVerdict::Consume => Some(None),
+            KeyVerdict::Run(action) => Some(Some(action)),
+        }
     }
 
     /// Runs `action` again while its key stays down. Every key event ends that.
@@ -231,6 +266,12 @@ impl Wirbel {
         delta_unaccel: Point<f64, Logical>,
         time: InputTime,
     ) {
+        if let Some(filter) = self.input_filter()
+            && filter.pointer_delta(self, delta, delta_unaccel) == Verdict::Consume
+        {
+            self.note_activity();
+            return;
+        }
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
@@ -240,7 +281,7 @@ impl Wirbel {
             time,
         };
         let location = pointer.current_location();
-        let under = self.surface_under(location);
+        let under = self.pointer_target(location);
         pointer.relative_motion(self, under, &event);
         pointer.frame(self);
 
@@ -254,7 +295,7 @@ impl Wirbel {
                     (location.x, target.y).into(),
                 ];
                 let allowed = candidates.into_iter().find(|candidate| {
-                    self.surface_under(*candidate)
+                    self.pointer_target(*candidate)
                         .is_some_and(|(under, origin)| {
                             let local = (*candidate - origin).to_i32_floor();
                             under == surface
@@ -287,6 +328,11 @@ impl Wirbel {
 
     pub fn on_pointer_motion(&mut self, location: Point<f64, Logical>, time: InputTime) {
         self.note_activity();
+        if let Some(filter) = self.input_filter()
+            && filter.pointer_motion(self, location) == Verdict::Consume
+        {
+            return;
+        }
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
@@ -305,6 +351,7 @@ impl Wirbel {
             self.drag_motion(location);
         } else if self.config.sloppy_focus
             && !pointer.is_grabbed()
+            && self.input_router().is_none()
             && let Some(window) = self.window_at(location)
             && self.focused.as_ref() != Some(&window)
         {
@@ -328,11 +375,28 @@ impl Wirbel {
         if button == BTN_LEFT {
             self.left_held = pressed;
         }
+        if let Some(filter) = self.input_filter()
+            && filter.pointer_button(self, button, pressed) == Verdict::Consume
+        {
+            if pressed {
+                self.swallowed_buttons.push(button);
+            } else {
+                self.swallowed_buttons.retain(|other| *other != button);
+            }
+            return;
+        }
+        // The press went to the filter, which is gone now: the client never saw it.
+        if !pressed && let Some(index) = self.swallowed_buttons.iter().position(|b| *b == button) {
+            self.swallowed_buttons.swap_remove(index);
+            return;
+        }
         if self.grab_button(button, pressed) {
             return;
         }
         let popup_grab = self.popup_grab.is_some();
-        if pressed && !pointer.is_grabbed() {
+        // A filter that routes the input focuses on its own; the layout's clicks do not apply.
+        let routed = self.input_router().is_some();
+        if pressed && !pointer.is_grabbed() && !routed {
             self.press(Some(button), serial);
         }
         pointer.button(
@@ -352,7 +416,9 @@ impl Wirbel {
             if pressed && popup_grab {
                 // The client has this press already, so no bind can claim it.
                 self.end_popup_grab();
-                self.press(None, serial);
+                if !routed {
+                    self.press(None, serial);
+                }
             }
         }
     }
@@ -417,6 +483,11 @@ impl Wirbel {
 
     pub fn on_pointer_axis(&mut self, scroll: Scroll) {
         self.note_activity();
+        if let Some(filter) = self.input_filter()
+            && filter.pointer_axis(self, &scroll) == Verdict::Consume
+        {
+            return;
+        }
         if self.axis_bind(&scroll) {
             return;
         }
@@ -474,7 +545,7 @@ impl Scroll {
     }
 
     /// Where this scrolls to, up or down if it does both.
-    fn direction(&self) -> Option<Direction> {
+    pub fn direction(&self) -> Option<Direction> {
         let value = |(amount, v120): (Option<f64>, Option<f64>)| {
             amount.or(v120).filter(|value| *value != 0.0)
         };

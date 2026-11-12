@@ -96,6 +96,11 @@ pub enum Action {
     MoveToOutput(Direction),
     /// Not for binds: comes from the VT keys, which work regardless of them.
     ChangeVt(i32),
+    /// The action of an extension, by its name, see `crate::extension`.
+    Extension {
+        name: String,
+        argument: String,
+    },
 }
 
 impl Action {
@@ -405,15 +410,20 @@ impl Config {
         modifiers: Modifiers,
         handle: &KeysymHandle<'_>,
     ) -> Option<&Action> {
-        let produced = handle.modified_syms();
-        let raw = handle.raw_syms();
+        self.action_for_syms(modifiers, &handle.modified_syms(), &handle.raw_syms())
+    }
+
+    /// `action_for_key` for a key that produces `produced` with the active modifiers and `raw`
+    /// without them.
+    pub fn action_for_syms(
+        &self,
+        modifiers: Modifiers,
+        produced: &[Keysym],
+        raw: &[Keysym],
+    ) -> Option<&Action> {
         self.binds
             .iter()
-            .find(|bind| {
-                (produced.contains(&bind.key) || raw.contains(&bind.key))
-                    && (bind.modifiers == modifiers
-                        || bind.modifiers == modifiers.without_key(bind.key))
-            })
+            .find(|bind| key_matches(bind.modifiers, bind.key, modifiers, produced, raw))
             .map(|bind| &bind.action)
     }
 
@@ -433,6 +443,19 @@ impl Config {
     }
 }
 
+/// Whether a press with `modifiers` held, producing `produced` (or `raw` without the modifiers),
+/// is the key `key` with `wanted` held, as binds match.
+pub fn key_matches(
+    wanted: Modifiers,
+    key: Keysym,
+    modifiers: Modifiers,
+    produced: &[Keysym],
+    raw: &[Keysym],
+) -> bool {
+    (produced.contains(&key) || raw.contains(&key))
+        && (wanted == modifiers || wanted == modifiers.without_key(key))
+}
+
 fn parse_size(value: &str) -> Result<i32, String> {
     value
         .parse::<u16>()
@@ -440,7 +463,8 @@ fn parse_size(value: &str) -> Result<i32, String> {
         .map_err(|_| format!("expected a number from 0 to 65535, got `{value}`"))
 }
 
-pub(crate) fn parse_bool(value: &str) -> Result<bool, String> {
+/// `1`, `true`, `yes`, `on` or `0`, `false`, `no`, `off`, as the config writes them.
+pub fn parse_bool(value: &str) -> Result<bool, String> {
     match value {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
@@ -449,7 +473,7 @@ pub(crate) fn parse_bool(value: &str) -> Result<bool, String> {
 }
 
 /// Returns premultiplied RGBA, which is what the renderer wants.
-pub(crate) fn parse_color(value: &str) -> Result<[f32; 4], String> {
+pub fn parse_color(value: &str) -> Result<[f32; 4], String> {
     let error = || format!("expected a colour like 0xRRGGBB, got `{value}`");
     let digits = value
         .strip_prefix("0x")
@@ -470,7 +494,8 @@ pub(crate) fn parse_color(value: &str) -> Result<[f32; 4], String> {
     ])
 }
 
-pub(crate) fn parse_modifiers(value: &str) -> Result<Modifiers, String> {
+/// `SUPER+SHIFT` and the like, as the first field of a bind.
+pub fn parse_modifiers(value: &str) -> Result<Modifiers, String> {
     let mut modifiers = Modifiers::default();
     for name in value.split('+').map(str::trim) {
         match name.to_ascii_lowercase().as_str() {
@@ -486,7 +511,8 @@ pub(crate) fn parse_modifiers(value: &str) -> Result<Modifiers, String> {
     Ok(modifiers)
 }
 
-fn parse_key(name: &str) -> Result<Keysym, String> {
+/// A key by its xkb name, as the second field of a bind.
+pub fn parse_key(name: &str) -> Result<Keysym, String> {
     let mut chars = name.chars();
     let key = match (chars.next(), chars.next()) {
         // Letters are stored in lower case, which is what an unshifted key produces.
@@ -559,7 +585,15 @@ pub(crate) fn parse_action(name: &str, argument: &str) -> Result<Action, String>
         "float" => Action::Float,
         "fullscreen" => Action::Fullscreen,
         "maximize" => Action::Maximize,
-        _ => return Err(format!("unknown action `{name}`")),
+        _ => {
+            let info = crate::extension::registered(name)
+                .ok_or_else(|| format!("unknown action `{name}`"))?;
+            (info.check)(argument)?;
+            return Ok(Action::Extension {
+                name: info.name.to_string(),
+                argument: argument.to_string(),
+            });
+        }
     };
     if argument.is_empty() {
         Ok(action)
@@ -648,7 +682,8 @@ fn parse_monitor_rule(value: &str) -> Result<MonitorRule, String> {
     Ok(rule)
 }
 
-pub(crate) fn parse_button(button: &str) -> Result<u32, String> {
+/// A mouse button by its name, such as `btn_left`, as in a mousebind.
+pub fn parse_button(button: &str) -> Result<u32, String> {
     match button {
         "btn_left" => Ok(BTN_LEFT),
         "btn_right" => Ok(BTN_RIGHT),
@@ -909,6 +944,7 @@ mod tests {
              bind = SUPER, a, workspace, 10\n\
              bind = SUPER, a, spawn\n\
              bind = SUPER, a, split_ratio, NaN\n\
+             bind = SUPER, a, dance, wildly\n\
              mousebind = SUPER, btn_side, move\n\
              mousebind = SUPER, btn_left, poke\n\
              mousebind = SUPER\n\
@@ -920,7 +956,9 @@ mod tests {
         let lines: Vec<usize> = errors.iter().map(|error| error.line).collect();
         assert_eq!(
             lines,
-            [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+            [
+                3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+            ]
         );
         assert_eq!(errors[2].to_string(), "line 5: unknown option `wobble`");
     }

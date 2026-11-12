@@ -154,6 +154,7 @@ impl Wirbel {
         let workspaces = self.monitors.iter().flat_map(|monitor| &monitor.workspaces);
         workspaces
             .flat_map(|workspace| workspace.windows())
+            .chain(self.held_windows.iter().cloned())
             .filter(|window| !self.awaiting_buffer.contains(window))
             .collect()
     }

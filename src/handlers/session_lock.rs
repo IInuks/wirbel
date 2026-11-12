@@ -140,9 +140,9 @@ impl SessionLockHandler for Wirbel {
 }
 
 impl Wirbel {
-    /// Takes the seat away from everybody the moment the session locks: popups, drags and even a
-    /// button held down over a client.
-    fn release_input(&mut self) {
+    /// Takes the seat away from everybody the moment the session locks (or an input filter takes
+    /// over): popups, drags and even a button held down over a client.
+    pub fn release_input(&mut self) {
         self.end_session(false);
         self.end_popup_grab();
         self.finish_drag();

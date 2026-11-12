@@ -1,1854 +1,8 @@
 //! Runs the compositor without a backend and talks to it as a real Wayland client. Input is
-//! injected where a backend would deliver it, output is rendered with pixman.
+//! injected where a backend would deliver it, output is rendered with pixman. The harness is
+//! `wirbel::test_harness`.
 
-use std::{
-    cell::RefCell,
-    env,
-    fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
-    os::{fd::AsFd, unix::net::UnixStream},
-    path::PathBuf,
-    process::{Child, Command, Stdio},
-    sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicU32, Ordering},
-        mpsc,
-    },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
-};
-
-use smithay::backend::input::{Axis, AxisSource};
-use smithay::{
-    backend::{
-        allocator::Fourcc,
-        input::{ButtonState, InputTime, KeyState},
-        renderer::{
-            Bind, ExportMem, Offscreen, damage::OutputDamageTracker, pixman::PixmanRenderer,
-        },
-    },
-    output::{Mode, Output, PhysicalProperties, Subpixel},
-    reexports::{
-        calloop::{EventLoop, channel},
-        pixman::Image,
-        wayland_server::Display,
-    },
-    utils::{Buffer, Rectangle, Size, Transform},
-};
-use smithay::{
-    reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback as server_feedback,
-    wayland::{pointer_constraints::with_pointer_constraint, presentation::Refresh},
-};
-use wayland_client::{
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop,
-    event_created_child,
-    globals::{GlobalList, GlobalListContents, registry_queue_init},
-    protocol::{
-        wl_buffer::WlBuffer,
-        wl_compositor::WlCompositor,
-        wl_data_device::{self, WlDataDevice},
-        wl_data_device_manager::WlDataDeviceManager,
-        wl_data_offer::WlDataOffer,
-        wl_data_source::{self, WlDataSource},
-        wl_keyboard::{self, WlKeyboard},
-        wl_output::{self, WlOutput},
-        wl_pointer::{self, WlPointer},
-        wl_region::WlRegion,
-        wl_registry::WlRegistry,
-        wl_seat::WlSeat,
-        wl_shm::{Format, WlShm},
-        wl_shm_pool::WlShmPool,
-        wl_subcompositor::WlSubcompositor,
-        wl_subsurface::WlSubsurface,
-        wl_surface::WlSurface,
-    },
-};
-use wayland_protocols::ext::idle_notify::v1::client::{
-    ext_idle_notification_v1::{self, ExtIdleNotificationV1},
-    ext_idle_notifier_v1::ExtIdleNotifierV1,
-};
-use wayland_protocols::ext::image_capture_source::v1::client::{
-    ext_image_capture_source_v1::ExtImageCaptureSourceV1,
-    ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
-};
-use wayland_protocols::ext::image_copy_capture::v1::client::{
-    ext_image_copy_capture_frame_v1::{self, ExtImageCopyCaptureFrameV1},
-    ext_image_copy_capture_manager_v1::{ExtImageCopyCaptureManagerV1, Options},
-    ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
-};
-use wayland_protocols::ext::session_lock::v1::client::{
-    ext_session_lock_manager_v1::ExtSessionLockManagerV1,
-    ext_session_lock_surface_v1::{self, ExtSessionLockSurfaceV1},
-    ext_session_lock_v1::{self, ExtSessionLockV1},
-};
-use wayland_protocols::wp::cursor_shape::v1::client::{
-    wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
-    wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
-};
-use wayland_protocols::wp::fractional_scale::v1::client::{
-    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
-    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
-};
-use wayland_protocols::wp::idle_inhibit::zv1::client::{
-    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
-};
-use wayland_protocols::wp::linux_dmabuf::zv1::client::{
-    zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
-    zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
-};
-use wayland_protocols::wp::pointer_constraints::zv1::client::{
-    zwp_confined_pointer_v1::{self, ZwpConfinedPointerV1},
-    zwp_locked_pointer_v1::{self, ZwpLockedPointerV1},
-    zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1},
-};
-use wayland_protocols::wp::presentation_time::client::{
-    wp_presentation::WpPresentation,
-    wp_presentation_feedback::{self, WpPresentationFeedback},
-};
-use wayland_protocols::wp::primary_selection::zv1::client::{
-    zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
-    zwp_primary_selection_device_v1::{self, ZwpPrimarySelectionDeviceV1},
-    zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
-    zwp_primary_selection_source_v1::{self, ZwpPrimarySelectionSourceV1},
-};
-use wayland_protocols::wp::relative_pointer::zv1::client::{
-    zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
-    zwp_relative_pointer_v1::{self, ZwpRelativePointerV1},
-};
-use wayland_protocols::wp::viewporter::client::{
-    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
-};
-use wayland_protocols::xdg::activation::v1::client::{
-    xdg_activation_token_v1::{self, XdgActivationTokenV1},
-    xdg_activation_v1::XdgActivationV1,
-};
-use wayland_protocols::xdg::decoration::zv1::client::{
-    zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
-    zxdg_toplevel_decoration_v1::{self, ZxdgToplevelDecorationV1},
-};
-use wayland_protocols::xdg::shell::client::{
-    xdg_popup::{self, XdgPopup},
-    xdg_positioner::{self, XdgPositioner},
-    xdg_surface::{self, XdgSurface},
-    xdg_toplevel::{self, XdgToplevel},
-    xdg_wm_base::{self, XdgWmBase},
-};
-use wayland_protocols::xdg::xdg_output::zv1::client::{
-    zxdg_output_manager_v1::ZxdgOutputManagerV1,
-    zxdg_output_v1::{self, ZxdgOutputV1},
-};
-use wayland_protocols_wlr::data_control::v1::client::{
-    zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
-    zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
-    zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
-    zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
-};
-use wayland_protocols_wlr::foreign_toplevel::v1::client::{
-    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
-    zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
-};
-use wayland_protocols_wlr::layer_shell::v1::client::{
-    zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
-    zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
-};
-use wayland_protocols_wlr::screencopy::v1::client::{
-    zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
-    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
-};
-use wirbel::{
-    Wirbel, config::Config, focus::KeyboardFocus, handlers::Capturer, input::Scroll, ipc::Position,
-    layout::Rect, workspace::Placement,
-};
-use x11rb::{
-    COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT,
-    connection::Connection as _,
-    protocol::{
-        Event,
-        xproto::{
-            AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
-            EventMask, GrabMode, GrabStatus, PropMode, WindowClass,
-        },
-    },
-    rust_connection::RustConnection,
-    wrapper::ConnectionExt as _,
-};
-
-const WIDTH: i32 = 1000;
-const HEIGHT: i32 = 600;
-const CONTROL_TEXT: &[u8] = b"from the clipboard manager";
-const BTN_LEFT: u32 = 0x110;
-const BTN_RIGHT: u32 = 0x111;
-
-// Evdev key codes.
-const KEY_1: u32 = 2;
-const KEY_2: u32 = 3;
-const KEY_3: u32 = 4;
-const KEY_Q: u32 = 16;
-const KEY_W: u32 = 17;
-const KEY_Y: u32 = 21; // z on a German keyboard
-const KEY_R: u32 = 19;
-const KEY_F: u32 = 33;
-const KEY_A: u32 = 30;
-const KEY_ENTER: u32 = 28;
-const KEY_LEFTCTRL: u32 = 29;
-const KEY_LEFTSHIFT: u32 = 42;
-const KEY_LEFTALT: u32 = 56;
-const KEY_LEFTMETA: u32 = 125;
-const KEY_UP: u32 = 103;
-const KEY_LEFT: u32 = 105;
-const KEY_RIGHT: u32 = 106;
-const KEY_DOWN: u32 = 108;
-const KEY_TAB: u32 = 15;
-
-type Job = Box<dyn FnOnce(&mut Wirbel) + Send>;
-
-struct Compositor {
-    jobs: channel::Sender<Job>,
-    socket: PathBuf,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Compositor {
-    /// The default configuration with focus on click, which is what most tests want to see.
-    fn start() -> Self {
-        Self::start_with("sloppy_focus = 0\nwarp_cursor = 0\n")
-    }
-
-    fn start_with(config: &str) -> Self {
-        let (config, errors) = Config::parse(config);
-        assert_eq!(errors, []);
-        let (jobs, job_source) = channel::channel::<Job>();
-        let (socket_tx, socket_rx) = mpsc::channel();
-
-        let thread = thread::spawn(move || {
-            let mut event_loop = EventLoop::try_new().unwrap();
-            let display = Display::new().unwrap();
-            let mut state = Wirbel::new(&mut event_loop, display, config).unwrap();
-
-            let output = test_output("test", (0, 0));
-            let _global = output.create_global::<Wirbel>(&state.display_handle);
-            state.add_output(&output);
-
-            event_loop
-                .handle()
-                .insert_source(job_source, |event, _, state| {
-                    if let channel::Event::Msg(job) = event {
-                        job(state);
-                    }
-                })
-                .unwrap();
-
-            socket_tx.send(state.socket_name.clone()).unwrap();
-            event_loop
-                .run(None, &mut state, Wirbel::after_dispatch)
-                .unwrap();
-        });
-
-        let name = socket_rx.recv().unwrap();
-        let socket = PathBuf::from(env::var_os("XDG_RUNTIME_DIR").unwrap()).join(name);
-        Self {
-            jobs,
-            socket,
-            thread: Some(thread),
-        }
-    }
-
-    /// Runs `job` on the compositor thread and returns its result.
-    fn with<R: Send + 'static>(&self, job: impl FnOnce(&mut Wirbel) -> R + Send + 'static) -> R {
-        let (tx, rx) = mpsc::channel();
-        self.jobs
-            .send(Box::new(move |state| tx.send(job(state)).unwrap()))
-            .unwrap();
-        rx.recv().unwrap()
-    }
-
-    fn pointer_at(&self, x: f64, y: f64) {
-        self.with(move |state| state.on_pointer_motion((x, y).into(), InputTime::now()));
-    }
-
-    fn click(&self) {
-        self.with(|state| {
-            state.on_pointer_button(BTN_LEFT, ButtonState::Pressed, InputTime::now());
-            state.on_pointer_button(BTN_LEFT, ButtonState::Released, InputTime::now());
-        });
-    }
-
-    fn button(&self, button: u32, button_state: ButtonState) {
-        self.with(move |state| state.on_pointer_button(button, button_state, InputTime::now()));
-    }
-
-    fn key(&self, evdev: u32, key_state: KeyState) {
-        self.with(move |state| {
-            state.on_key((evdev + 8).into(), key_state, InputTime::now());
-        });
-    }
-
-    fn tap_key(&self, evdev: u32) {
-        self.key(evdev, KeyState::Pressed);
-        self.key(evdev, KeyState::Released);
-    }
-
-    /// Taps `key` with `modifiers` held.
-    fn chord(&self, modifiers: &[u32], key: u32) {
-        for modifier in modifiers {
-            self.key(*modifier, KeyState::Pressed);
-        }
-        self.tap_key(key);
-        for modifier in modifiers.iter().rev() {
-            self.key(*modifier, KeyState::Released);
-        }
-    }
-
-    /// Adds a 1000x600 output at `location` and returns it.
-    fn add_output(&self, name: &'static str, location: (i32, i32)) -> Output {
-        self.with(move |state| {
-            let output = test_output(name, location);
-            let _global = output.create_global::<Wirbel>(&state.display_handle);
-            state.add_output(&output);
-            output
-        })
-    }
-
-    fn focused_rect(&self) -> Option<Rect> {
-        self.with(|state| {
-            let focused = state.focused.as_ref()?;
-            let frames = state.frames.iter();
-            frames
-                .into_iter()
-                .find(|frame| frame.window == *focused)
-                .map(|frame| frame.inner)
-        })
-    }
-
-    /// Geometry of all visible windows, by rectangle of their content.
-    fn frames(&self) -> Vec<Rect> {
-        self.with(|state| state.frames.iter().map(|frame| frame.inner).collect())
-    }
-
-    fn active_workspace(&self) -> usize {
-        self.with(|state| state.monitors[state.active_monitor].active)
-    }
-
-    fn screenshot(&self) -> Screenshot {
-        self.screenshot_of(0)
-    }
-
-    /// What a backend does for screen captures after it drew `monitor`.
-    fn run_captures(&self, monitor: usize) {
-        thread_local! {
-            static CAPTURER: RefCell<Capturer<Image<'static, 'static>>> = RefCell::default();
-        }
-        self.with(move |state| {
-            state.space.refresh();
-            let output = state.monitors[monitor].output.clone();
-            let mut renderer = PixmanRenderer::new().unwrap();
-            CAPTURER.with_borrow_mut(|capturer| capturer.run(state, &mut renderer, &output));
-        });
-    }
-
-    /// What the backend does after it presented a frame on every output.
-    fn present(&self) {
-        self.with(|state| {
-            let outputs = state.monitors.iter().map(|monitor| monitor.output.clone());
-            for output in outputs.collect::<Vec<_>>() {
-                state.send_frame_callbacks(&output);
-            }
-        });
-    }
-
-    /// Renders an output with pixman into XRGB pixels.
-    fn screenshot_of(&self, monitor: usize) -> Screenshot {
-        let pixels = self.with(move |state| {
-            // Runs once per loop iteration normally. Output tracking of new windows needs it.
-            state.space.refresh();
-            let output = state.monitors[monitor].output.clone();
-            let background = state.config.background_color;
-            let size = Size::<i32, Buffer>::from((WIDTH, HEIGHT));
-
-            let mut renderer = PixmanRenderer::new().unwrap();
-            let mut image: Image<'static, 'static> =
-                renderer.create_buffer(Fourcc::Argb8888, size).unwrap();
-            let mut framebuffer = renderer.bind(&mut image).unwrap();
-
-            let elements = state.scene_elements(&mut renderer, &output);
-            OutputDamageTracker::from_output(&output)
-                .render_output(&mut renderer, &mut framebuffer, 0, &elements, background)
-                .unwrap();
-
-            let mapping = renderer
-                .copy_framebuffer(&framebuffer, Rectangle::from_size(size), Fourcc::Argb8888)
-                .unwrap();
-            renderer.map_texture(&mapping).unwrap().to_vec()
-        });
-        Screenshot { pixels }
-    }
-}
-
-impl Drop for Compositor {
-    fn drop(&mut self) {
-        let stop: Job = Box::new(|state| state.loop_signal.stop());
-        if self.jobs.send(stop).is_ok()
-            && let Some(thread) = self.thread.take()
-        {
-            let result = thread.join();
-            if !thread::panicking() {
-                result.unwrap();
-            }
-        }
-    }
-}
-
-fn test_output(name: &str, location: (i32, i32)) -> Output {
-    let output = Output::new(
-        name.to_string(),
-        PhysicalProperties {
-            size: (0, 0).into(),
-            subpixel: Subpixel::Unknown,
-            make: "wirbel".into(),
-            model: "headless".into(),
-            serial_number: "0".into(),
-        },
-    );
-    let mode = Mode {
-        size: (WIDTH, HEIGHT).into(),
-        refresh: 60_000,
-    };
-    output.change_current_state(
-        Some(mode),
-        Some(Transform::Normal),
-        None,
-        Some(location.into()),
-    );
-    output.set_preferred(mode);
-    output
-}
-
-struct Screenshot {
-    pixels: Vec<u8>,
-}
-
-impl Screenshot {
-    /// The pixel as 0xRRGGBB.
-    fn at(&self, x: i32, y: i32) -> u32 {
-        let offset = ((y * WIDTH + x) * 4) as usize;
-        let bytes = &self.pixels[offset..offset + 4];
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0])
-    }
-}
-
-fn rgb(color: [f32; 4]) -> u32 {
-    let channel = |value: f32| (value * 255.0).round() as u32;
-    channel(color[0]) << 16 | channel(color[1]) << 8 | channel(color[2])
-}
-
-#[derive(Debug, PartialEq)]
-enum Input {
-    KeyboardEnter(usize),
-    KeyboardLeave(usize),
-    Key(u32, wl_keyboard::KeyState),
-    PointerEnter(usize, f64, f64),
-    PointerLeave(usize),
-    PointerMotion(f64, f64),
-    Button(u32, wl_pointer::ButtonState),
-    AxisSource(wl_pointer::AxisSource),
-    Axis(wl_pointer::Axis, f64),
-    AxisV120(wl_pointer::Axis, i32),
-    AxisStop(wl_pointer::Axis),
-}
-
-#[derive(Default)]
-struct ClientState {
-    windows: Vec<WindowState>,
-    input: Vec<Input>,
-    /// Position of the latest popup configure, relative to the parent window.
-    popup_position: Option<(i32, i32)>,
-    /// Serial of the latest button press, for interactive move and resize.
-    button_serial: u32,
-    closed: Vec<usize>,
-    /// Rate and delay of the keyboard.
-    repeat: Option<(i32, i32)>,
-    /// Surfaces that are no windows. In input events they count from `OTHER_SURFACES` on.
-    others: Vec<WlSurface>,
-    layers: Vec<LayerState>,
-    popups_done: u32,
-    lock_events: Vec<LockEvent>,
-    /// Size of the latest configure of a lock surface.
-    lock_size: Option<(u32, u32)>,
-    decoration_modes: Vec<zxdg_toplevel_decoration_v1::Mode>,
-    offers: Vec<WlDataOffer>,
-    selection: Option<WlDataOffer>,
-    primary_offers: Vec<ZwpPrimarySelectionOfferV1>,
-    primary: Option<ZwpPrimarySelectionOfferV1>,
-    dnd: Vec<DndEvent>,
-    source_events: Vec<SourceEvent>,
-    preferred_scale: Option<u32>,
-    idle: Vec<bool>,
-    dmabuf: Option<Result<(), ()>>,
-    logical_size: Option<(i32, i32)>,
-    /// Serial of the latest key event, for the clipboard.
-    key_serial: u32,
-    /// Serial of the latest pointer enter, for setting the cursor.
-    enter_serial: u32,
-    /// Lock and confinement going on and off.
-    constraint_events: Vec<bool>,
-    /// Accelerated and raw motion by the relative pointer.
-    relative: Vec<(f64, f64, f64, f64)>,
-    /// Whether presentation feedback said presented, each time it answered.
-    presented: Vec<bool>,
-    /// The latest activation token.
-    activation_token: Option<String>,
-    copy: CopyState,
-    foreign: Vec<ForeignToplevel>,
-    control_offers: Vec<(ZwlrDataControlOfferV1, Vec<String>)>,
-    control_selection: Option<ZwlrDataControlOfferV1>,
-    control_primary: Option<ZwlrDataControlOfferV1>,
-    control_cancelled: bool,
-}
-
-/// What a capture frame or session said, for either of the two protocols.
-#[derive(Debug, Default, Clone, PartialEq)]
-struct CopyState {
-    /// Size of the buffer to bring.
-    size: Option<(u32, u32)>,
-    stride: u32,
-    formats: Vec<u32>,
-    /// All buffer events are through.
-    described: bool,
-    damage: Vec<(i32, i32, i32, i32)>,
-    ready: bool,
-    failed: bool,
-    stopped: bool,
-}
-
-#[derive(Debug)]
-struct ForeignToplevel {
-    handle: ZwlrForeignToplevelHandleV1,
-    title: String,
-    app_id: String,
-    states: Vec<u32>,
-    outputs: i32,
-    parent: bool,
-    done: u32,
-    closed: bool,
-}
-
-/// First index of surfaces in `Input` events that are no windows.
-const OTHER_SURFACES: usize = 1000;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum LockEvent {
-    Locked,
-    Finished,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum DndEvent {
-    Enter(f64, f64),
-    Motion(f64, f64),
-    Leave,
-    Drop,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SourceEvent {
-    Target,
-    Dropped,
-    Finished,
-    Cancelled,
-}
-
-struct LayerState {
-    surface: WlSurface,
-    layer: ZwlrLayerSurfaceV1,
-    size: (u32, u32),
-    configures: u32,
-    closed: bool,
-    buffer: Option<WlBuffer>,
-}
-
-struct WindowState {
-    surface: WlSurface,
-    xdg_surface: XdgSurface,
-    toplevel: XdgToplevel,
-    /// Size of the latest configure.
-    size: (i32, i32),
-    activated: bool,
-    states: Vec<xdg_toplevel::State>,
-    configures: u32,
-    buffer: Option<WlBuffer>,
-}
-
-impl ClientState {
-    fn window_index(&self, surface: &WlSurface) -> usize {
-        self.find_window(surface).unwrap()
-    }
-
-    fn other_index(&self, surface: &WlSurface) -> Option<usize> {
-        let others = self.others.iter();
-        let index = others.into_iter().position(|other| other == surface)?;
-        Some(OTHER_SURFACES + index)
-    }
-
-    /// `None` if the client already destroyed the surface. A leave for such a surface crosses
-    /// paths with the destroy request and is not an error.
-    fn find_window(&self, surface: &WlSurface) -> Option<usize> {
-        self.windows
-            .iter()
-            .position(|window| window.surface == *surface)
-            .or_else(|| self.other_index(surface))
-    }
-}
-
-struct Client {
-    connection: Connection,
-    queue: EventQueue<ClientState>,
-    state: ClientState,
-    handle: QueueHandle<ClientState>,
-    globals: GlobalList,
-    compositor: WlCompositor,
-    wm_base: XdgWmBase,
-    shm: WlShm,
-    _keyboard: WlKeyboard,
-    _pointer: WlPointer,
-}
-
-impl Client {
-    fn connect(compositor: &Compositor) -> Self {
-        let stream = UnixStream::connect(&compositor.socket).unwrap();
-        let connection = Connection::from_socket(stream).unwrap();
-        let (globals, queue) = registry_queue_init::<ClientState>(&connection).unwrap();
-        let handle = queue.handle();
-
-        let wl_compositor: WlCompositor = globals.bind(&handle, 1..=6, ()).unwrap();
-        let wm_base: XdgWmBase = globals.bind(&handle, 1..=6, ()).unwrap();
-        let shm: WlShm = globals.bind(&handle, 1..=1, ()).unwrap();
-        let seat: WlSeat = globals.bind(&handle, 1..=9, ()).unwrap();
-
-        let mut client = Self {
-            connection,
-            state: ClientState::default(),
-            globals,
-            compositor: wl_compositor,
-            wm_base,
-            shm,
-            _keyboard: seat.get_keyboard(&handle, ()),
-            _pointer: seat.get_pointer(&handle, ()),
-            queue,
-            handle,
-        };
-        client.sync();
-        client
-    }
-
-    fn sync(&mut self) {
-        self.queue.roundtrip(&mut self.state).unwrap();
-    }
-
-    /// Opens a toplevel and walks it through configure up to the first buffer.
-    fn open_window(&mut self, color: u32) -> usize {
-        let index = self.open_unmapped_window();
-        self.draw(index, color);
-        index
-    }
-
-    /// Opens a toplevel and stops after the initial configure.
-    fn open_unmapped_window(&mut self) -> usize {
-        self.open_unmapped_window_with(|_| {})
-    }
-
-    /// Like `open_unmapped_window`, with a chance to set the window up before the first commit.
-    fn open_unmapped_window_with(&mut self, setup: impl FnOnce(&XdgToplevel)) -> usize {
-        let surface = self.compositor.create_surface(&self.handle, ());
-        let xdg_surface = self.wm_base.get_xdg_surface(&surface, &self.handle, ());
-        let toplevel = xdg_surface.get_toplevel(&self.handle, ());
-        setup(&toplevel);
-        surface.commit();
-        self.state.windows.push(WindowState {
-            surface,
-            xdg_surface,
-            toplevel,
-            size: (0, 0),
-            activated: false,
-            states: Vec::new(),
-            configures: 0,
-            buffer: None,
-        });
-        self.sync();
-        let index = self.state.windows.len() - 1;
-        assert!(
-            self.state.windows[index].configures > 0,
-            "no initial configure"
-        );
-        index
-    }
-
-    /// Opens a window that picks its own size, as dialogs do.
-    fn open_sized_window(
-        &mut self,
-        size: (i32, i32),
-        color: u32,
-        setup: impl FnOnce(&XdgToplevel),
-    ) -> usize {
-        let index = self.open_unmapped_window_with(setup);
-        assert_eq!(self.size(index), (0, 0), "dialog was told a size");
-        self.draw_sized(index, size, color);
-        index
-    }
-
-    /// Fills the window with `color`, using the size of the last configure.
-    fn draw(&mut self, index: usize, color: u32) {
-        self.draw_sized(index, self.state.windows[index].size, color);
-    }
-
-    fn draw_sized(&mut self, index: usize, (width, height): (i32, i32), color: u32) {
-        let surface = self.state.windows[index].surface.clone();
-        let buffer = self.fill(&surface, width, height, color);
-        self.state.windows[index].buffer = Some(buffer);
-    }
-
-    fn fill(&mut self, surface: &WlSurface, width: i32, height: i32, color: u32) -> WlBuffer {
-        static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
-
-        let path = env::temp_dir().join(format!(
-            "wirbel-test-{}-{}",
-            std::process::id(),
-            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        fs::remove_file(&path).unwrap();
-        let pixels: Vec<u8> = color.to_le_bytes().repeat((width * height) as usize);
-        file.write_all(&pixels).unwrap();
-
-        let pool = self
-            .shm
-            .create_pool(file.as_fd(), pixels.len() as i32, &self.handle, ());
-        let buffer = pool.create_buffer(
-            0,
-            width,
-            height,
-            width * 4,
-            Format::Xrgb8888,
-            &self.handle,
-            (),
-        );
-        pool.destroy();
-
-        surface.attach(Some(&buffer), 0, 0);
-        surface.damage_buffer(0, 0, width, height);
-        surface.commit();
-        self.sync();
-        buffer
-    }
-
-    /// Opens a 100x50 popup anchored near the right edge of a window filling its output, which
-    /// would stick out of the output.
-    fn open_edge_popup(&mut self, index: usize) -> (WlSurface, XdgPopup) {
-        let positioner = self.wm_base.create_positioner(&self.handle, ());
-        positioner.set_size(100, 50);
-        positioner.set_anchor_rect(960, 20, 1, 1);
-        positioner.set_anchor(xdg_positioner::Anchor::BottomRight);
-        positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
-        positioner.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::SlideX);
-
-        let surface = self.compositor.create_surface(&self.handle, ());
-        let xdg_surface = self.wm_base.get_xdg_surface(&surface, &self.handle, ());
-        let parent = self.state.windows[index].xdg_surface.clone();
-        let popup = xdg_surface.get_popup(Some(&parent), &positioner, &self.handle, ());
-        surface.commit();
-        self.sync();
-        (surface, popup)
-    }
-
-    /// Remembers `surface` for input events and returns its index there.
-    fn track(&mut self, surface: &WlSurface) -> usize {
-        self.state.others.push(surface.clone());
-        OTHER_SURFACES + self.state.others.len() - 1
-    }
-
-    fn bind<I: Proxy + 'static>(&self, versions: std::ops::RangeInclusive<u32>) -> I
-    where
-        ClientState: Dispatch<I, ()>,
-    {
-        self.globals.bind(&self.handle, versions, ()).unwrap()
-    }
-
-    /// Creates a layer surface and walks it through the initial configure. `setup` runs before
-    /// the first commit.
-    fn open_unmapped_layer(
-        &mut self,
-        level: zwlr_layer_shell_v1::Layer,
-        setup: impl FnOnce(&ZwlrLayerSurfaceV1),
-    ) -> usize {
-        let shell: ZwlrLayerShellV1 = self.bind(1..=5);
-        let surface = self.compositor.create_surface(&self.handle, ());
-        let layer = shell.get_layer_surface(&surface, None, level, "test".into(), &self.handle, ());
-        setup(&layer);
-        surface.commit();
-        self.state.others.push(surface.clone());
-        self.state.layers.push(LayerState {
-            surface,
-            layer,
-            size: (0, 0),
-            configures: 0,
-            closed: false,
-            buffer: None,
-        });
-        self.sync();
-        let index = self.state.layers.len() - 1;
-        assert_eq!(
-            self.state.layers[index].configures, 1,
-            "no initial configure"
-        );
-        index
-    }
-
-    fn open_layer(
-        &mut self,
-        level: zwlr_layer_shell_v1::Layer,
-        color: u32,
-        setup: impl FnOnce(&ZwlrLayerSurfaceV1),
-    ) -> usize {
-        let index = self.open_unmapped_layer(level, setup);
-        self.draw_layer(index, color);
-        index
-    }
-
-    /// A bar of the given height along the top of the output.
-    fn open_bar(&mut self, height: u32, color: u32) -> usize {
-        self.open_layer(zwlr_layer_shell_v1::Layer::Top, color, |layer| {
-            layer.set_size(0, height);
-            layer.set_anchor(top_bar_anchor());
-            layer.set_exclusive_zone(height as i32);
-        })
-    }
-
-    fn draw_layer(&mut self, index: usize, color: u32) {
-        let layer = &self.state.layers[index];
-        let surface = layer.surface.clone();
-        let (w, h) = (layer.size.0 as i32, layer.size.1 as i32);
-        let buffer = self.fill(&surface, w, h, color);
-        self.state.layers[index].buffer = Some(buffer);
-    }
-
-    fn close_layer(&mut self, index: usize) {
-        let layer = &self.state.layers[index];
-        layer.layer.destroy();
-        layer.surface.destroy();
-        self.sync();
-    }
-
-    /// Input index of the surface of a layer surface.
-    fn layer_input(&self, index: usize) -> usize {
-        self.state
-            .other_index(&self.state.layers[index].surface)
-            .unwrap()
-    }
-
-    /// A positioner for a popup of the given size at `(x, y)` of its parent.
-    fn positioner(&self, (x, y): (i32, i32), (w, h): (i32, i32)) -> XdgPositioner {
-        let positioner = self.wm_base.create_positioner(&self.handle, ());
-        positioner.set_size(w, h);
-        positioner.set_anchor_rect(x, y, 1, 1);
-        positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
-        positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
-        positioner
-    }
-
-    /// Opens and draws a popup of `parent`, grabbing with `grab` if given.
-    fn open_popup(
-        &mut self,
-        parent: &XdgSurface,
-        at: (i32, i32),
-        size: (i32, i32),
-        color: u32,
-        grab: Option<u32>,
-    ) -> TestPopup {
-        let positioner = self.positioner(at, size);
-        let surface = self.compositor.create_surface(&self.handle, ());
-        let xdg_surface = self.wm_base.get_xdg_surface(&surface, &self.handle, ());
-        let popup = xdg_surface.get_popup(Some(parent), &positioner, &self.handle, ());
-        self.finish_popup(surface, xdg_surface, popup, size, color, grab)
-    }
-
-    fn finish_popup(
-        &mut self,
-        surface: WlSurface,
-        xdg_surface: XdgSurface,
-        popup: XdgPopup,
-        size: (i32, i32),
-        color: u32,
-        grab: Option<u32>,
-    ) -> TestPopup {
-        if let Some(serial) = grab {
-            popup.grab(&self.seat(), serial);
-        }
-        let input = self.track(&surface);
-        surface.commit();
-        self.sync();
-        let buffer = self.fill(&surface, size.0, size.1, color);
-        TestPopup {
-            surface,
-            xdg_surface,
-            popup,
-            input,
-            _buffer: buffer,
-        }
-    }
-
-    /// Opens and draws a popup of a layer surface.
-    fn open_layer_popup(
-        &mut self,
-        index: usize,
-        at: (i32, i32),
-        size: (i32, i32),
-        color: u32,
-        grab: Option<u32>,
-    ) -> TestPopup {
-        let positioner = self.positioner(at, size);
-        let surface = self.compositor.create_surface(&self.handle, ());
-        let xdg_surface = self.wm_base.get_xdg_surface(&surface, &self.handle, ());
-        let popup = xdg_surface.get_popup(None, &positioner, &self.handle, ());
-        self.state.layers[index].layer.get_popup(&popup);
-        self.finish_popup(surface, xdg_surface, popup, size, color, grab)
-    }
-
-    /// A buffer of plain memory for a capture, and the file it lives in.
-    fn capture_buffer(&mut self, width: i32, height: i32) -> (WlBuffer, fs::File) {
-        static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
-        let path = env::temp_dir().join(format!(
-            "wirbel-capture-{}-{}",
-            std::process::id(),
-            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        fs::remove_file(&path).unwrap();
-        file.set_len((width * height * 4) as u64).unwrap();
-        let pool = self
-            .shm
-            .create_pool(file.as_fd(), width * height * 4, &self.handle, ());
-        let format = Format::Xrgb8888;
-        let buffer = pool.create_buffer(0, width, height, width * 4, format, &self.handle, ());
-        pool.destroy();
-        (buffer, file)
-    }
-
-    /// Checks the buffer events of a new `wlr-screencopy` frame and returns the size they name.
-    fn describe_frame(&mut self) -> (i32, i32) {
-        self.sync();
-        assert!(self.state.copy.described, "no buffer_done");
-        let (width, height) = self.state.copy.size.expect("no buffer event");
-        assert_eq!(self.state.copy.formats, [Format::Xrgb8888 as u32]);
-        assert_eq!(self.state.copy.stride, width * 4);
-        (width as i32, height as i32)
-    }
-
-    fn xdg_surface(&self, index: usize) -> XdgSurface {
-        self.state.windows[index].xdg_surface.clone()
-    }
-
-    /// Asks for the session lock and returns the lock object.
-    fn lock(&mut self) -> ExtSessionLockV1 {
-        let manager: ExtSessionLockManagerV1 = self.bind(1..=1);
-        let lock = manager.lock(&self.handle, ());
-        self.sync();
-        lock
-    }
-
-    /// Creates a lock surface on the first output of this client and draws it. Returns its
-    /// index in input events.
-    fn lock_surface(
-        &mut self,
-        lock: &ExtSessionLockV1,
-        output: &WlOutput,
-        color: u32,
-    ) -> LockedSurface {
-        let surface = self.compositor.create_surface(&self.handle, ());
-        let input = self.track(&surface);
-        let lock_surface = lock.get_lock_surface(&surface, output, &self.handle, ());
-        self.sync();
-        let (w, h) = self
-            .state
-            .lock_size
-            .expect("no configure for the lock surface");
-        let buffer = self.fill(&surface, w as i32, h as i32, color);
-        LockedSurface {
-            surface,
-            lock_surface,
-            input,
-            _buffer: buffer,
-        }
-    }
-
-    fn close(&mut self, index: usize) {
-        let window = &self.state.windows[index];
-        window.toplevel.destroy();
-        window.xdg_surface.destroy();
-        window.surface.destroy();
-        self.sync();
-    }
-
-    fn take_input(&mut self) -> Vec<Input> {
-        self.sync();
-        std::mem::take(&mut self.state.input)
-    }
-
-    fn size(&self, index: usize) -> (i32, i32) {
-        self.state.windows[index].size
-    }
-
-    fn activated(&self, index: usize) -> bool {
-        self.state.windows[index].activated
-    }
-
-    fn has_state(&self, index: usize, state: xdg_toplevel::State) -> bool {
-        self.state.windows[index].states.contains(&state)
-    }
-
-    fn toplevel(&self, index: usize) -> XdgToplevel {
-        self.state.windows[index].toplevel.clone()
-    }
-
-    fn seat(&self) -> WlSeat {
-        self.globals.bind(&self.handle, 1..=9, ()).unwrap()
-    }
-}
-
-impl Dispatch<WlRegistry, GlobalListContents> for ClientState {
-    fn event(
-        _: &mut Self,
-        _: &WlRegistry,
-        _: <WlRegistry as Proxy>::Event,
-        _: &GlobalListContents,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<XdgWmBase, ()> for ClientState {
-    fn event(
-        _: &mut Self,
-        wm_base: &XdgWmBase,
-        event: xdg_wm_base::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let xdg_wm_base::Event::Ping { serial } = event {
-            wm_base.pong(serial);
-        }
-    }
-}
-
-impl Dispatch<XdgSurface, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        xdg_surface: &XdgSurface,
-        event: xdg_surface::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let xdg_surface::Event::Configure { serial } = event {
-            xdg_surface.ack_configure(serial);
-            if let Some(window) = state
-                .windows
-                .iter_mut()
-                .find(|w| w.xdg_surface == *xdg_surface)
-            {
-                window.configures += 1;
-            }
-        }
-    }
-}
-
-impl Dispatch<XdgToplevel, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        toplevel: &XdgToplevel,
-        event: xdg_toplevel::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        let index = state.windows.iter().position(|w| w.toplevel == *toplevel);
-        match event {
-            xdg_toplevel::Event::Configure {
-                width,
-                height,
-                states,
-            } => {
-                let Some(index) = index else { return };
-                let window = &mut state.windows[index];
-                window.size = (width, height);
-                window.states = states
-                    .chunks_exact(4)
-                    .filter_map(|chunk| {
-                        let value = u32::from_ne_bytes(chunk.try_into().unwrap());
-                        xdg_toplevel::State::try_from(value).ok()
-                    })
-                    .collect();
-                window.activated = window.states.contains(&xdg_toplevel::State::Activated);
-            }
-            xdg_toplevel::Event::Close => state.closed.extend(index),
-            _ => {}
-        }
-    }
-}
-
-struct TestPopup {
-    surface: WlSurface,
-    xdg_surface: XdgSurface,
-    popup: XdgPopup,
-    input: usize,
-    _buffer: WlBuffer,
-}
-
-impl TestPopup {
-    fn destroy(&self) {
-        self.popup.destroy();
-        self.xdg_surface.destroy();
-        self.surface.destroy();
-    }
-}
-
-struct LockedSurface {
-    surface: WlSurface,
-    lock_surface: ExtSessionLockSurfaceV1,
-    input: usize,
-    _buffer: WlBuffer,
-}
-
-fn top_bar_anchor() -> zwlr_layer_surface_v1::Anchor {
-    use zwlr_layer_surface_v1::Anchor;
-    Anchor::Top | Anchor::Left | Anchor::Right
-}
-
-impl Dispatch<ZwlrLayerSurfaceV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        layer: &ZwlrLayerSurfaceV1,
-        event: zwlr_layer_surface_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        let entry = state.layers.iter_mut().find(|entry| entry.layer == *layer);
-        let Some(entry) = entry else {
-            return;
-        };
-        match event {
-            zwlr_layer_surface_v1::Event::Configure {
-                serial,
-                width,
-                height,
-            } => {
-                layer.ack_configure(serial);
-                entry.size = (width, height);
-                entry.configures += 1;
-            }
-            zwlr_layer_surface_v1::Event::Closed => entry.closed = true,
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ExtSessionLockV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ExtSessionLockV1,
-        event: ext_session_lock_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            ext_session_lock_v1::Event::Locked => state.lock_events.push(LockEvent::Locked),
-            ext_session_lock_v1::Event::Finished => state.lock_events.push(LockEvent::Finished),
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ExtSessionLockSurfaceV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        surface: &ExtSessionLockSurfaceV1,
-        event: ext_session_lock_surface_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let ext_session_lock_surface_v1::Event::Configure {
-            serial,
-            width,
-            height,
-        } = event
-        {
-            surface.ack_configure(serial);
-            state.lock_size = Some((width, height));
-        }
-    }
-}
-
-impl Dispatch<ZxdgToplevelDecorationV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZxdgToplevelDecorationV1,
-        event: zxdg_toplevel_decoration_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let zxdg_toplevel_decoration_v1::Event::Configure {
-            mode: WEnum::Value(mode),
-        } = event
-        {
-            state.decoration_modes.push(mode);
-        }
-    }
-}
-
-impl Dispatch<WlDataDevice, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &WlDataDevice,
-        event: wl_data_device::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_data_device::Event::DataOffer { id } => state.offers.push(id),
-            wl_data_device::Event::Selection { id } => state.selection = id,
-            wl_data_device::Event::Enter {
-                x, y, id, serial, ..
-            } => {
-                if let Some(offer) = id {
-                    offer.accept(serial, Some("text/plain".into()));
-                    offer.set_actions(
-                        wayland_client::protocol::wl_data_device_manager::DndAction::Copy,
-                        wayland_client::protocol::wl_data_device_manager::DndAction::Copy,
-                    );
-                    state.selection = Some(offer);
-                }
-                state.dnd.push(DndEvent::Enter(x, y));
-            }
-            wl_data_device::Event::Motion { x, y, .. } => state.dnd.push(DndEvent::Motion(x, y)),
-            wl_data_device::Event::Leave => state.dnd.push(DndEvent::Leave),
-            wl_data_device::Event::Drop => state.dnd.push(DndEvent::Drop),
-            _ => {}
-        }
-    }
-
-    event_created_child!(ClientState, WlDataDevice, [
-        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
-    ]);
-}
-
-impl Dispatch<ZwpPrimarySelectionDeviceV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZwpPrimarySelectionDeviceV1,
-        event: zwp_primary_selection_device_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwp_primary_selection_device_v1::Event::DataOffer { offer } => {
-                state.primary_offers.push(offer);
-            }
-            zwp_primary_selection_device_v1::Event::Selection { id } => state.primary = id,
-            _ => {}
-        }
-    }
-
-    event_created_child!(ClientState, ZwpPrimarySelectionDeviceV1, [
-        zwp_primary_selection_device_v1::EVT_DATA_OFFER_OPCODE => (ZwpPrimarySelectionOfferV1, ()),
-    ]);
-}
-
-/// Answers every request for data with `CLIPBOARD_TEXT`.
-impl Dispatch<WlDataSource, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &WlDataSource,
-        event: wl_data_source::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_data_source::Event::Send { fd, .. } => {
-                fs::File::from(fd).write_all(CLIPBOARD_TEXT).unwrap();
-            }
-            wl_data_source::Event::Target { .. } => state.source_events.push(SourceEvent::Target),
-            wl_data_source::Event::DndDropPerformed => {
-                state.source_events.push(SourceEvent::Dropped);
-            }
-            wl_data_source::Event::DndFinished => state.source_events.push(SourceEvent::Finished),
-            wl_data_source::Event::Cancelled => state.source_events.push(SourceEvent::Cancelled),
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ZwpPrimarySelectionSourceV1, ()> for ClientState {
-    fn event(
-        _: &mut Self,
-        _: &ZwpPrimarySelectionSourceV1,
-        event: zwp_primary_selection_source_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let zwp_primary_selection_source_v1::Event::Send { fd, .. } = event {
-            fs::File::from(fd).write_all(CLIPBOARD_TEXT).unwrap();
-        }
-    }
-}
-
-impl Dispatch<WpFractionalScaleV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &WpFractionalScaleV1,
-        event: wp_fractional_scale_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
-            state.preferred_scale = Some(scale);
-        }
-    }
-}
-
-impl Dispatch<ExtIdleNotificationV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ExtIdleNotificationV1,
-        event: ext_idle_notification_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            ext_idle_notification_v1::Event::Idled => state.idle.push(true),
-            ext_idle_notification_v1::Event::Resumed => state.idle.push(false),
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ZwpLinuxBufferParamsV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZwpLinuxBufferParamsV1,
-        event: zwp_linux_buffer_params_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwp_linux_buffer_params_v1::Event::Created { .. } => state.dmabuf = Some(Ok(())),
-            zwp_linux_buffer_params_v1::Event::Failed => state.dmabuf = Some(Err(())),
-            _ => {}
-        }
-    }
-
-    event_created_child!(ClientState, ZwpLinuxBufferParamsV1, [
-        zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => (WlBuffer, ()),
-    ]);
-}
-
-impl Dispatch<WlOutput, ()> for ClientState {
-    fn event(
-        _: &mut Self,
-        _: &WlOutput,
-        _: wl_output::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<ZxdgOutputV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZxdgOutputV1,
-        event: zxdg_output_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let zxdg_output_v1::Event::LogicalSize { width, height } = event {
-            state.logical_size = Some((width, height));
-        }
-    }
-}
-
-impl Dispatch<WlKeyboard, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &WlKeyboard,
-        event: wl_keyboard::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        let input = match event {
-            wl_keyboard::Event::Enter { surface, .. } => {
-                Input::KeyboardEnter(state.window_index(&surface))
-            }
-            wl_keyboard::Event::Leave { surface, .. } => match state.find_window(&surface) {
-                Some(index) => Input::KeyboardLeave(index),
-                None => return,
-            },
-            wl_keyboard::Event::Key {
-                key,
-                serial,
-                state: WEnum::Value(key_state),
-                ..
-            } => {
-                state.key_serial = serial;
-                Input::Key(key, key_state)
-            }
-            wl_keyboard::Event::RepeatInfo { rate, delay } => {
-                state.repeat = Some((rate, delay));
-                return;
-            }
-            _ => return,
-        };
-        state.input.push(input);
-    }
-}
-
-impl Dispatch<WlPointer, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &WlPointer,
-        event: wl_pointer::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        let input = match event {
-            wl_pointer::Event::Enter {
-                surface,
-                serial,
-                surface_x,
-                surface_y,
-            } => {
-                state.enter_serial = serial;
-                Input::PointerEnter(state.window_index(&surface), surface_x, surface_y)
-            }
-            wl_pointer::Event::Leave { surface, .. } => match state.find_window(&surface) {
-                Some(index) => Input::PointerLeave(index),
-                None => return,
-            },
-            wl_pointer::Event::Motion {
-                surface_x,
-                surface_y,
-                ..
-            } => Input::PointerMotion(surface_x, surface_y),
-            wl_pointer::Event::Button {
-                button,
-                serial,
-                state: WEnum::Value(button_state),
-                ..
-            } => {
-                state.button_serial = serial;
-                Input::Button(button, button_state)
-            }
-            wl_pointer::Event::AxisSource {
-                axis_source: WEnum::Value(source),
-            } => Input::AxisSource(source),
-            wl_pointer::Event::Axis {
-                axis: WEnum::Value(axis),
-                value,
-                ..
-            } => Input::Axis(axis, value),
-            wl_pointer::Event::AxisValue120 {
-                axis: WEnum::Value(axis),
-                value120,
-            } => Input::AxisV120(axis, value120),
-            wl_pointer::Event::AxisStop {
-                axis: WEnum::Value(axis),
-                ..
-            } => Input::AxisStop(axis),
-            _ => return,
-        };
-        state.input.push(input);
-    }
-}
-
-impl Dispatch<XdgPopup, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &XdgPopup,
-        event: xdg_popup::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            xdg_popup::Event::Configure { x, y, .. } => state.popup_position = Some((x, y)),
-            xdg_popup::Event::PopupDone => state.popups_done += 1,
-            _ => {}
-        }
-    }
-}
-
-delegate_noop!(ClientState: ignore XdgPositioner);
-delegate_noop!(ClientState: ignore WlCompositor);
-delegate_noop!(ClientState: ignore WlSurface);
-delegate_noop!(ClientState: ignore WlSubcompositor);
-delegate_noop!(ClientState: ignore WlSubsurface);
-delegate_noop!(ClientState: ignore WlShm);
-delegate_noop!(ClientState: ignore WlShmPool);
-delegate_noop!(ClientState: ignore WlBuffer);
-delegate_noop!(ClientState: ignore WlSeat);
-delegate_noop!(ClientState: ignore ZwlrLayerShellV1);
-delegate_noop!(ClientState: ignore ExtSessionLockManagerV1);
-delegate_noop!(ClientState: ignore ZxdgDecorationManagerV1);
-delegate_noop!(ClientState: ignore WlDataDeviceManager);
-delegate_noop!(ClientState: ignore WlDataOffer);
-delegate_noop!(ClientState: ignore ZwpPrimarySelectionDeviceManagerV1);
-delegate_noop!(ClientState: ignore ZwpPrimarySelectionOfferV1);
-delegate_noop!(ClientState: ignore WpCursorShapeManagerV1);
-delegate_noop!(ClientState: ignore WpCursorShapeDeviceV1);
-delegate_noop!(ClientState: ignore WpViewporter);
-delegate_noop!(ClientState: ignore WpViewport);
-delegate_noop!(ClientState: ignore WpFractionalScaleManagerV1);
-delegate_noop!(ClientState: ignore ZwpIdleInhibitManagerV1);
-delegate_noop!(ClientState: ignore ZwpIdleInhibitorV1);
-delegate_noop!(ClientState: ignore ExtIdleNotifierV1);
-delegate_noop!(ClientState: ignore ZwpLinuxDmabufV1);
-delegate_noop!(ClientState: ignore ZxdgOutputManagerV1);
-delegate_noop!(ClientState: ignore WlRegion);
-delegate_noop!(ClientState: ignore ZwpPointerConstraintsV1);
-delegate_noop!(ClientState: ignore ZwpRelativePointerManagerV1);
-delegate_noop!(ClientState: ignore WpPresentation);
-delegate_noop!(ClientState: ignore XdgActivationV1);
-delegate_noop!(ClientState: ignore ZwlrScreencopyManagerV1);
-delegate_noop!(ClientState: ignore ExtImageCopyCaptureManagerV1);
-delegate_noop!(ClientState: ignore ExtOutputImageCaptureSourceManagerV1);
-delegate_noop!(ClientState: ignore ExtImageCaptureSourceV1);
-delegate_noop!(ClientState: ignore ZwlrDataControlManagerV1);
-
-impl Dispatch<ZwlrScreencopyFrameV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZwlrScreencopyFrameV1,
-        event: zwlr_screencopy_frame_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        use zwlr_screencopy_frame_v1::Event;
-        match event {
-            Event::Buffer {
-                format,
-                width,
-                height,
-                stride,
-            } => {
-                state.copy.size = Some((width, height));
-                state.copy.stride = stride;
-                if let WEnum::Value(format) = format {
-                    state.copy.formats.push(format as u32);
-                }
-            }
-            Event::BufferDone => state.copy.described = true,
-            Event::Damage {
-                x,
-                y,
-                width,
-                height,
-            } => {
-                let rect = (x as i32, y as i32, width as i32, height as i32);
-                state.copy.damage.push(rect);
-            }
-            Event::Ready { .. } => state.copy.ready = true,
-            Event::Failed => state.copy.failed = true,
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ExtImageCopyCaptureSessionV1,
-        event: ext_image_copy_capture_session_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        use ext_image_copy_capture_session_v1::Event;
-        match event {
-            Event::BufferSize { width, height } => state.copy.size = Some((width, height)),
-            Event::ShmFormat {
-                format: WEnum::Value(format),
-            } => state.copy.formats.push(format as u32),
-            Event::Done => state.copy.described = true,
-            Event::Stopped => state.copy.stopped = true,
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ExtImageCopyCaptureFrameV1,
-        event: ext_image_copy_capture_frame_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        use ext_image_copy_capture_frame_v1::Event;
-        match event {
-            Event::Damage {
-                x,
-                y,
-                width,
-                height,
-            } => state.copy.damage.push((x, y, width, height)),
-            Event::Ready => state.copy.ready = true,
-            Event::Failed { .. } => state.copy.failed = true,
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZwlrForeignToplevelManagerV1,
-        event: zwlr_foreign_toplevel_manager_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } = event {
-            state.foreign.push(ForeignToplevel {
-                handle: toplevel,
-                title: String::new(),
-                app_id: String::new(),
-                states: Vec::new(),
-                outputs: 0,
-                parent: false,
-                done: 0,
-                closed: false,
-            });
-        }
-    }
-
-    event_created_child!(ClientState, ZwlrForeignToplevelManagerV1, [
-        zwlr_foreign_toplevel_manager_v1::EVT_TOPLEVEL_OPCODE => (ZwlrForeignToplevelHandleV1, ()),
-    ]);
-}
-
-impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        handle: &ZwlrForeignToplevelHandleV1,
-        event: zwlr_foreign_toplevel_handle_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        use zwlr_foreign_toplevel_handle_v1::Event;
-        let entry = state
-            .foreign
-            .iter_mut()
-            .find(|entry| entry.handle == *handle);
-        let entry = entry.expect("event for an unknown toplevel");
-        match event {
-            Event::Title { title } => entry.title = title,
-            Event::AppId { app_id } => entry.app_id = app_id,
-            Event::OutputEnter { .. } => entry.outputs += 1,
-            Event::OutputLeave { .. } => entry.outputs -= 1,
-            Event::State { state } => {
-                let states = state.chunks_exact(4);
-                entry.states = states
-                    .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
-                    .collect();
-            }
-            Event::Parent { parent } => entry.parent = parent.is_some(),
-            Event::Done => entry.done += 1,
-            Event::Closed => entry.closed = true,
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ZwlrDataControlDeviceV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZwlrDataControlDeviceV1,
-        event: zwlr_data_control_device_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        use zwlr_data_control_device_v1::Event;
-        match event {
-            Event::DataOffer { id } => state.control_offers.push((id, Vec::new())),
-            Event::Selection { id } => state.control_selection = id,
-            Event::PrimarySelection { id } => state.control_primary = id,
-            _ => {}
-        }
-    }
-
-    event_created_child!(ClientState, ZwlrDataControlDeviceV1, [
-        zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ZwlrDataControlOfferV1, ()),
-    ]);
-}
-
-impl Dispatch<ZwlrDataControlOfferV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        offer: &ZwlrDataControlOfferV1,
-        event: zwlr_data_control_offer_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event
-            && let Some(entry) = state.control_offers.iter_mut().find(|(o, _)| o == offer)
-        {
-            entry.1.push(mime_type);
-        }
-    }
-}
-
-impl Dispatch<ZwlrDataControlSourceV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZwlrDataControlSourceV1,
-        event: zwlr_data_control_source_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwlr_data_control_source_v1::Event::Send { fd, .. } => {
-                fs::File::from(fd).write_all(CONTROL_TEXT).unwrap();
-            }
-            zwlr_data_control_source_v1::Event::Cancelled => state.control_cancelled = true,
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ZwpLockedPointerV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZwpLockedPointerV1,
-        event: zwp_locked_pointer_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwp_locked_pointer_v1::Event::Locked => state.constraint_events.push(true),
-            zwp_locked_pointer_v1::Event::Unlocked => state.constraint_events.push(false),
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ZwpConfinedPointerV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZwpConfinedPointerV1,
-        event: zwp_confined_pointer_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwp_confined_pointer_v1::Event::Confined => state.constraint_events.push(true),
-            zwp_confined_pointer_v1::Event::Unconfined => state.constraint_events.push(false),
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ZwpRelativePointerV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &ZwpRelativePointerV1,
-        event: zwp_relative_pointer_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let zwp_relative_pointer_v1::Event::RelativeMotion {
-            dx,
-            dy,
-            dx_unaccel,
-            dy_unaccel,
-            ..
-        } = event
-        {
-            state.relative.push((dx, dy, dx_unaccel, dy_unaccel));
-        }
-    }
-}
-
-impl Dispatch<WpPresentationFeedback, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &WpPresentationFeedback,
-        event: wp_presentation_feedback::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            wp_presentation_feedback::Event::Presented { .. } => state.presented.push(true),
-            wp_presentation_feedback::Event::Discarded => state.presented.push(false),
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<XdgActivationTokenV1, ()> for ClientState {
-    fn event(
-        state: &mut Self,
-        _: &XdgActivationTokenV1,
-        event: xdg_activation_token_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let xdg_activation_token_v1::Event::Done { token } = event {
-            state.activation_token = Some(token);
-        }
-    }
-}
-
-// Output 1000x600, outer gap 10, inner gap 5, border 4. One window fills the output minus gap and
-// border. Two windows share 975 pixels of width: tiles of 488 and 487 pixels.
-const FULL: (i32, i32) = (972, 572);
-const LEFT: (i32, i32) = (480, 572);
-const RIGHT: (i32, i32) = (479, 572);
-const RIGHT_X: f64 = 507.0;
+use wirbel::test_harness::*;
 
 #[test]
 fn offers_the_globals_kitty_needs() {
@@ -2194,34 +348,6 @@ fn border_follows_focus() {
     let shot = compositor.screenshot();
     assert_eq!(shot.at(10, 300), rgb(Config::default().focus_color));
     assert_eq!(shot.at(503, 300), rgb(Config::default().border_color));
-}
-
-// Stage 2: binds, workspaces, floating, fullscreen, mouse.
-
-const SUPER: &[u32] = &[KEY_LEFTMETA];
-const SUPER_SHIFT: &[u32] = &[KEY_LEFTMETA, KEY_LEFTSHIFT];
-const ALT: &[u32] = &[KEY_LEFTALT];
-const RED: u32 = 0x00ff_0000;
-const GREEN: u32 = 0x0000_ff00;
-const BLUE: u32 = 0x0000_00ff;
-
-/// A compositor with windows `a` and `b` side by side, `b` focused.
-fn two_windows() -> (Compositor, Client, usize, usize) {
-    let compositor = Compositor::start();
-    let mut client = Client::connect(&compositor);
-    let a = client.open_window(RED);
-    let b = client.open_window(GREEN);
-    client.take_input();
-    (compositor, client, a, b)
-}
-
-/// A scratch file path for one test.
-fn scratch_path(name: &str) -> PathBuf {
-    env::temp_dir().join(format!("wirbel-test-{}-{name}", std::process::id()))
-}
-
-fn is_tiled(compositor: &Compositor) -> Vec<bool> {
-    compositor.with(|state| state.frames.iter().map(|frame| frame.tiled).collect())
 }
 
 #[test]
@@ -2903,30 +1029,6 @@ fn fullscreen_is_per_workspace() {
     let _ = a;
 }
 
-/// Holds Super and drags with `button` from one point to another.
-fn super_drag(compositor: &Compositor, button: u32, from: (f64, f64), to: (f64, f64)) {
-    compositor.pointer_at(from.0, from.1);
-    compositor.key(KEY_LEFTMETA, KeyState::Pressed);
-    compositor.button(button, ButtonState::Pressed);
-    compositor.pointer_at(to.0, to.1);
-    compositor.button(button, ButtonState::Released);
-    compositor.key(KEY_LEFTMETA, KeyState::Released);
-}
-
-/// A window of 300x200 floating over `main`, at 350,200.
-fn floating_dialog() -> (Compositor, Client, usize, usize) {
-    let compositor = Compositor::start();
-    let mut client = Client::connect(&compositor);
-    let main = client.open_window(RED);
-    let parent = client.toplevel(main);
-    let dialog = client.open_sized_window((300, 200), GREEN, |toplevel| {
-        toplevel.set_parent(Some(&parent));
-    });
-    client.sync();
-    client.take_input();
-    (compositor, client, main, dialog)
-}
-
 #[test]
 fn super_left_drag_moves_a_floating_window_and_hides_the_press() {
     let (compositor, mut client, _, _) = floating_dialog();
@@ -3119,16 +1221,6 @@ fn a_move_request_with_a_stale_serial_is_ignored() {
     assert!(compositor.with(|state| state.drag.is_none()));
 }
 
-/// The defaults: sloppy focus and warping on.
-fn mango_like() -> (Compositor, Client, usize, usize) {
-    let compositor = Compositor::start_with("");
-    let mut client = Client::connect(&compositor);
-    let a = client.open_window(RED);
-    let b = client.open_window(GREEN);
-    client.take_input();
-    (compositor, client, a, b)
-}
-
 #[test]
 fn sloppy_focus_follows_the_pointer_between_windows() {
     let (compositor, mut client, a, b) = mango_like();
@@ -3243,13 +1335,6 @@ fn warping_can_be_turned_off() {
         pointer.current_location()
     });
     assert_eq!((location.x, location.y), (750.0, 300.0));
-}
-
-/// Two 1000x600 outputs side by side, the second one to the right.
-fn two_outputs() -> (Compositor, Output) {
-    let compositor = Compositor::start();
-    let second = compositor.add_output("second", (WIDTH, 0));
-    (compositor, second)
 }
 
 #[test]
@@ -3484,18 +1569,6 @@ fn surface_coordinates_are_relative_on_the_second_output() {
     );
 }
 
-fn scroll(
-    compositor: &Compositor,
-    build: impl FnOnce(&mut Scroll) + Send + 'static,
-    source: AxisSource,
-) {
-    compositor.with(move |state| {
-        let mut scroll = Scroll::new(source, InputTime::now());
-        build(&mut scroll);
-        state.on_pointer_axis(scroll);
-    });
-}
-
 #[test]
 fn a_wheel_scrolls_with_value_and_notches_on_both_axes() {
     let (compositor, mut client, _, _) = two_windows();
@@ -3592,120 +1665,6 @@ fn stacking_order_survives_a_trip_through_a_hidden_workspace() {
     });
     assert_eq!(placements[0], Some(Placement::Tiled));
     assert!(matches!(placements[1], Some(Placement::Floating(_))));
-}
-
-// Control socket. These go through the real `wirbel` binary wherever a command line is involved.
-
-impl Compositor {
-    fn wayland_display(&self) -> &std::ffi::OsStr {
-        self.socket.file_name().unwrap()
-    }
-
-    fn ipc_path(&self) -> PathBuf {
-        wirbel::ipc::socket_path(self.wayland_display()).unwrap()
-    }
-
-    fn cli(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_wirbel"));
-        command
-            .args(args)
-            .env("WAYLAND_DISPLAY", self.wayland_display());
-        command
-    }
-
-    /// Runs a command to its end and returns its standard output.
-    fn run(&self, args: &[&str]) -> String {
-        let output = self.cli(args).output().unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{args:?}: {stderr}");
-        String::from_utf8(output.stdout).unwrap()
-    }
-
-    /// Runs a command that has to fail and returns its error message.
-    fn run_failing(&self, args: &[&str]) -> String {
-        let output = self.cli(args).output().unwrap();
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
-        String::from_utf8(output.stderr).unwrap()
-    }
-
-    fn pointer(&self) -> (f64, f64) {
-        self.with(|state| {
-            let location = state.seat.get_pointer().unwrap().current_location();
-            (location.x, location.y)
-        })
-    }
-
-    fn raw_ipc(&self) -> RawIpc {
-        let stream = UnixStream::connect(self.ipc_path()).unwrap();
-        stream.set_read_timeout(Some(ANSWER)).unwrap();
-        RawIpc {
-            reader: BufReader::new(stream.try_clone().unwrap()),
-            stream,
-        }
-    }
-}
-
-/// How long a test waits for a line before it counts as missing.
-const ANSWER: Duration = Duration::from_secs(5);
-
-struct RawIpc {
-    stream: UnixStream,
-    reader: BufReader<UnixStream>,
-}
-
-impl RawIpc {
-    fn send(&mut self, text: &str) {
-        self.stream.write_all(text.as_bytes()).unwrap();
-    }
-
-    fn line(&mut self) -> String {
-        let mut line = String::new();
-        self.reader.read_line(&mut line).unwrap();
-        line.trim_end().to_string()
-    }
-
-    fn request(&mut self, text: &str) -> String {
-        self.send(text);
-        self.send("\n");
-        self.line()
-    }
-}
-
-/// A running `wirbel pos` or `wirbel distance` with its output on a pipe.
-struct Watcher {
-    child: Child,
-    lines: mpsc::Receiver<String>,
-}
-
-impl Watcher {
-    fn start(compositor: &Compositor, args: &[&str]) -> Self {
-        Self::start_command(compositor, &[&["pos"], args].concat())
-    }
-
-    fn start_command(compositor: &Compositor, args: &[&str]) -> Self {
-        let mut child = compositor.cli(args).stdout(Stdio::piped()).spawn().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let (tx, lines) = mpsc::channel();
-        thread::spawn(move || {
-            for line in stdout.lines() {
-                if tx.send(line.unwrap()).is_err() {
-                    break;
-                }
-            }
-        });
-        Self { child, lines }
-    }
-
-    fn next(&self) -> String {
-        self.lines.recv_timeout(ANSWER).expect("no line from pos")
-    }
-}
-
-impl Drop for Watcher {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 #[test]
@@ -3994,11 +1953,6 @@ fn click_clicks_where_the_pointer_is() {
             Input::Button(BTN_LEFT, wl_pointer::ButtonState::Released),
         ]
     );
-}
-
-fn presses(input: &[Input]) -> usize {
-    let press = Input::Button(BTN_LEFT, wl_pointer::ButtonState::Pressed);
-    input.iter().filter(|event| **event == press).count()
 }
 
 #[test]
@@ -4648,18 +2602,6 @@ fn a_spawned_client_finds_the_compositor_it_runs_in() {
     fs::remove_file(path).unwrap();
 }
 
-// Colours of test surfaces.
-const BAR: u32 = 0x0012_3456;
-const POPUP: u32 = 0x00ab_cdef;
-const LOCK: u32 = 0x0065_4321;
-const CLIPBOARD_TEXT: &[u8] = b"from the other client";
-
-use zwlr_layer_shell_v1::Layer as Level;
-
-fn default_config() -> Config {
-    Config::default()
-}
-
 #[test]
 fn an_exclusive_zone_makes_room_and_gives_it_back() {
     let compositor = Compositor::start();
@@ -5292,22 +3234,6 @@ fn window_popups_stay_clear_of_a_panel() {
     assert_eq!(client.state.popup_position, Some((100, 570 - 200 - 14)));
 }
 
-/// A window with a popup holding a grab, opened by a click at (100, 100).
-fn window_with_grabbing_popup() -> (Compositor, Client, usize, TestPopup) {
-    let compositor = Compositor::start();
-    let mut client = Client::connect(&compositor);
-    let a = client.open_window(RED);
-    compositor.pointer_at(100.0, 100.0);
-    compositor.button(BTN_LEFT, ButtonState::Pressed);
-    client.sync();
-    let serial = client.state.button_serial;
-    let parent = client.xdg_surface(a);
-    let popup = client.open_popup(&parent, (200, 200), (100, 100), POPUP, Some(serial));
-    compositor.button(BTN_LEFT, ButtonState::Released);
-    client.take_input();
-    (compositor, client, a, popup)
-}
-
 #[test]
 fn a_grabbing_popup_gets_the_keyboard_and_gives_it_back() {
     let (compositor, mut client, a, popup) = window_with_grabbing_popup();
@@ -5326,7 +3252,7 @@ fn a_grabbing_popup_gets_the_keyboard_and_gives_it_back() {
 
     popup.destroy();
     client.sync();
-    compositor.with(|_| ());
+    compositor.housekeeping();
     assert!(compositor.with(|state| state.popup_grab.is_none()));
     assert!(client.take_input().contains(&Input::KeyboardEnter(a)));
 }
@@ -5522,40 +3448,6 @@ fn every_window_is_decorated_by_the_server_whatever_it_asks() {
     );
 }
 
-fn read_pipe(read: std::os::fd::OwnedFd) -> Vec<u8> {
-    use std::io::Read;
-    let mut text = Vec::new();
-    fs::File::from(read).read_to_end(&mut text).unwrap();
-    text
-}
-
-/// Two clients with a window each. The second has the keyboard.
-fn two_clients() -> (Compositor, Client, Client) {
-    let compositor = Compositor::start();
-    let mut first = Client::connect(&compositor);
-    first.open_window(RED);
-    let mut second = Client::connect(&compositor);
-    second.open_window(GREEN);
-    first.sync();
-    (compositor, first, second)
-}
-
-/// Runs both clients until `source` has answered a pending request. Reading blocks, so that
-/// happens on another thread.
-fn exchange(
-    source_client: &mut Client,
-    target: &mut Client,
-    request: impl FnOnce(&mut Client, std::os::fd::BorrowedFd<'_>),
-) -> Vec<u8> {
-    let (read, write) = rustix::pipe::pipe().unwrap();
-    request(target, write.as_fd());
-    target.sync();
-    drop(write);
-    source_client.sync();
-    source_client.sync();
-    read_pipe(read)
-}
-
 #[test]
 fn the_clipboard_travels_between_clients_with_the_keyboard() {
     let (compositor, mut first, mut second) = two_clients();
@@ -5665,6 +3557,9 @@ fn drag_and_drop_reaches_another_client_and_the_pointer_stays_visible_to_pos() {
     );
     assert_eq!(compositor.screenshot().at(705, 305), BLUE);
 
+    // The target accepted the offer while handling the enter event; a roundtrip makes sure the
+    // compositor has that before the drop, or it rightly cancels the drag.
+    second.sync();
     compositor.button(BTN_LEFT, ButtonState::Released);
     second.sync();
     assert!(second.state.dnd.contains(&DndEvent::Drop));
@@ -5753,43 +3648,6 @@ fn xdg_output_reports_the_logical_size() {
     assert_eq!(client.state.logical_size, Some((WIDTH, HEIGHT)));
 }
 
-/// Starts offering dmabufs of a made-up device, with `answer` as the result of every import.
-fn offer_dmabufs(compositor: &Compositor, answer: bool) {
-    compositor.with(move |state| {
-        use smithay::backend::allocator::{Format as DmabufFormat, Modifier};
-        state.import_dmabuf = Box::new(move |_| answer);
-        let format = DmabufFormat {
-            code: Fourcc::Argb8888,
-            modifier: Modifier::Linear,
-        };
-        state.offer_dmabufs(1, [format]);
-    });
-}
-
-fn create_dmabuf(client: &mut Client) {
-    let manager: ZwpLinuxDmabufV1 = client.bind(4..=5);
-    let params = manager.create_params(&client.handle, ());
-    let file = fs::File::create(scratch_path("dmabuf")).unwrap();
-    file.set_len(4096).unwrap();
-    let modifier = u64::from(smithay::backend::allocator::Modifier::Linear);
-    params.add(
-        file.as_fd(),
-        0,
-        0,
-        64,
-        (modifier >> 32) as u32,
-        modifier as u32,
-    );
-    params.create(
-        16,
-        16,
-        Fourcc::Argb8888 as u32,
-        zwp_linux_buffer_params_v1::Flags::empty(),
-    );
-    client.sync();
-    fs::remove_file(scratch_path("dmabuf")).ok();
-}
-
 #[test]
 fn a_dmabuf_the_renderer_accepts_becomes_a_buffer() {
     let compositor = Compositor::start();
@@ -5818,27 +3676,6 @@ fn without_a_backend_there_are_no_dmabufs_to_get() {
             .iter()
             .any(|global| global.interface == "zwp_linux_dmabuf_v1")
     );
-}
-
-fn bound_output(client: &mut Client) -> WlOutput {
-    let output = client.bind(1..=4);
-    client.sync();
-    output
-}
-
-/// A window and a session locked by a second client whose lock surface fills the output.
-fn locked_session() -> (Compositor, Client, Client, ExtSessionLockV1, LockedSurface) {
-    let compositor = Compositor::start();
-    let mut windows = Client::connect(&compositor);
-    windows.open_window(RED);
-    let mut locker = Client::connect(&compositor);
-    let lock = locker.lock();
-    let output = bound_output(&mut locker);
-    let surface = locker.lock_surface(&lock, &output, LOCK);
-    compositor.present();
-    locker.sync();
-    windows.take_input();
-    (compositor, windows, locker, lock, surface)
 }
 
 #[test]
@@ -6195,27 +4032,6 @@ fn a_lock_surface_follows_the_size_of_its_output() {
     assert_eq!(locker.state.lock_size, Some((800, 400)));
 }
 
-/// A client with an idle notification of a few milliseconds.
-fn idle_client(compositor: &Compositor) -> (Client, ExtIdleNotificationV1) {
-    let client = Client::connect(compositor);
-    let notifier: ExtIdleNotifierV1 = client.bind(1..=2);
-    let seat = client.seat();
-    let notification = notifier.get_idle_notification(20, &seat, &client.handle, ());
-    (client, notification)
-}
-
-fn wait_for_idle(client: &mut Client, wanted: usize) {
-    let start = Instant::now();
-    while client.state.idle.len() < wanted {
-        assert!(
-            start.elapsed() < ANSWER,
-            "no idle event: {:?}",
-            client.state.idle
-        );
-        client.sync();
-    }
-}
-
 #[test]
 fn the_session_goes_idle_and_input_wakes_it() {
     let compositor = Compositor::start();
@@ -6230,13 +4046,19 @@ fn the_session_goes_idle_and_input_wakes_it() {
 #[test]
 fn a_visible_inhibitor_holds_off_idling_and_a_hidden_one_does_not() {
     let compositor = Compositor::start();
-    let (mut client, _notification) = idle_client(&compositor);
+    let mut client = Client::connect(&compositor);
     let a = client.open_window(RED);
     let manager: ZwpIdleInhibitManagerV1 = client.bind(1..=1);
     let surface = client.state.windows[a].surface.clone();
     let _inhibitor = manager.create_inhibitor(&surface, &client.handle, ());
     client.sync();
-    compositor.with(|_| ());
+    compositor.housekeeping();
+    assert!(compositor.with(|state| state.idle_notifier_state.is_inhibited()));
+    // The notification only now: its 20 ms may run out on a busy machine before the window is up.
+    let notifier: ExtIdleNotifierV1 = client.bind(1..=2);
+    let seat = client.seat();
+    let _notification = notifier.get_idle_notification(20, &seat, &client.handle, ());
+    client.sync();
     compositor.pointer_at(10.0, 10.0);
     assert!(compositor.with(|state| state.idle_notifier_state.is_inhibited()));
     let start = Instant::now();
@@ -6250,7 +4072,7 @@ fn a_visible_inhibitor_holds_off_idling_and_a_hidden_one_does_not() {
     );
 
     compositor.chord(&[KEY_LEFTMETA], KEY_2);
-    compositor.with(|_| ());
+    compositor.housekeeping();
     assert!(!compositor.with(|state| state.idle_notifier_state.is_inhibited()));
     wait_for_idle(&mut client, 1);
 }
@@ -6267,28 +4089,6 @@ fn refuses_the_drm_backend_without_a_virtual_terminal() {
     assert_eq!(output.status.code(), Some(1));
     let message = String::from_utf8_lossy(&output.stderr);
     assert!(message.contains("not a virtual terminal"), "{message}");
-}
-
-const KEY_BACKSPACE: u32 = 14;
-const KEY_F3: u32 = 61;
-
-/// Lets the compositor note every VT switch, and every emergency stop, in a list of its own.
-fn record_vt_switches(compositor: &Compositor) -> Arc<Mutex<Vec<i32>>> {
-    let switches = Arc::new(Mutex::new(Vec::new()));
-    let recorded = switches.clone();
-    compositor.with(move |state| {
-        state.change_vt = Some(Box::new(move |vt| recorded.lock().unwrap().push(vt)));
-    });
-    switches
-}
-
-fn record_emergency(compositor: &Compositor) -> Arc<Mutex<u32>> {
-    let count = Arc::new(Mutex::new(0));
-    let recorded = count.clone();
-    compositor.with(move |state| {
-        state.emergency = Box::new(move || *recorded.lock().unwrap() += 1);
-    });
-    count
 }
 
 #[test]
@@ -6367,11 +4167,6 @@ fn a_frame_from_before_the_lock_does_not_confirm_it() {
     assert_eq!(locker.state.lock_events, [LockEvent::Locked]);
 }
 
-/// The dark pixels and the light ones around (x, y), which only a drawn cursor gives.
-fn differs_from_background(shot: &Screenshot, background: u32, x: i32, y: i32) -> bool {
-    (0..24).any(|offset| shot.at(x + offset / 2, y + offset) != background)
-}
-
 #[test]
 fn named_cursors_are_drawn_when_nobody_else_does_it_also_while_locked() {
     let compositor = Compositor::start();
@@ -6393,34 +4188,6 @@ fn named_cursors_are_drawn_when_nobody_else_does_it_also_while_locked() {
     locker.lock();
     let shot = compositor.screenshot();
     assert!(differs_from_background(&shot, background, 300, 200));
-}
-
-/// A window with the pointer inside and the keyboard, and what a game needs from the compositor.
-fn window_for_game() -> (Compositor, Client, ZwpPointerConstraintsV1, usize) {
-    let compositor = Compositor::start();
-    let mut client = Client::connect(&compositor);
-    let window = client.open_window(0xff0000);
-    let constraints = client.bind::<ZwpPointerConstraintsV1>(1..=1);
-    compositor.pointer_at(100.0, 100.0);
-    client.take_input();
-    (compositor, client, constraints, window)
-}
-
-impl Compositor {
-    fn pointer_delta(&self, dx: f64, dy: f64) {
-        self.with(move |state| {
-            let delta = (dx, dy).into();
-            let raw = (dx * 2.0, dy * 2.0).into();
-            state.on_pointer_delta(delta, raw, InputTime::now());
-        });
-    }
-
-    fn pointer_location(&self) -> (f64, f64) {
-        self.with(|state| {
-            let location = state.seat.get_pointer().unwrap().current_location();
-            (location.x, location.y)
-        })
-    }
 }
 
 #[test]
@@ -6578,20 +4345,6 @@ fn moving_the_pointer_away_by_command_ends_a_lock() {
     assert_eq!(client.state.constraint_events, [true, false]);
 }
 
-/// Asks for a token, with the serial of the latest key press if `serial` is set.
-fn activation_token(client: &mut Client, serial: bool, surface: &WlSurface) -> String {
-    let activation = client.bind::<XdgActivationV1>(1..=1);
-    let token = activation.get_activation_token(&client.handle, ());
-    if serial {
-        let seat: WlSeat = client.globals.bind(&client.handle, 1..=9, ()).unwrap();
-        token.set_serial(client.state.key_serial, &seat);
-    }
-    token.set_surface(surface);
-    token.commit();
-    client.sync();
-    client.state.activation_token.take().unwrap()
-}
-
 #[test]
 fn a_token_from_a_key_press_brings_up_the_window_on_its_workspace() {
     let compositor = Compositor::start();
@@ -6665,94 +4418,6 @@ fn presentation_feedback_answers_with_the_frame_that_shows_the_surface() {
     });
     client.sync();
     assert_eq!(client.state.presented, [true]);
-}
-
-/// A compositor with a running X server and an X client of it, or `None` on a machine without
-/// Xwayland, where there is nothing to test.
-fn with_x_server() -> Option<(Compositor, RustConnection, u32, MutexGuard<'static, ()>)> {
-    // A real session has one server. Several that come and go here trip over each other's sockets.
-    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-    let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|err| err.into_inner());
-    let compositor = Compositor::start();
-    compositor.with(Wirbel::start_xwayland);
-    let display = compositor.with(|state| state.xwayland.display)?;
-    wait_for(|| compositor.with(|state| state.xwm.is_some()));
-    let (connection, screen) = x11rb::connect(Some(&format!(":{display}"))).unwrap();
-    let root = connection.setup().roots[screen].root;
-    Some((compositor, connection, root, turn))
-}
-
-/// Opens an X11 window. With `override_redirect` it is a menu, without one a normal window.
-fn x_window(connection: &RustConnection, root: u32, override_redirect: bool) -> u32 {
-    let window = connection.generate_id().unwrap();
-    let aux = CreateWindowAux::new()
-        .background_pixel(0x00ff0000)
-        .override_redirect(u32::from(override_redirect))
-        .event_mask(EventMask::KEY_PRESS | EventMask::STRUCTURE_NOTIFY | EventMask::FOCUS_CHANGE);
-    connection
-        .create_window(
-            COPY_DEPTH_FROM_PARENT,
-            window,
-            root,
-            40,
-            30,
-            200,
-            100,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            COPY_FROM_PARENT,
-            &aux,
-        )
-        .unwrap();
-    connection.map_window(window).unwrap();
-    connection.flush().unwrap();
-    window
-}
-
-fn wait_for(mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !condition() {
-        assert!(Instant::now() < deadline, "timed out");
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Where a window is on the screen. Its parent is the frame of the window manager.
-fn x_geometry(connection: &RustConnection, window: u32) -> (i32, i32, u32, u32) {
-    let geometry = connection.get_geometry(window).unwrap().reply().unwrap();
-    let on_screen = connection
-        .translate_coordinates(window, geometry.root, 0, 0)
-        .unwrap()
-        .reply()
-        .unwrap();
-    (
-        on_screen.dst_x.into(),
-        on_screen.dst_y.into(),
-        geometry.width.into(),
-        geometry.height.into(),
-    )
-}
-
-/// Ends the Xwayland of a display the hard way.
-fn kill_x_server(display: u32) {
-    let wanted = format!(":{display}");
-    let mine = std::process::id().to_string();
-    for entry in fs::read_dir("/proc").unwrap().flatten() {
-        let Ok(line) = fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let mut words = line.split(|byte| *byte == 0);
-        let is_server = words.next().is_some_and(|word| word.ends_with(b"Xwayland"))
-            && words.next() == Some(wanted.as_bytes());
-        let status = fs::read_to_string(entry.path().join("status")).unwrap_or_default();
-        let parent = status.lines().find_map(|line| line.strip_prefix("PPid:"));
-        if is_server && parent.is_some_and(|parent| parent.trim() == mine) {
-            let pid = entry.file_name().into_string().unwrap();
-            Command::new("kill").args(["-9", &pid]).status().unwrap();
-            return;
-        }
-    }
-    panic!("no Xwayland on {wanted}");
 }
 
 #[test]
@@ -6991,35 +4656,6 @@ fn a_dead_x_server_takes_its_windows_along_and_comes_back() {
     let root = connection.setup().roots[screen].root;
     x_window(&connection, root, false);
     wait_for(|| compositor.focused_rect().is_some());
-}
-
-/// The XRGB pixel at (x, y) of a captured image `width` wide.
-fn captured_pixel(file: &fs::File, width: i32, x: i32, y: i32) -> u32 {
-    use std::os::unix::fs::FileExt;
-    let mut pixel = [0; 4];
-    file.read_exact_at(&mut pixel, ((y * width + x) * 4) as u64)
-        .unwrap();
-    u32::from_le_bytes(pixel) & 0xff_ffff
-}
-
-/// Captures all of the first output by `wlr-screencopy` and returns the image.
-fn screencopy(compositor: &Compositor, client: &mut Client, cursor: i32) -> fs::File {
-    let manager: ZwlrScreencopyManagerV1 = client.bind(1..=3);
-    let output: WlOutput = client.bind(1..=4);
-    let frame = manager.capture_output(cursor, &output, &client.handle, ());
-    let (width, height) = client.describe_frame();
-    assert_eq!((width, height), (WIDTH, HEIGHT));
-    let (buffer, file) = client.capture_buffer(width, height);
-    client.state.copy = CopyState::default();
-    frame.copy(&buffer);
-    client.sync();
-    assert!(!client.state.copy.ready, "answered before the next frame");
-    compositor.run_captures(0);
-    client.sync();
-    assert!(client.state.copy.ready, "no ready");
-    assert!(!client.state.copy.failed);
-    frame.destroy();
-    file
 }
 
 #[test]
@@ -7274,12 +4910,6 @@ fn image_copy_capture_learns_a_new_mode_and_ends_with_the_output() {
     assert!(client.state.copy.stopped);
 }
 
-fn foreign_manager(client: &mut Client) -> ZwlrForeignToplevelManagerV1 {
-    let manager = client.bind(1..=3);
-    client.sync();
-    manager
-}
-
 #[test]
 fn window_lists_see_windows_come_change_and_go() {
     use zwlr_foreign_toplevel_handle_v1::State as ForeignState;
@@ -7425,28 +5055,6 @@ fn a_parent_is_named_to_the_window_list() {
     assert_eq!(list.state.foreign.len(), 2);
     let child = list.state.foreign.iter().find(|entry| entry.parent);
     assert!(child.is_some(), "no parent event");
-}
-
-/// A clipboard manager: a client without any window.
-struct Manager {
-    client: Client,
-    _device: ZwlrDataControlDeviceV1,
-    control: ZwlrDataControlManagerV1,
-}
-
-impl Manager {
-    fn connect(compositor: &Compositor) -> Self {
-        let mut client = Client::connect(compositor);
-        let control: ZwlrDataControlManagerV1 = client.bind(1..=2);
-        let seat = client.seat();
-        let device = control.get_data_device(&seat, &client.handle, ());
-        client.sync();
-        Self {
-            client,
-            _device: device,
-            control,
-        }
-    }
 }
 
 #[test]
@@ -7597,7 +5205,6 @@ fn a_subsurface_moves_with_the_commit_of_its_parent() {
     }
 }
 
-const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_RIGHTALT: u32 = 100; // AltGr on a German keyboard
 
 #[test]
@@ -7731,12 +5338,6 @@ fn used_workspaces_skip_the_empty_ones_and_stop_at_the_ends() {
     assert_eq!(compositor.active_workspace(), 6, "no wrapping");
 }
 
-const REPEATING: &str = "repeat_delay = 40
-    repeat_rate = 200
-    bind = SUPER, Right, workspace, next
-    bind = SUPER, Return, spawn, true
-    bind = SUPER, w, close\n";
-
 #[test]
 fn a_held_bind_repeats_until_its_key_goes_up() {
     let compositor = Compositor::start_with(REPEATING);
@@ -7868,23 +5469,6 @@ fn mango_lines_for_binds_work_as_they_are() {
     assert_eq!(config.axis_binds.len(), 1);
 }
 
-fn ipc_lines(compositor: &Compositor, request: &str) -> BufReader<UnixStream> {
-    let socket = compositor.with(|state| state.socket_name.clone());
-    let path = wirbel::ipc::socket_path(socket.as_ref()).unwrap();
-    let mut stream = UnixStream::connect(path).unwrap();
-    writeln!(stream, "{request}").unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    BufReader::new(stream)
-}
-
-fn next_line(reader: &mut BufReader<UnixStream>) -> String {
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    line
-}
-
 #[test]
 fn bars_can_follow_the_workspaces() {
     let compositor = Compositor::start();
@@ -7978,18 +5562,6 @@ fn the_offset_of_a_cursor_surface_moves_its_hotspot() {
     // The hotspot stays in the picture where the client's image moved to.
     assert_eq!(compositor.screenshot().at(399, 298), BLUE);
     assert_ne!(compositor.screenshot().at(392, 294), BLUE);
-}
-
-/// A tile that draws up to the edge of the output, across the gap it was told to leave.
-fn overflowing_tile() -> (Compositor, Client, usize) {
-    let compositor = Compositor::start_with("gap_outer = 40\nborder_width = 0\n");
-    let mut client = Client::connect(&compositor);
-    let tile = client.open_window(RED);
-    client.sync();
-    client.draw_sized(tile, (WIDTH, HEIGHT), RED);
-    client.sync();
-    client.take_input();
-    (compositor, client, tile)
 }
 
 #[test]
@@ -8089,22 +5661,6 @@ fn a_window_that_wants_attention_shows_in_the_tags_until_it_has_the_focus() {
         state.set_focus(Some(window));
     });
     assert!(!next_line(&mut ipc_lines(&compositor, "tags")).contains(r#""is_urgent":true"#));
-}
-
-impl Client {
-    /// `sync` for a client that may have earned a protocol error, which ends it and only it.
-    fn sync_or_die(&mut self) {
-        let _ = self.queue.roundtrip(&mut self.state);
-    }
-}
-
-/// Whatever a client does to itself, the compositor stays and serves the next one.
-fn survives(compositor: &Compositor) {
-    let mut client = Client::connect(compositor);
-    let window = client.open_window(BLUE);
-    client.sync();
-    client.close(window);
-    client.sync();
 }
 
 #[test]
@@ -8252,6 +5808,7 @@ fn a_hundred_windows_fit_somehow() {
         assert!(frame.w > 0 && frame.h > 0, "{frame:?}");
     }
     drop(client);
+    compositor.wait_for_clients(0);
     survives(&compositor);
     assert!(compositor.frames().is_empty());
 }
@@ -8278,6 +5835,7 @@ fn nothing_stays_behind_when_windows_and_clients_go() {
             client.sync();
         }
     }
+    compositor.wait_for_clients(0);
     survives(&compositor);
     compositor.with(|state| {
         state.popups.cleanup();
@@ -8288,27 +5846,6 @@ fn nothing_stays_behind_when_windows_and_clients_go() {
         assert!(state.borders.is_empty());
         assert_eq!(state.space.elements().count(), 0);
     });
-}
-
-// Plugins: what they ask for on the socket, and `wirbel plug`.
-
-/// Waits until `done` holds, or fails the test.
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !done() {
-        assert!(start.elapsed() < ANSWER, "timed out waiting for {what}");
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn first_window_id(ipc: &mut RawIpc) -> u64 {
-    let windows = ipc.request("windows");
-    let start = windows.find(r#""id":"#).expect("no window") + 5;
-    let digits: String = windows[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().unwrap()
 }
 
 #[test]
@@ -8437,75 +5974,6 @@ fn plugins_dispatch_bind_actions() {
         ipc.request("opacity 1 2"),
         "error opacity goes from 0 to 1, got 2"
     );
-}
-
-/// A config file and a plugin script for the `wirbel plug` tests. The script notes that it ran,
-/// then waits to be stopped.
-struct PlugSetup {
-    folder: PathBuf,
-    config: PathBuf,
-    plugin: PathBuf,
-    marker: PathBuf,
-}
-
-impl PlugSetup {
-    fn new(name: &str) -> Self {
-        use std::os::unix::fs::PermissionsExt;
-        let folder = scratch_path(name);
-        let _ = fs::remove_dir_all(&folder);
-        fs::create_dir_all(&folder).unwrap();
-        let config = folder.join("config");
-        fs::write(&config, "# mine\nsloppy_focus = 0\n").unwrap();
-        let plugin = folder.join("marker.sh");
-        let marker = folder.join("ran");
-        fs::write(
-            &plugin,
-            format!(
-                "#!/bin/sh\necho \"$WIRBEL_PLUGIN $WIRBEL_SOCKET\" > '{}'\nexec sleep 60\n",
-                marker.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&plugin, fs::Permissions::from_mode(0o755)).unwrap();
-        Self {
-            folder,
-            config,
-            plugin,
-            marker,
-        }
-    }
-
-    fn plug(&self, compositor: &Compositor, args: &[&str]) -> String {
-        let output = compositor
-            .cli(&[&["plug"], args].concat())
-            .env("WIRBEL_CONFIG", &self.config)
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{args:?}: {stderr}");
-        String::from_utf8(output.stdout).unwrap()
-    }
-
-    fn plug_failing(&self, compositor: &Compositor, args: &[&str]) -> String {
-        let output = compositor
-            .cli(&[&["plug"], args].concat())
-            .env("WIRBEL_CONFIG", &self.config)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
-        String::from_utf8(output.stderr).unwrap()
-    }
-
-    fn running(&self, compositor: &Compositor) -> bool {
-        let plugin = self.plugin.clone();
-        compositor.with(move |state| state.plugins.running().any(|path| path == plugin))
-    }
-}
-
-impl Drop for PlugSetup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.folder);
-    }
 }
 
 #[test]
@@ -8671,44 +6139,6 @@ fn wirbel_restart_ends_the_compositor_for_the_session_to_start_again() {
     );
 }
 
-const CTRL_ALT: &[u32] = &[KEY_LEFTCTRL, KEY_LEFTALT];
-const KEY_ESC: u32 = 1;
-
-fn hold(compositor: &Compositor, keys: &[u32], key_state: KeyState) {
-    for key in keys {
-        compositor.key(*key, key_state);
-    }
-}
-
-/// A plugin connection that took Ctrl+Alt+left, with events on it.
-fn grabbing_plugin(compositor: &Compositor) -> RawIpc {
-    let mut plugin = compositor.raw_ipc();
-    assert_eq!(plugin.request("grab ctrl+alt btn_left"), "ok");
-    plugin
-}
-
-/// A closed connection is noticed in its own time.
-fn wait_until_plugin_input_unused(compositor: &Compositor) {
-    for _ in 0..500 {
-        if !compositor.with(|state| state.plugin_input.in_use()) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    panic!("the grabs and lines of a closed connection stay");
-}
-
-/// Moves to `from`, presses, moves to `to` in a few steps and lets go.
-fn stroke(compositor: &Compositor, from: (f64, f64), to: (f64, f64)) {
-    compositor.pointer_at(from.0, from.1);
-    compositor.button(BTN_LEFT, ButtonState::Pressed);
-    for step in 1..=4 {
-        let t = f64::from(step) / 4.0;
-        compositor.pointer_at(from.0 + t * (to.0 - from.0), from.1 + t * (to.1 - from.1));
-    }
-    compositor.button(BTN_LEFT, ButtonState::Released);
-}
-
 #[test]
 fn a_grab_takes_the_button_for_a_whole_session_until_the_modifiers_go_up() {
     let (compositor, mut client, _, _) = two_windows();
@@ -8860,4 +6290,76 @@ fn plugins_find_focus_and_close_the_window_at_a_place() {
     client.sync();
     assert_eq!(client.state.closed, [b]);
     assert!(plugin.request("close 99999").starts_with("error"));
+}
+
+#[test]
+fn injection_needs_test_input() {
+    use wirbel::inject::Inject;
+    let compositor = Compositor::start();
+    let answer = compositor.with(|state| state.inject(Inject::Wheel(1.0)));
+    assert!(answer.is_err());
+}
+
+#[test]
+fn injected_input_takes_the_real_paths() {
+    use wirbel::inject::Inject;
+    let (compositor, mut client, _, _) = two_windows();
+    compositor.with(|state| state.test_input = true);
+    let inject = |request: Inject| compositor.with(move |state| state.inject(request)).unwrap();
+    let key = |code, pressed| {
+        let state = if pressed {
+            wl_keyboard::KeyState::Pressed
+        } else {
+            wl_keyboard::KeyState::Released
+        };
+        Input::Key(code, state)
+    };
+
+    // A capital letter takes Shift around it.
+    inject(Inject::Type("aA".into()));
+    assert_eq!(
+        client.take_input(),
+        [
+            key(KEY_A, true),
+            key(KEY_A, false),
+            key(KEY_LEFTSHIFT, true),
+            key(KEY_A, true),
+            key(KEY_A, false),
+            key(KEY_LEFTSHIFT, false),
+        ]
+    );
+    let cannot = compositor.with(|state| state.inject(Inject::Type("a語".into())));
+    assert!(cannot.is_err());
+    assert_eq!(client.take_input(), [], "half a word got typed");
+
+    // A chord runs the bind like the keyboard would.
+    let chord = Inject::parse("inject chord SUPER+2").unwrap().unwrap();
+    inject(chord);
+    assert_eq!(compositor.active_workspace(), 1);
+    inject(Inject::parse("inject chord SUPER+1").unwrap().unwrap());
+    assert_eq!(compositor.active_workspace(), 0);
+
+    // Relative motion moves the pointer like a mouse.
+    compositor.pointer_at(100.0, 100.0);
+    inject(Inject::Motion {
+        dx: 50.0,
+        dy: -20.0,
+    });
+    let location = compositor.with(|state| state.seat.get_pointer().unwrap().current_location());
+    assert_eq!((location.x, location.y), (150.0, 80.0));
+
+    client.take_input();
+    inject(Inject::Button {
+        button: BTN_RIGHT,
+        down: true,
+    });
+    inject(Inject::Button {
+        button: BTN_RIGHT,
+        down: false,
+    });
+    inject(Inject::Wheel(2.0));
+    let input = client.take_input();
+    assert!(input.contains(&Input::Button(BTN_RIGHT, wl_pointer::ButtonState::Pressed)));
+    assert!(input.contains(&Input::Button(BTN_RIGHT, wl_pointer::ButtonState::Released)));
+    assert!(input.contains(&Input::AxisV120(wl_pointer::Axis::VerticalScroll, 240)));
 }

@@ -13,6 +13,9 @@
 //! - `watch-tags` and `watch-monitors` do so now and again whenever that line changes.
 //! - `workspace N`, `workspace next|prev|next_used|prev_used`, `quit`, `restart` and `reload` act like the
 //!   bind and answer with `ok`.
+//! - `NAME ARGUMENT` for the name of an extension runs its command, see `crate::extension`; it
+//!   answers with `ok`, another line the extension chooses, or `error MESSAGE`.
+//! - `inject ...` plays keyboard and mouse input, only with `--test-input`, see `inject`.
 //! - What plugins ask for, see `plugin_api`.
 //!
 //! Nothing here may block the compositor. A client that stops reading only misses lines: its next
@@ -42,6 +45,7 @@ use smithay::{
 use crate::{
     Wirbel,
     config::{Action, BTN_LEFT, WORKSPACES, WorkspaceTarget},
+    inject::Inject,
     plugin_api::PluginRequest,
 };
 
@@ -611,6 +615,19 @@ impl Wirbel {
         while let Some(line) = self.ipc.next_line(id) {
             match Request::parse(&line) {
                 Ok(request) => self.handle_request(id, request),
+                Err(_) if let Some((name, argument)) = crate::extension::parse_request(&line) => {
+                    match self.extension_command(name, &argument) {
+                        Ok(answer) => self.ipc.reply(id, &answer),
+                        Err(err) => self.ipc.reply(id, &format!("error {err}")),
+                    }
+                }
+                Err(_) if let Some(inject) = Inject::parse(&line) => {
+                    let answer = inject.and_then(|inject| self.inject(inject));
+                    match answer {
+                        Ok(()) => self.ipc.reply(id, "ok"),
+                        Err(err) => self.ipc.reply(id, &format!("error {err}")),
+                    }
+                }
                 Err(err) => match PluginRequest::parse(&line) {
                     Some(Ok(request)) => self.handle_plugin_request(id, request),
                     Some(Err(err)) => self.ipc.reply(id, &format!("error {err}")),

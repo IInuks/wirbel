@@ -103,6 +103,7 @@ const FLOATING_SHARE: f64 = 0.75;
 pub struct BorderEdge {
     pub location: Point<i32, Logical>,
     pub buffer: SolidColorBuffer,
+    pub color: [f32; 4],
 }
 
 /// Whether a window asks to float by its nature: dialogs and windows of a fixed size.
@@ -132,6 +133,15 @@ fn x11_wants_to_float(window: &X11Surface) -> bool {
         )
     );
     fixed || floating_type || window.is_transient_for().is_some() || window.is_modal()
+}
+
+/// Whether a window of either kind asks to float by its nature.
+pub fn wants_to_float_window(window: &Window) -> bool {
+    match (window.toplevel(), window.x11_surface()) {
+        (Some(toplevel), _) => wants_to_float(toplevel),
+        (None, Some(surface)) => x11_wants_to_float(surface),
+        (None, None) => false,
+    }
 }
 
 /// Whether the client has caught up with the size last asked of it. Until then, the size of what
@@ -224,6 +234,8 @@ pub struct Wirbel {
     pub borders: Vec<(Window, Vec<BorderEdge>)>,
     /// Pressed keys that triggered a bind. Their release must not reach a client either.
     pub swallowed_keys: Vec<Keycode>,
+    /// Buttons an input filter kept the press of; their release is kept too, filter or not.
+    pub swallowed_buttons: Vec<u32>,
     /// The bind of a modifier key, on its way out of the keyboard filter.
     pub modifier_action: Option<Action>,
     /// The timer of a held bind.
@@ -244,6 +256,8 @@ pub struct Wirbel {
     pub last_press: Serial,
     /// Whether the left button is down, by hand or by `wirbel click`.
     pub left_held: bool,
+    /// Whether the control socket takes `inject` requests, see `crate::inject`.
+    pub test_input: bool,
     /// Buttons and lines of the plugins, see `crate::plugin_input`.
     pub plugin_input: crate::plugin_input::PluginInput,
     pub ipc: Ipc,
@@ -251,6 +265,18 @@ pub struct Wirbel {
     pub plugins: PluginHost,
     /// What they did to the windows, see `crate::plugin_api`.
     pub plugin_state: PluginState,
+    /// The extensions built into this compositor and their state, see `crate::extension`.
+    pub extensions: crate::extension::Extensions,
+    /// What draws an output instead of the scene, see `crate::scene_override`.
+    pub scene_override: Option<crate::scene_override::SceneOverrideSlot>,
+    /// Overrides taken off their output that still have to release their GL objects.
+    pub retired_overrides: Vec<crate::scene_override::SceneOverrideSlot>,
+    /// What gets the input before binds and clients, see `crate::input_filter`.
+    pub input_filter: Option<crate::input_filter::InputFilterSlot>,
+    /// What shows windows instead of the layout, see `crate::window_hook`.
+    pub window_hook: Option<std::rc::Rc<dyn crate::window_hook::WindowHook>>,
+    /// Windows the window hook keeps out of the workspaces, in the order they opened.
+    pub held_windows: Vec<Window>,
     /// Asks the renderer whether it can use a dmabuf. Set by a backend that offers dmabufs.
     pub import_dmabuf: Box<dyn FnMut(&Dmabuf) -> bool>,
 
@@ -353,6 +379,7 @@ impl Wirbel {
             frames: Vec::new(),
             borders: Vec::new(),
             swallowed_keys: Vec::new(),
+            swallowed_buttons: Vec::new(),
             modifier_action: None,
             bind_repeat: None,
             last_axis_bind: None,
@@ -364,10 +391,17 @@ impl Wirbel {
             urgent: Vec::new(),
             last_press: Serial::from(0),
             left_held: false,
+            test_input: false,
             plugin_input: Default::default(),
             ipc,
             plugins: PluginHost::default(),
             plugin_state: PluginState::default(),
+            extensions: Default::default(),
+            scene_override: None,
+            retired_overrides: Vec::new(),
+            input_filter: None,
+            window_hook: None,
+            held_windows: Vec::new(),
             import_dmabuf: Box::new(|_| false),
 
             needs_redraw: true,
@@ -547,6 +581,7 @@ impl Wirbel {
         }
         keyboard.change_repeat_info(config.repeat_rate, config.repeat_delay);
         self.config = config;
+        self.reload_extensions();
         self.retile();
         self.sync_plugins();
         tracing::info!("configuration reloaded");
@@ -710,6 +745,7 @@ impl Wirbel {
             .iter()
             .flat_map(|monitor| &monitor.workspaces)
             .flat_map(Workspace::windows)
+            .chain(self.held_windows.iter().cloned())
             .find(|window| window.wl_surface().as_deref() == Some(surface))
     }
 
@@ -719,6 +755,7 @@ impl Wirbel {
             .iter()
             .flat_map(|monitor| &monitor.workspaces)
             .flat_map(Workspace::windows)
+            .chain(self.held_windows.iter().cloned())
             .chain(self.overrides.iter().cloned())
             .find(|window| window.x11_surface() == Some(surface))
     }
@@ -790,6 +827,9 @@ impl Wirbel {
     }
 
     fn place(&mut self, window: Window, placement: Placement, requested: Option<FullKind>) -> bool {
+        if self.hold_new_window(&window) {
+            return true;
+        }
         let Some(monitor) = self.monitors.get_mut(self.active_monitor) else {
             return false;
         };
@@ -1016,14 +1056,26 @@ impl Wirbel {
         self.update_keyboard_focus();
     }
 
-    /// Who should have the keyboard: the lock screen rules everything, then a layer surface that
-    /// claims the keyboard, then one that was clicked, then the focused window.
+    /// Who should have the keyboard: the lock screen rules everything, then nobody while an input
+    /// filter holds the input, then a layer surface that claims the keyboard, then one that was
+    /// clicked, then the focused window.
     fn keyboard_target(&self) -> Option<KeyboardFocus> {
         if self.lock.is_active() {
             let surface = self
                 .lock
                 .surface_for_input(self.monitors.get(self.active_monitor));
             return surface.map(KeyboardFocus::Surface);
+        }
+        if let Some(filter) = self.input_filter() {
+            if filter.holds_input() {
+                return None;
+            }
+            if filter.routes_input() {
+                // What is drawn over the filter's picture comes first, as it would in 2D.
+                return self
+                    .override_layer_keyboard()
+                    .or_else(|| filter.route_keyboard(self));
+            }
         }
         let active = self.monitors.get(self.active_monitor).into_iter();
         let monitors = active.chain(&self.monitors);
@@ -1046,13 +1098,7 @@ impl Wirbel {
                 && has_buffer(layer.wl_surface())
         });
         let layer = layer.map(|layer| layer.wl_surface().clone().into());
-        layer.or_else(|| {
-            let window = self.focused.as_ref()?;
-            match window.x11_surface() {
-                Some(surface) => Some(KeyboardFocus::X11(Box::new(surface.clone()))),
-                None => Some(window.toplevel()?.wl_surface().clone().into()),
-            }
-        })
+        layer.or_else(|| KeyboardFocus::of_window(self.focused.as_ref()?))
     }
 
     /// Brings the keyboard in line with `keyboard_target`. Whatever changes the answer calls this.
@@ -1210,6 +1256,9 @@ impl Wirbel {
 
     /// Forgets a window that is gone, or unmapped itself, and moves focus to its neighbour.
     pub fn remove_window(&mut self, window: &Window) {
+        let held = self.held_windows.len();
+        self.held_windows.retain(|other| other != window);
+        let known = held != self.held_windows.len() || self.locate(window).is_some();
         self.dismiss_window_popups(window);
         self.awaiting_buffer.retain(|other| other != window);
         self.urgent.retain(|other| other != window);
@@ -1223,6 +1272,9 @@ impl Wirbel {
             self.update_keyboard_focus();
         }
         self.retile();
+        if known {
+            self.window_event(window, crate::window_hook::WindowEvent::Unmapped);
+        }
     }
 
     /// Enters or leaves floating. A window that starts floating sits in the middle of its output
@@ -1303,6 +1355,50 @@ impl Wirbel {
             .map(|(_, surface, location)| (surface, location))
     }
 
+    /// The layer surface drawn over a render override at `position` (`override_layers`), its
+    /// surface there and where that surface begins.
+    pub fn override_layer_under(
+        &self,
+        position: Point<f64, Logical>,
+    ) -> Option<(LayerSurface, WlSurface, Point<f64, Logical>)> {
+        let output = self.scene_override.as_ref()?.output();
+        let area = self.space.output_geometry(output)?;
+        if !area.to_f64().contains(position) {
+            return None;
+        }
+        layer_under(&self.override_layers(output), position)
+    }
+
+    /// The layer surface drawn over a render override that should have the keyboard: one that
+    /// claims it, else the one that was clicked.
+    fn override_layer_keyboard(&self) -> Option<KeyboardFocus> {
+        let output = self.scene_override.as_ref()?.output();
+        let entries = self.override_layers(output);
+        let shown = |layer: &LayerSurface| has_buffer(layer.wl_surface());
+        let exclusive = entries.iter().map(|entry| &entry.layer).find(|layer| {
+            layer.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
+                && shown(layer)
+        });
+        let clicked = || {
+            let layer = self.layer_focus.as_ref()?;
+            let listed = entries.iter().any(|entry| entry.layer == *layer);
+            (listed && layer.can_receive_keyboard_focus() && shown(layer)).then_some(layer)
+        };
+        let layer = exclusive.or_else(clicked)?;
+        Some(layer.wl_surface().clone().into())
+    }
+
+    /// Whether a layer surface drawn over a render override claims the keyboard.
+    pub fn override_layer_exclusive(&self) -> bool {
+        let Some(slot) = self.scene_override.as_ref() else {
+            return false;
+        };
+        self.override_layers(slot.output()).iter().any(|entry| {
+            entry.layer.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
+                && has_buffer(entry.layer.wl_surface())
+        })
+    }
+
     /// The topmost thing at `position`, with its surface and where that surface begins. A locked
     /// session has nothing but lock surfaces.
     pub fn under(
@@ -1323,19 +1419,8 @@ impl Wirbel {
         let LayerTiers { above, below } =
             monitor.map_or_else(LayerTiers::default, |index| self.layer_tiers(index));
         let on_layer = |entries: &[LayerEntry]| {
-            entries.iter().find_map(|entry| {
-                let relative = position - entry.location.to_f64();
-                let kind = match entry.part {
-                    LayerPart::Whole => WindowSurfaceType::ALL,
-                    LayerPart::Surface => {
-                        WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE
-                    }
-                    LayerPart::Popups => WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE,
-                };
-                let (surface, offset) = entry.layer.surface_under(relative, kind)?;
-                let location = (offset + entry.location).to_f64();
-                Some((Target::Layer(entry.layer.clone()), surface, location))
-            })
+            layer_under(entries, position)
+                .map(|(layer, surface, location)| (Target::Layer(layer), surface, location))
         };
         on_layer(&above)
             .or_else(|| {
@@ -1384,7 +1469,7 @@ impl Wirbel {
         let Some(pointer) = self.seat.get_pointer() else {
             return location;
         };
-        let under = self.surface_under(location);
+        let under = self.pointer_target(location);
         let serial = SERIAL_COUNTER.next_serial();
         let event = MotionEvent {
             location,
@@ -1423,7 +1508,7 @@ impl Wirbel {
             .map(root_of);
         let wanted = focused == Some(root_of(surface.clone()));
         let location = pointer.current_location();
-        let origin = self.surface_under(location).map(|under| under.1);
+        let origin = self.pointer_target(location).map(|under| under.1);
         with_pointer_constraint(&surface, &pointer, |constraint| {
             let Some(constraint) = constraint else {
                 return;
@@ -1480,7 +1565,7 @@ impl Wirbel {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
-        let under = self.surface_under(pointer.current_location());
+        let under = self.pointer_target(pointer.current_location());
         if under.map(|(surface, _)| surface) != pointer.current_focus() {
             self.refresh_pointer_focus();
         }
@@ -1534,7 +1619,7 @@ pub(crate) fn has_buffer(surface: &WlSurface) -> bool {
 }
 
 /// Sends the scale and transform of `output` to `surface`, as far as they changed.
-pub(crate) fn apply_output_scale(surface: &WlSurface, states: &SurfaceData, output: &Output) {
+pub fn apply_output_scale(surface: &WlSurface, states: &SurfaceData, output: &Output) {
     let scale = output.current_scale();
     send_surface_state(
         surface,
@@ -1547,7 +1632,11 @@ pub(crate) fn apply_output_scale(surface: &WlSurface, states: &SurfaceData, outp
     });
 }
 
-fn border_edges(tile: Rect, width: i32, color: [f32; 4]) -> impl Iterator<Item = BorderEdge> {
+pub(crate) fn border_edges(
+    tile: Rect,
+    width: i32,
+    color: [f32; 4],
+) -> impl Iterator<Item = BorderEdge> {
     let Rect { x, y, w, h } = tile;
     let side = width.min(w).min(h);
     [
@@ -1561,6 +1650,7 @@ fn border_edges(tile: Rect, width: i32, color: [f32; 4]) -> impl Iterator<Item =
     .map(move |(x, y, w, h)| BorderEdge {
         location: (x, y).into(),
         buffer: SolidColorBuffer::new((w, h), color),
+        color,
     })
 }
 
@@ -1585,4 +1675,23 @@ pub struct ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+/// The first of `entries` (front to back) with a surface at `position`, that surface and where
+/// it begins.
+fn layer_under(
+    entries: &[LayerEntry],
+    position: Point<f64, Logical>,
+) -> Option<(LayerSurface, WlSurface, Point<f64, Logical>)> {
+    entries.iter().find_map(|entry| {
+        let relative = position - entry.location.to_f64();
+        let kind = match entry.part {
+            LayerPart::Whole => WindowSurfaceType::ALL,
+            LayerPart::Surface => WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+            LayerPart::Popups => WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE,
+        };
+        let (surface, offset) = entry.layer.surface_under(relative, kind)?;
+        let location = (offset + entry.location).to_f64();
+        Some((entry.layer.clone(), surface, location))
+    })
 }

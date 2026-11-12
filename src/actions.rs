@@ -57,6 +57,11 @@ impl Wirbel {
                     change_vt(vt);
                 }
             }
+            Action::Extension { name, argument } => {
+                if let Err(err) = self.extension_command(&name, &argument) {
+                    tracing::warn!(name, argument, err, "extension action failed");
+                }
+            }
         }
     }
 

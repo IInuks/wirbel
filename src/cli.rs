@@ -1,5 +1,5 @@
 //! The commands that talk to a running compositor: `wirbel pos`, `wirbel distance`, `wirbel move`,
-//! `wirbel click`, `wirbel ws`, `wirbel mmsg`.
+//! `wirbel click`, `wirbel ws`, `wirbel mmsg`, `wirbel inject`, and those of extensions.
 
 use std::{
     env,
@@ -11,6 +11,7 @@ use std::{
 
 use crate::{
     config::WORKSPACES,
+    inject::{Inject, Step, parse_script},
     ipc::{Position, Request, View, parse_step, socket_path},
 };
 
@@ -31,6 +32,10 @@ const CLICK_USAGE: &str = "usage: wirbel click [COUNT|loop] [SECONDS]";
 const DEFAULT_CLICK_GAP: Duration = Duration::from_secs(1);
 /// More places than a double holds for a position would only print noise.
 const MAX_DECIMALS: usize = 17;
+const INJECT_USAGE: &str =
+    "usage: wirbel inject key NAME down|up | tap NAME | chord MODS+KEY | type TEXT
+                     | motion DX DY | button left|right|middle down|up | wheel STEPS
+       wirbel inject --script SCRIPT";
 const MMSG_USAGE: &str =
     "usage: mmsg get|watch all-tags|all-monitors, or mmsg dispatch view,N|quit|reload_config";
 
@@ -48,8 +53,13 @@ fn connect() -> Result<UnixStream, String> {
 
 /// Connects and sends `request`. The reader is at the first line of the answer.
 fn send(request: Request) -> Result<BufReader<UnixStream>, String> {
+    send_line(&request.to_line())
+}
+
+/// Connects and sends one request line.
+fn send_line(line: &str) -> Result<BufReader<UnixStream>, String> {
     let mut stream = connect()?;
-    let line = request.to_line() + "\n";
+    let line = format!("{line}\n");
     stream
         .write_all(line.as_bytes())
         .map_err(|err| format!("failed to send: {err}"))?;
@@ -420,6 +430,21 @@ pub fn workspace(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// The command of an extension, `wirbel NAME ARGUMENT...`: sends `NAME ARGUMENT...` and prints
+/// the answer unless it is `ok`. See `crate::extension`.
+pub fn extension(name: &str, args: &[String]) -> Result<(), String> {
+    let line = ask_line(&format!("{name} {}", args.join(" ")))?;
+    match line.as_str() {
+        "ok" => Ok(()),
+        "error unknown request" => Err(format!("the running wirbel has no `{name}`")),
+        line if line.starts_with("error ") => check_answer(line),
+        line => {
+            println!("{line}");
+            Ok(())
+        }
+    }
+}
+
 /// `None` is until stopped.
 fn parse_click_count(text: &str) -> Result<Option<u32>, String> {
     if text == "loop" {
@@ -446,10 +471,51 @@ fn check_answer(line: &str) -> Result<(), String> {
 
 /// The single line that answers `request`.
 fn ask(request: Request) -> Result<String, String> {
-    let mut reader = send(request)?;
+    ask_line(&request.to_line())
+}
+
+/// The single line that answers the request `line`.
+fn ask_line(line: &str) -> Result<String, String> {
+    let mut reader = send_line(line)?;
     let timeout = reader.get_ref().set_read_timeout(Some(ANSWER_TIMEOUT));
     timeout.map_err(|err| format!("failed to set a timeout: {err}"))?;
     read_line(&mut reader)?.ok_or("the compositor went away".to_string())
+}
+
+/// Plays input into a compositor started with `--test-input` or `--headless`: one request, or a
+/// whole script over one connection, see `crate::inject`.
+pub fn inject(args: &[String]) -> Result<(), String> {
+    let steps = match args {
+        [flag, script] if flag == "--script" => parse_script(script)?,
+        [flag] if flag == "--help" || flag == "-h" => {
+            println!("{INJECT_USAGE}\n\n{}", crate::inject::SCRIPT_HELP);
+            return Ok(());
+        }
+        [] => return Err(INJECT_USAGE.into()),
+        words => {
+            let line = format!("inject {}", words.join(" "));
+            match Inject::parse(&line) {
+                Some(Ok(inject)) => vec![Step::Send(inject)],
+                Some(Err(err)) => return Err(err),
+                None => return Err(INJECT_USAGE.into()),
+            }
+        }
+    };
+    let mut reader = BufReader::new(connect()?);
+    let timeout = reader.get_ref().set_read_timeout(Some(ANSWER_TIMEOUT));
+    timeout.map_err(|err| format!("failed to set a timeout: {err}"))?;
+    for step in steps {
+        match step {
+            Step::Wait(time) => thread::sleep(time),
+            Step::Send(inject) => {
+                let line = inject.to_line() + "\n";
+                let written = reader.get_mut().write_all(line.as_bytes());
+                written.map_err(|err| format!("failed to send: {err}"))?;
+                check_answer(&read_line(&mut reader)?.ok_or("the compositor went away")?)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Stands in for the `mmsg` of Mango, for the bars written against it. What they do not ask for

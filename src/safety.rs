@@ -4,6 +4,8 @@
 //!
 //! - [`install_log`]: the log and stderr go to a file, flushed line by line.
 //! - [`install_panic_hook`]: a panic ends up in that file, and the terminal is restored.
+//! - [`contain_panic`]: the exception, for code that is built to fail without harm, like an
+//!   optional renderer: its panic is logged and handed back as an error.
 //! - [`Watchdog`]: `--timeout`, SIGTERM/SIGINT and reporting a stalled main loop. A clean stop gets
 //!   [`GRACE`], then the process goes down the hard way.
 //! - [`Chord`] and [`watch_keyboards`]: the emergency chord, read from the evdev devices. Those
@@ -343,8 +345,33 @@ pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let backtrace = Backtrace::force_capture();
         tracing::error!("panic: {info}\n{backtrace}");
+        if CONTAINED.get() > 0 {
+            // `contain_panic` catches it, and the compositor goes on.
+            return;
+        }
         hard_exit(EXIT_PANIC, &format!("panic: {info}"));
     }));
+}
+
+thread_local! {
+    /// How many `contain_panic` calls this thread is in.
+    static CONTAINED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f`, turning a panic into an error instead of ending the compositor. Only for code whose
+/// state cannot be left half done for anybody else: whatever `f` changed has to be its own, or
+/// put back by guards that run while unwinding.
+pub fn contain_panic<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    CONTAINED.set(CONTAINED.get() + 1);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    CONTAINED.set(CONTAINED.get() - 1);
+    result.map_err(|payload| {
+        payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic without a message".to_string())
+    })
 }
 
 /// When the watchdog stops the compositor. Set by the signal handler, which may do little else.
@@ -582,6 +609,21 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    #[test]
+    fn a_contained_panic_is_an_error() {
+        assert_eq!(contain_panic(|| 7), Ok(7));
+        assert_eq!(
+            contain_panic(|| -> u8 { panic!("boom") }),
+            Err("boom".to_string())
+        );
+        let code = 3;
+        assert_eq!(
+            contain_panic(|| -> u8 { panic!("code {code}") }),
+            Err("code 3".to_string())
+        );
+        assert_eq!(CONTAINED.get(), 0);
+    }
 
     fn press(chord: &mut Chord, keys: &[u16]) -> bool {
         keys.iter().fold(false, |_, key| chord.feed(*key, true))

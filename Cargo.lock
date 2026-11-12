@@ -2199,6 +2199,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
+ "wirbel",
  "x11rb",
  "xcursor",
 ]

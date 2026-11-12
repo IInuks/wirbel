@@ -81,8 +81,8 @@ use crate::{
     cursor::Cursors,
     handlers::Capturer,
     monitor::{self, ModeInfo},
-    render::SceneElement,
     safety::SessionActive,
+    scene_override::OutputElement,
 };
 
 /// Plain 8 bits per channel. Nothing here deals with more, and every driver has these.
@@ -458,7 +458,7 @@ impl Drm {
             device
                 .manager
                 .lock()
-                .initialize_output::<_, SceneElement<Renderer<'_>>>(
+                .initialize_output::<_, OutputElement<Renderer<'_>>>(
                     crtc,
                     mode,
                     &[connector.handle()],
@@ -823,7 +823,7 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
                 Rendered::Fatal
             }
             Ok(mut renderer) => {
-                let elements = state.scene_elements(&mut renderer, &output);
+                let elements = state.output_elements(&mut renderer, &output);
                 let color = state.config.background_color;
                 let frame = surface.drm_output.render_frame(
                     &mut renderer,
@@ -886,7 +886,8 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
         if !matches!(outcome, Rendered::Reset | Rendered::Fatal)
             && let Ok(mut renderer) = this.gpus.single_renderer(&render_gpu)
         {
-            this.capturer.run(state, &mut renderer, &output);
+            this.capturer
+                .run_with(state, &mut renderer, &output, Wirbel::output_elements);
         }
         (output, outcome)
     };

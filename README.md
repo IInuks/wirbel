@@ -130,6 +130,8 @@ These commands talk to the running wirbel, so you can use them in scripts and ke
 | `wirbel distance [SECONDS\|loop]` | measures how far the mouse travels |
 | `wirbel ws 3` / `next` / `prev` / `next_used` / `prev_used` | switches workspace |
 | `wirbel restart` | restarts the whole session, like logging out and in |
+| `wirbel NAME ARGUMENT` | the command of an extension, in a program that builds wirbel with extensions (`wirbel::app::main`, see `src/extension.rs`) |
+| `wirbel inject …` | plays keyboard/mouse input into a test instance (`--headless` or `--test-input` only), see `wirbel inject --help` |
 | `wirbel check [CONFIG]` | checks the config and shows your GPUs and monitors |
 | `wirbel plug …` | manages plugins, see below |
 

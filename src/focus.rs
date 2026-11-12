@@ -5,7 +5,7 @@ use std::borrow::Cow;
 
 use smithay::{
     backend::input::{InputTime, KeyState},
-    desktop::PopupKind,
+    desktop::{PopupKind, Window},
     input::{
         Seat,
         keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
@@ -22,6 +22,16 @@ use crate::Wirbel;
 pub enum KeyboardFocus {
     Surface(WlSurface),
     X11(Box<X11Surface>),
+}
+
+impl KeyboardFocus {
+    /// What gets the keyboard when `window` has it.
+    pub fn of_window(window: &Window) -> Option<Self> {
+        match window.x11_surface() {
+            Some(surface) => Some(Self::X11(Box::new(surface.clone()))),
+            None => Some(window.toplevel()?.wl_surface().clone().into()),
+        }
+    }
 }
 
 impl From<WlSurface> for KeyboardFocus {

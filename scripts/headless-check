@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Starts wirbel --headless, opens a client in it, captures a frame with grim and checks the PNG.
+# Nothing shows on the screen, and nothing is left running afterwards.
+#
+#   scripts/headless-check [--size WxH] [--client CMD] [--wait SECONDS] [--config FILE] [--out FILE]
+#
+# Defaults: 1280x720, kitty, 3 s, an empty config (never the user's), /tmp/wirbel-headless-check.png.
+# Exit status 0 when the frame has the right size and is not one flat colour.
+set -euo pipefail
+
+size=1280x720
+client=kitty
+wait=3
+config=
+out=/tmp/wirbel-headless-check.png
+while [ $# -gt 0 ]; do
+    case $1 in
+        --size) size=$2; shift 2 ;;
+        --client) client=$2; shift 2 ;;
+        --wait) wait=$2; shift 2 ;;
+        --config) config=$2; shift 2 ;;
+        --out) out=$2; shift 2 ;;
+        -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+binary=$repo/target/debug/wirbel
+[ -x "$binary" ] || { echo "build first: $binary is missing" >&2; exit 1; }
+work=$(mktemp -d)
+pid=
+cleanup() {
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -rf "$work"
+}
+trap cleanup EXIT INT TERM
+
+if [ -z "$config" ]; then
+    config=$work/config
+    : > "$config"
+fi
+log=$work/log
+# The empty WAYLAND_DISPLAY and DISPLAY keep everything off the session this runs in. The
+# timeout ends wirbel even if this script gets killed hard.
+WAYLAND_DISPLAY= DISPLAY= strat void "$binary" --headless "$size" --config "$config" \
+    --timeout $((${wait%.*} + 30)) --log "$log" -c "$client" >"$work/out" 2>&1 &
+pid=$!
+
+socket=
+for _ in $(seq 100); do
+    socket=$(sed -n 's/.*compositor ready socket="\([^"]*\)".*/\1/p' "$log" 2>/dev/null || true)
+    [ -n "$socket" ] && break
+    kill -0 "$pid" 2>/dev/null || { cat "$log" "$work/out" >&2; echo "wirbel ended early" >&2; exit 1; }
+    sleep 0.1
+done
+[ -n "$socket" ] || { cat "$log" >&2; echo "wirbel did not get ready" >&2; exit 1; }
+echo "headless wirbel ready on $socket (pid $pid)"
+
+sleep "$wait"
+mkdir -p "$(dirname "$out")"
+WAYLAND_DISPLAY=$socket grim "$out"
+
+# PNG: the width and height are big-endian in the IHDR chunk, at bytes 16 and 20.
+dimensions=$(od -An -tu1 -j16 -N8 "$out" | awk '{print $1*16777216+$2*65536+$3*256+$4 "x" $5*16777216+$6*65536+$7*256+$8}')
+if [ "$dimensions" != "$size" ]; then
+    echo "the capture is $dimensions, expected $size" >&2
+    exit 1
+fi
+# A flat frame compresses to almost nothing; a window with text does not.
+bytes=$(stat -c %s "$out")
+if [ "$bytes" -lt 3000 ]; then
+    echo "the capture looks empty ($bytes bytes)" >&2
+    exit 1
+fi
+grep -E ' (ERROR|WARN) ' "$log" >&2 || true
+echo "$out"

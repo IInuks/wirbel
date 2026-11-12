@@ -16,7 +16,7 @@ use smithay::{
     },
 };
 
-use crate::{Wirbel, grabs::DragKind, workspace::FullKind};
+use crate::{Wirbel, grabs::DragKind, window_hook::WindowEvent, workspace::FullKind};
 
 fn is_window_of(window: &Window, surface: &WlSurface) -> bool {
     window
@@ -154,7 +154,11 @@ impl Wirbel {
         match (index, has_buffer) {
             (Some(index), true) => {
                 self.awaiting_buffer.remove(index);
-                self.set_focus(Some(window.clone()));
+                // A held window is shown by the window hook, which decides about the keyboard.
+                if !self.is_held(&window) {
+                    self.set_focus(Some(window.clone()));
+                }
+                self.window_event(&window, WindowEvent::Mapped);
             }
             // An X11 window leaves through the X server. Xwayland drops buffers at will.
             (None, false) if window.toplevel().is_some() => {
@@ -221,9 +225,9 @@ impl Wirbel {
             return;
         };
         let shown = self.find_layer(&root).is_some()
-            || self
-                .find_window(&root)
-                .is_some_and(|window| self.space.element_location(&window).is_some());
+            || self.find_window(&root).is_some_and(|window| {
+                self.space.element_location(&window).is_some() || self.hook_shows(&window)
+            });
         if self.lock.is_active() || !shown {
             surface.send_popup_done();
             return;

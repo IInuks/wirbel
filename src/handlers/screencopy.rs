@@ -29,7 +29,7 @@ use smithay::{
         renderer::{
             Bind, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, Texture,
             damage::OutputDamageTracker,
-            element::{Element, Kind},
+            element::{Kind, RenderElement},
         },
     },
     output::{Output, WeakOutput},
@@ -58,7 +58,7 @@ use smithay::{
     },
 };
 
-use crate::{Wirbel, render::SceneElement};
+use crate::Wirbel;
 
 /// Version 3 only adds the events that close the list of buffer formats.
 const VERSION: u32 = 3;
@@ -490,13 +490,29 @@ impl<T> Capturer<T> {
         &mut self.targets[index]
     }
 
-    /// Answers what waits for `output`, as far as it can be answered now. Called by the backend
-    /// after every frame it drew for `output`.
+    /// Answers what waits for `output`, as far as it can be answered now, from the scene.
     pub fn run<R>(&mut self, state: &mut Wirbel, renderer: &mut R, output: &Output)
     where
         R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<T> + Bind<T>,
         R::TextureId: Clone + Texture + Send + 'static,
         R::Error: 'static,
+    {
+        self.run_with(state, renderer, output, Wirbel::scene_elements::<R>);
+    }
+
+    /// Answers what waits for `output`, as far as it can be answered now. Called by the backend
+    /// after every frame it drew for `output`, with what it draws there (`Wirbel::output_elements`).
+    pub fn run_with<R, E>(
+        &mut self,
+        state: &mut Wirbel,
+        renderer: &mut R,
+        output: &Output,
+        elements: impl Fn(&Wirbel, &mut R, &Output) -> Vec<E>,
+    ) where
+        R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<T> + Bind<T>,
+        R::TextureId: Clone + Texture + Send + 'static,
+        R::Error: 'static,
+        E: RenderElement<R>,
     {
         for cursor in [false, true] {
             let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut state.screencopy.queue)
@@ -509,23 +525,25 @@ impl<T> Capturer<T> {
             if due.is_empty() {
                 continue;
             }
-            let waiting = self.capture(state, renderer, output, cursor, due);
+            let waiting = self.capture(state, renderer, output, cursor, due, &elements);
             state.screencopy.queue.extend(waiting);
         }
     }
 
-    fn capture<R>(
+    fn capture<R, E>(
         &mut self,
         state: &Wirbel,
         renderer: &mut R,
         output: &Output,
         cursor: bool,
         due: Vec<Capture>,
+        elements: &impl Fn(&Wirbel, &mut R, &Output) -> Vec<E>,
     ) -> Vec<Capture>
     where
         R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<T> + Bind<T>,
         R::TextureId: Clone + Texture + Send + 'static,
         R::Error: 'static,
+        E: RenderElement<R>,
     {
         let target = self.target(output, cursor);
         let Some(mode) = output.current_mode() else {
@@ -561,7 +579,7 @@ impl<T> Capturer<T> {
             return Vec::new();
         };
 
-        let mut elements: Vec<SceneElement<R>> = state.scene_elements(renderer, output);
+        let mut elements = elements(state, renderer, output);
         if !cursor {
             elements.retain(|element| element.kind() != Kind::Cursor);
         }
