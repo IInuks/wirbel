@@ -11,13 +11,14 @@
 use std::rc::Rc;
 
 use smithay::{
-    desktop::Window,
+    desktop::{PopupManager, Window, space::SpaceElement, utils::with_surfaces_surface_tree},
     output::Output,
-    utils::{Logical, Rectangle, Size},
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    utils::{IsAlive, Logical, Rectangle, Size},
     wayland::seat::WaylandFocus,
 };
 
-use crate::{Wirbel, workspace::Placement};
+use crate::{Wirbel, state::apply_output_scale, workspace::Placement};
 
 /// What happened to a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +119,65 @@ impl Wirbel {
             }
         }
         windows
+    }
+
+    /// The root surfaces of what the hook shows on `output`: its windows and their popups.
+    pub(crate) fn hook_surfaces(&self, output: &Output) -> Vec<WlSurface> {
+        let Some(hook) = &self.window_hook else {
+            return Vec::new();
+        };
+        let mut roots = Vec::new();
+        for window in hook.shown_windows(self, output) {
+            let Some(root) = window.wl_surface() else {
+                continue;
+            };
+            let popups = PopupManager::popups_for_surface(&root);
+            roots.extend(popups.map(|(popup, _)| popup.wl_surface().clone()));
+            roots.push(root.into_owned());
+        }
+        roots
+    }
+
+    /// Does for the windows the hook shows what `Space::refresh` does for the layout's: every
+    /// surface of their trees and popups, also one that came since, enters the output it is
+    /// shown on and learns its scale; a window shown there no longer leaves it. Clients go by
+    /// these events (scale, whether they are visible at all).
+    pub(crate) fn refresh_hook_outputs(&mut self) {
+        let mut shown: Vec<(Window, Output)> = Vec::new();
+        if let Some(hook) = self.window_hook.clone() {
+            for monitor in self.monitors.iter().filter(|monitor| monitor.connected) {
+                for window in hook.shown_windows(self, &monitor.output) {
+                    shown.push((window, monitor.output.clone()));
+                }
+            }
+        }
+        for (window, output) in &self.hook_outputs {
+            let still = shown.iter().any(|(w, o)| w == window && o == output);
+            // Back in the layout on that output, the space keeps its outputs.
+            let in_space = self.space.outputs_for_element(window).contains(output);
+            if !still && !in_space && window.alive() {
+                window.output_leave(output);
+            }
+        }
+        // The hook does not say where on the output a window is: all of it is on it.
+        let everywhere = Rectangle::new(
+            (i32::MIN / 2, i32::MIN / 2).into(),
+            (i32::MAX, i32::MAX).into(),
+        );
+        for (window, output) in &shown {
+            window.output_enter(output, everywhere);
+            let Some(root) = window.wl_surface() else {
+                continue;
+            };
+            let popups = PopupManager::popups_for_surface(&root);
+            let popups = popups.map(|(popup, _)| popup.wl_surface().clone());
+            for tree in popups.chain([root.into_owned()]) {
+                with_surfaces_surface_tree(&tree, |surface, states| {
+                    apply_output_scale(surface, states, output);
+                });
+            }
+        }
+        self.hook_outputs = shown;
     }
 
     /// Whether the hook shows `window` on some output.

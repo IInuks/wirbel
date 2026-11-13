@@ -22,7 +22,10 @@ use smithay::{
     },
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     output::Output,
-    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
+    reexports::{
+        wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
+        wayland_server::{Resource, protocol::wl_surface::WlSurface},
+    },
     utils::{Logical, Physical, Point, Rectangle, Scale},
     wayland::{
         compositor::with_states, dmabuf::DmabufFeedback, seat::WaylandFocus,
@@ -417,6 +420,18 @@ impl Wirbel {
                 |surface, _| surface_presentation_feedback_flags_from_states(surface, None, states),
             );
         }
+        // The hook draws its windows its own way, not as elements of this frame: what it shows
+        // on the output counts as presented with the frame, as it gets the frame callbacks.
+        if !self.lock.is_active() {
+            for root in self.hook_surfaces(output) {
+                take_presentation_feedback_surface_tree(
+                    &root,
+                    &mut feedback,
+                    |_, _| Some(output.clone()),
+                    |_, _| wp_presentation_feedback::Kind::empty(),
+                );
+            }
+        }
         feedback
     }
 
@@ -436,6 +451,17 @@ impl Wirbel {
                 surface_primary_scanout_output,
                 |surface, _| select_dmabuf_feedback(surface, states, render, scanout),
             );
+        }
+        // What the hook shows is never scanned out: it is drawn by the renderer.
+        if !self.lock.is_active() {
+            for root in self.hook_surfaces(output) {
+                send_dmabuf_feedback_surface_tree(
+                    &root,
+                    output,
+                    |_, _| Some(output.clone()),
+                    |_, _| render,
+                );
+            }
         }
     }
 

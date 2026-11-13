@@ -68,7 +68,7 @@ pub use wayland_client::{
         wl_shm_pool::WlShmPool,
         wl_subcompositor::WlSubcompositor,
         wl_subsurface::WlSubsurface,
-        wl_surface::WlSurface,
+        wl_surface::{self, WlSurface},
     },
 };
 
@@ -650,6 +650,16 @@ pub struct ClientState {
     pub control_cancelled: bool,
     /// Frame callbacks done, by window index.
     pub frames_done: HashMap<usize, u32>,
+    /// `wl_surface.enter` (true) and `leave` (false) events, in order.
+    pub surface_outputs: Vec<(WlSurface, bool)>,
+}
+
+impl ClientState {
+    /// Whether the last of the enter and leave events of `surface` said it is on an output.
+    pub fn on_output(&self, surface: &WlSurface) -> bool {
+        let mut events = self.surface_outputs.iter().filter(|(s, _)| s == surface);
+        events.next_back().is_some_and(|(_, entered)| *entered)
+    }
 }
 
 /// What a capture frame or session said, for either of the two protocols.
@@ -1195,6 +1205,23 @@ impl Dispatch<WlRegistry, GlobalListContents> for ClientState {
     }
 }
 
+impl Dispatch<WlSurface, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        surface: &WlSurface,
+        event: wl_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_surface::Event::Enter { .. } => state.surface_outputs.push((surface.clone(), true)),
+            wl_surface::Event::Leave { .. } => state.surface_outputs.push((surface.clone(), false)),
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<WlCallback, usize> for ClientState {
     fn event(
         state: &mut Self,
@@ -1689,8 +1716,6 @@ impl Dispatch<XdgPopup, ()> for ClientState {
 delegate_noop!(ClientState: ignore XdgPositioner);
 
 delegate_noop!(ClientState: ignore WlCompositor);
-
-delegate_noop!(ClientState: ignore WlSurface);
 
 delegate_noop!(ClientState: ignore WlSubcompositor);
 

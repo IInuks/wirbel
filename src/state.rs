@@ -277,6 +277,8 @@ pub struct Wirbel {
     pub window_hook: Option<std::rc::Rc<dyn crate::window_hook::WindowHook>>,
     /// Windows the window hook keeps out of the workspaces, in the order they opened.
     pub held_windows: Vec<Window>,
+    /// The windows the window hook showed on each output after the last event loop iteration.
+    pub(crate) hook_outputs: Vec<(Window, Output)>,
     /// Asks the renderer whether it can use a dmabuf. Set by a backend that offers dmabufs.
     pub import_dmabuf: Box<dyn FnMut(&Dmabuf) -> bool>,
 
@@ -402,6 +404,7 @@ impl Wirbel {
             input_filter: None,
             window_hook: None,
             held_windows: Vec::new(),
+            hook_outputs: Vec::new(),
             import_dmabuf: Box::new(|_| false),
 
             needs_redraw: true,
@@ -456,6 +459,7 @@ impl Wirbel {
     pub fn after_dispatch(&mut self) {
         let start = self.stats.start();
         self.space.refresh();
+        self.refresh_hook_outputs();
         self.popups.cleanup();
         self.reap_popup_grab();
         self.settle_x11_windows();
