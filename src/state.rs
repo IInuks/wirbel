@@ -612,6 +612,12 @@ impl Wirbel {
             .map(|pointer| pointer.current_location());
         let pointer_lost =
             location.is_some_and(|location| self.monitor_at(location) == Some(index));
+        // A render override has nothing to draw on any more: its owner gets to fall back.
+        if let Some(slot) = &self.scene_override
+            && slot.output() == output
+        {
+            slot.fail("its output was removed");
+        }
         self.close_layers(output);
         self.lock_remove_output(output);
         self.screencopy.output_removed(output);

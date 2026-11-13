@@ -148,6 +148,12 @@ impl SceneOverrideSlot {
         self.broken.get()
     }
 
+    /// Breaks the override from outside a frame (its output went away, say): its owner hears
+    /// about it through `SceneOverride::failed`, once, as after a failed `draw`.
+    pub fn fail(&self, error: &str) {
+        fail(&self.broken, &*self.scene, error);
+    }
+
     /// The element that draws the override, for one frame. Every frame of an override is a new
     /// picture, so every element damages the whole output.
     pub fn element(&self) -> OverrideElement {
@@ -235,6 +241,18 @@ impl fmt::Debug for OverrideElement {
 /// How many overrides failed, for the tests.
 static FAILURES: AtomicU64 = AtomicU64::new(0);
 
+/// Marks an override broken and tells its owner, once.
+fn fail(broken: &Cell<bool>, scene: &dyn SceneOverride, error: &str) {
+    if broken.replace(true) {
+        return;
+    }
+    FAILURES.fetch_add(1, Ordering::Relaxed);
+    tracing::error!(error, "render override failed, drawing the scene instead");
+    if let Err(panic) = crate::safety::contain_panic(|| scene.failed(error)) {
+        tracing::error!(panic, "render override panicked while failing");
+    }
+}
+
 /// How many times an override broke since the start.
 pub fn failures() -> u64 {
     FAILURES.load(Ordering::Relaxed)
@@ -274,14 +292,7 @@ impl OverrideElement {
 
     /// Marks the override broken and tells its owner, once.
     fn fail(&self, error: &str) {
-        if self.broken.replace(true) {
-            return;
-        }
-        FAILURES.fetch_add(1, Ordering::Relaxed);
-        tracing::error!(error, "render override failed, drawing the scene instead");
-        if let Err(panic) = crate::safety::contain_panic(|| self.scene.failed(error)) {
-            tracing::error!(panic, "render override panicked while failing");
-        }
+        fail(&self.broken, &*self.scene, error);
     }
 
     fn draw_gles(&self, frame: &mut GlesFrame<'_, '_>) -> Result<(), GlesError> {
@@ -752,6 +763,18 @@ mod tests {
         fn failed(&self, _error: &str) {
             panic!("failing badly");
         }
+    }
+
+    #[test]
+    fn a_slot_can_be_failed_from_outside_once() {
+        let recorder = Rc::new(Recorder {
+            failed: Cell::new(0),
+        });
+        let slot = SceneOverrideSlot::new(output(Transform::Normal), recorder.clone());
+        slot.fail("output removed");
+        slot.fail("again");
+        assert!(slot.is_broken());
+        assert_eq!(recorder.failed.get(), 1);
     }
 
     #[test]
