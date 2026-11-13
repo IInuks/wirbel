@@ -11,6 +11,11 @@
 //! filter's answer: the pointer over them is theirs, and one that claims the keyboard, or was
 //! clicked, has it.
 //!
+//! A filter that holds the input may still aim the pointer at one surface
+//! (`InputFilter::held_pointer`), for example through a pointer of its own: that surface gets
+//! pointer focus and motion as usual, nobody gets the keyboard, and the filter hands buttons and
+//! the wheel to the pointer itself (they come to it first anyway).
+//!
 //! A locked session has no filter: the lock screen gets everything, as without one. The
 //! emergency chord and the VT keys come first anyway.
 
@@ -101,6 +106,17 @@ pub trait InputFilter {
     fn route_keyboard(&self, _wirbel: &Wirbel) -> Option<KeyboardFocus> {
         None
     }
+
+    /// While holding the input: the surface that still has the pointer at `location`, if any,
+    /// and where it would begin (as `route_pointer`). The owner calls
+    /// `Wirbel::refresh_pointer_focus` when the answer changes.
+    fn held_pointer(
+        &self,
+        _wirbel: &Wirbel,
+        _location: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        None
+    }
 }
 
 /// A filter as kept in `Wirbel::input_filter`.
@@ -166,15 +182,15 @@ impl Wirbel {
     }
 
     /// The surface the pointer is over at `location` as far as clients are concerned, and where
-    /// that surface begins: none while a filter holds the input, the filter's answer while it
-    /// routes the input.
+    /// that surface begins: while a filter holds the input only what it aims the pointer at, the
+    /// filter's answer while it routes the input.
     pub fn pointer_target(
         &self,
         location: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
         if let Some(filter) = self.input_filter() {
             if filter.holds_input() {
-                return None;
+                return filter.held_pointer(self, location);
             }
             if filter.routes_input() {
                 // Layer surfaces drawn over a render override are on top of the filter's picture.

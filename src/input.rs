@@ -491,24 +491,7 @@ impl Wirbel {
         if self.axis_bind(&scroll) {
             return;
         }
-        let mut frame = AxisFrame::new(scroll.time).source(scroll.source);
-        for (axis, amount, discrete) in [
-            (Axis::Horizontal, scroll.horizontal.0, scroll.horizontal.1),
-            (Axis::Vertical, scroll.vertical.0, scroll.vertical.1),
-        ] {
-            let value = amount
-                .or(discrete.map(|v120| v120 * 15.0 / 120.0))
-                .unwrap_or(0.0);
-            if value != 0.0 {
-                frame = frame.value(axis, value);
-                if let Some(discrete) = discrete {
-                    frame = frame.v120(axis, discrete as i32);
-                }
-            }
-            if scroll.source == AxisSource::Finger && amount == Some(0.0) {
-                frame = frame.stop(axis);
-            }
-        }
+        let frame = scroll.axis_frame();
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
@@ -535,6 +518,30 @@ pub struct Scroll {
 }
 
 impl Scroll {
+    /// The scroll as a client gets it: the amount (from the notches if there is none) and the
+    /// notches of both axes, and the stop of a finger that left the touchpad.
+    pub fn axis_frame(&self) -> AxisFrame {
+        let mut frame = AxisFrame::new(self.time).source(self.source);
+        for (axis, amount, discrete) in [
+            (Axis::Horizontal, self.horizontal.0, self.horizontal.1),
+            (Axis::Vertical, self.vertical.0, self.vertical.1),
+        ] {
+            let value = amount
+                .or(discrete.map(|v120| v120 * 15.0 / 120.0))
+                .unwrap_or(0.0);
+            if value != 0.0 {
+                frame = frame.value(axis, value);
+                if let Some(discrete) = discrete {
+                    frame = frame.v120(axis, discrete as i32);
+                }
+            }
+            if self.source == AxisSource::Finger && amount == Some(0.0) {
+                frame = frame.stop(axis);
+            }
+        }
+        frame
+    }
+
     pub fn new(source: AxisSource, time: InputTime) -> Self {
         Self {
             source,
