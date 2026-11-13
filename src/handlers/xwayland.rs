@@ -227,7 +227,11 @@ impl Wirbel {
 
     fn x11_full_request(&mut self, surface: &X11Surface, kind: Option<FullKind>) {
         match self.find_x11(surface) {
-            Some(window) => self.set_full(&window, kind),
+            Some(window) => {
+                if !self.hook_full_request(&window, kind) {
+                    self.set_full(&window, kind);
+                }
+            }
             // Not mapped yet: `place_x11_window` picks it up from here.
             None => {
                 let result = surface

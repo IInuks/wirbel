@@ -66,7 +66,16 @@ impl XdgShellHandler for Wirbel {
         // looks at this.
         let wanted = output.as_ref().and_then(Output::from_resource);
         let monitor = wanted.and_then(|output| self.monitor_of_output(&output));
-        match (self.find_window(surface.wl_surface()), monitor) {
+        let window = self.find_window(surface.wl_surface());
+        if let Some(window) = &window
+            && self.hook_full_request(window, Some(FullKind::Fullscreen))
+        {
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
+            }
+            return;
+        }
+        match (window, monitor) {
             (Some(window), Some(monitor)) => {
                 if self.locate(&window).is_some_and(|(m, _)| m != monitor) {
                     self.send_to_monitor(&window, monitor, None);
@@ -176,7 +185,11 @@ impl Wirbel {
     fn full_request(&mut self, surface: &ToplevelSurface, kind: Option<FullKind>) {
         let window = self.find_window(surface.wl_surface());
         match window {
-            Some(window) => self.set_full(&window, kind),
+            Some(window) => {
+                if !self.hook_full_request(&window, kind) {
+                    self.set_full(&window, kind);
+                }
+            }
             None => surface.with_pending_state(|state| {
                 for (wanted, flag) in [
                     (FullKind::Fullscreen, xdg_toplevel::State::Fullscreen),

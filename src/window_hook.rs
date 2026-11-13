@@ -18,7 +18,11 @@ use smithay::{
     wayland::seat::WaylandFocus,
 };
 
-use crate::{Wirbel, state::apply_output_scale, workspace::Placement};
+use crate::{
+    Wirbel,
+    state::apply_output_scale,
+    workspace::{FullKind, Placement},
+};
 
 /// What happened to a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +47,15 @@ pub trait WindowHook {
     /// The windows the hook shows on `output`. They get frame callbacks after each frame of that
     /// output, like the windows the layout shows there.
     fn shown_windows(&self, wirbel: &Wirbel, output: &Output) -> Vec<Window>;
+
+    /// `window` asks to be fullscreen or maximized (`Some`), or not any more (`None`). Returning
+    /// `true` takes the request: the hook sets the window's pending state itself, the core leaves
+    /// the layout alone and only sends the configure the protocol owes (X11 windows the hook
+    /// configures itself). `false` lets the layout handle it as usual.
+    fn full_request(&self, wirbel: &mut Wirbel, window: &Window, kind: Option<FullKind>) -> bool {
+        let _ = (wirbel, window, kind);
+        false
+    }
 }
 
 impl Wirbel {
@@ -60,6 +73,14 @@ impl Wirbel {
     pub fn window_event(&mut self, window: &Window, event: WindowEvent) {
         if let Some(hook) = self.window_hook.clone() {
             hook.event(self, window, event);
+        }
+    }
+
+    /// Offers a fullscreen/maximize request of `window` to the hook. Whether it took it.
+    pub(crate) fn hook_full_request(&mut self, window: &Window, kind: Option<FullKind>) -> bool {
+        match self.window_hook.clone() {
+            Some(hook) => hook.full_request(self, window, kind),
+            None => false,
         }
     }
 
