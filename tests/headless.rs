@@ -4327,6 +4327,101 @@ fn a_window_without_the_keyboard_cannot_catch_the_pointer() {
 }
 
 #[test]
+fn an_absolute_device_moves_a_locked_pointer_by_relative_motion() {
+    let (compositor, mut client, constraints, window) = window_for_game();
+    let manager = client.bind::<ZwpRelativePointerManagerV1>(1..=1);
+    let _relative = manager.get_relative_pointer(&client._pointer, &client.handle, ());
+    // Unconstrained, the host cursor puts the pointer where it is, without relative motion.
+    compositor.pointer_absolute(100.0, 100.0);
+    let surface = client.state.windows[window].surface.clone();
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &client._pointer,
+        None,
+        Lifetime::Persistent,
+        &client.handle,
+        (),
+    );
+    client.sync();
+    client.sync();
+    assert_eq!(client.state.constraint_events, [true]);
+    client.take_input();
+
+    compositor.pointer_absolute(112.0, 95.0);
+    compositor.pointer_absolute(115.0, 99.0);
+    client.sync();
+    assert_eq!(
+        client.state.relative,
+        [(12.0, -5.0, 12.0, -5.0), (3.0, 4.0, 3.0, 4.0)]
+    );
+    assert_eq!(compositor.pointer_location(), (100.0, 100.0));
+    assert!(
+        !client
+            .take_input()
+            .iter()
+            .any(|input| matches!(input, Input::PointerMotion(..)))
+    );
+}
+
+#[test]
+fn a_locked_pointer_is_not_moved_on_its_own_surface() {
+    let (compositor, mut client, constraints, window) = window_for_game();
+    let surface = client.state.windows[window].surface.clone();
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &client._pointer,
+        None,
+        Lifetime::Persistent,
+        &client.handle,
+        (),
+    );
+    client.sync();
+    client.sync();
+    client.take_input();
+    compositor.pointer_at(130.0, 120.0);
+    compositor.with(|state| state.refresh_pointer_focus());
+    client.sync();
+    assert_eq!(compositor.pointer_location(), (100.0, 100.0));
+    assert_eq!(client.state.constraint_events, [true]);
+    assert!(
+        !client
+            .take_input()
+            .iter()
+            .any(|input| matches!(input, Input::PointerMotion(..)))
+    );
+}
+
+#[test]
+fn a_lock_that_never_held_leaves_the_pointer_where_it_is() {
+    let (compositor, mut client, constraints, first) = window_for_game();
+    let second = client.open_window(0x00ff00);
+    client.sync();
+    let left = compositor.frames()[0];
+    let start = (f64::from(left.x + 10), f64::from(left.y + 10));
+    compositor.pointer_at(start.0, start.1);
+    assert_ne!(first, second);
+
+    // The second window has the keyboard, so the lock on the first one waits.
+    let surface = client.state.windows[first].surface.clone();
+    let lock = constraints.lock_pointer(
+        &surface,
+        &client._pointer,
+        None,
+        Lifetime::Persistent,
+        &client.handle,
+        (),
+    );
+    lock.set_cursor_position_hint(50.0, 60.0);
+    surface.commit();
+    client.sync();
+    lock.destroy();
+    client.sync();
+    client.sync();
+    assert_eq!(client.state.constraint_events, []);
+    assert_eq!(compositor.pointer_location(), start);
+}
+
+#[test]
 fn moving_the_pointer_away_by_command_ends_a_lock() {
     let (compositor, mut client, constraints, window) = window_for_game();
     let surface = client.state.windows[window].surface.clone();

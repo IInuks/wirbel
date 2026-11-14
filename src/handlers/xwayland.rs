@@ -159,6 +159,7 @@ impl Wirbel {
     }
 
     fn xwayland_ready(&mut self, socket: UnixStream, client: Client) {
+        self.xwayland.client = Some(client.id());
         let wm = X11Wm::start_wm(
             self.loop_handle.clone(),
             &self.display_handle,

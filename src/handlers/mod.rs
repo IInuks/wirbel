@@ -96,21 +96,24 @@ impl PointerConstraintsHandler for Wirbel {
     fn remove_constraint(
         &mut self,
         surface: &WlSurface,
-        pointer: &PointerHandle<Self>,
+        _pointer: &PointerHandle<Self>,
         removal: ConstraintRemove,
     ) {
-        let ConstraintRemove::Destroyed(PointerConstraint::Locked(locked)) = removal else {
+        // Only a lock that held the pointer had a cursor drawn by the client. A game may drop an
+        // idle lock to make a new one when the pointer comes back, which must not move it.
+        let ConstraintRemove::Destroyed(constraint) = removal else {
             return;
         };
+        let PointerConstraint::Locked(locked) = &constraint else {
+            return;
+        };
+        if !constraint.is_active() {
+            return;
+        }
         let Some(hint) = locked.cursor_position_hint() else {
             return;
         };
-        let location = pointer.current_location();
-        if let Some((under, origin)) = self.surface_under(location)
-            && under == *surface
-        {
-            self.warp_pointer(origin + hint);
-        }
+        self.warp_pointer_onto(surface, hint);
     }
 }
 

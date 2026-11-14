@@ -2507,6 +2507,11 @@ impl Compositor {
         });
     }
 
+    /// An absolute device (the nested backend's host cursor) at `x`, `y`.
+    pub fn pointer_absolute(&self, x: f64, y: f64) {
+        self.with(move |state| state.on_pointer_absolute((x, y).into(), InputTime::now()));
+    }
+
     pub fn pointer_location(&self) -> (f64, f64) {
         self.with(|state| {
             let location = state.seat.get_pointer().unwrap().current_location();

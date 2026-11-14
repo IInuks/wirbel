@@ -93,7 +93,7 @@ impl Wirbel {
                     return;
                 };
                 let position = event.position_transformed(geometry.size) + geometry.loc.to_f64();
-                self.on_pointer_motion(position, event.time());
+                self.on_pointer_absolute(position, event.time());
             }
             InputEvent::PointerButton { event } => {
                 self.on_pointer_button(event.button_code(), event.state(), event.time());
@@ -311,8 +311,22 @@ impl Wirbel {
         }
     }
 
+    /// An absolute device (the host's cursor in the nested backend) is at `location`. While a
+    /// constraint holds the pointer, the way from its last position is a relative motion: a game
+    /// that locked the pointer gets motion it can use, and the pointer stays put or confined.
+    pub fn on_pointer_absolute(&mut self, location: Point<f64, Logical>, time: InputTime) {
+        let last = self.last_absolute.replace(location);
+        match last {
+            Some(last) if self.active_constraint().is_some() => {
+                let delta = location - last;
+                self.on_pointer_delta(delta, delta, time);
+            }
+            _ => self.on_pointer_motion(location, time),
+        }
+    }
+
     /// What holds the pointer back right now.
-    fn active_constraint(&self) -> Option<Constraint> {
+    pub(crate) fn active_constraint(&self) -> Option<Constraint> {
         let pointer = self.seat.get_pointer()?;
         let surface = pointer.current_focus()?;
         with_pointer_constraint(&surface, &pointer, |constraint| {
@@ -502,7 +516,7 @@ impl Wirbel {
 }
 
 /// What a pointer constraint does.
-enum Constraint {
+pub(crate) enum Constraint {
     Locked,
     /// The surface and the part of it that the pointer stays in.
     Confined(WlSurface, Option<RegionAttributes>),

@@ -25,7 +25,7 @@ use smithay::{
     input::{
         Seat, SeatState,
         keyboard::{Keycode, LedState},
-        pointer::{CursorImageStatus, MotionEvent},
+        pointer::{CursorImageStatus, MotionEvent, RelativeMotionEvent},
     },
     output::Output,
     reexports::{
@@ -84,6 +84,7 @@ use crate::{
     focus::KeyboardFocus,
     grabs::Drag,
     handlers::{ForeignToplevelState, ScreencopyState, SessionLock},
+    input::Constraint,
     ipc::{Ipc, Position},
     layout::Rect,
     plugin::PluginHost,
@@ -256,6 +257,11 @@ pub struct Wirbel {
     pub last_press: Serial,
     /// Whether the left button is down, by hand or by `wirbel click`.
     pub left_held: bool,
+    /// Where the last absolute device put the pointer, even if a constraint kept it elsewhere.
+    pub last_absolute: Option<Point<f64, Logical>>,
+    /// The surface `move_pointer` last gave the pointer focus to and the point on it, when no grab
+    /// had it: the same again from the same place is nothing new for the client.
+    pointer_told: Option<(WlSurface, Point<f64, Logical>)>,
     /// Whether the control socket takes `inject` requests, see `crate::inject`.
     pub test_input: bool,
     /// Buttons and lines of the plugins, see `crate::plugin_input`.
@@ -396,6 +402,8 @@ impl Wirbel {
             urgent: Vec::new(),
             last_press: Serial::from(0),
             left_held: false,
+            last_absolute: None,
+            pointer_told: None,
             test_input: false,
             plugin_input: Default::default(),
             ipc,
@@ -1496,13 +1504,65 @@ impl Wirbel {
             return location;
         };
         let under = self.pointer_target(location);
+        // A locked pointer stays on its surface, even if that surface moved under it since.
+        let locked = matches!(self.active_constraint(), Some(Constraint::Locked));
+        if locked && under.as_ref().map(|(surface, _)| surface) == pointer.current_focus().as_ref()
+        {
+            return pointer.current_location();
+        }
+        // Some clients take every motion as news, even to where they were told the pointer is
+        // already (an X11 game reading raw motion through Xwayland jumps).
+        let grabbed = pointer.is_grabbed();
+        let told = under
+            .as_ref()
+            .map(|(surface, origin)| (surface.clone(), location - *origin));
+        let focused =
+            under.as_ref().map(|(surface, _)| surface) == pointer.current_focus().as_ref();
+        // The protocol sends 1/256 of a pixel: less than that from what the client was told is
+        // nothing (a drift adds up and is sent once it is more).
+        let same = match (&told, &self.pointer_told) {
+            (Some((surface, at)), Some((before, was))) => {
+                const UNIT: f64 = 1.0 / 256.0;
+                surface == before && (at.x - was.x).abs() < UNIT && (at.y - was.y).abs() < UNIT
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !grabbed && focused && same && location == pointer.current_location() {
+            // The output under it may have changed all the same.
+            let position = self.pointer_position();
+            self.ipc.publish(&position);
+            self.update_pointer_constraint();
+            return location;
+        }
+        self.pointer_told = if grabbed { None } else { told };
         let serial = SERIAL_COUNTER.next_serial();
         let event = MotionEvent {
             location,
             serial,
             time,
         };
+        let entering = under
+            .as_ref()
+            .filter(|(surface, _)| pointer.current_focus().as_ref() != Some(surface))
+            .filter(|(surface, _)| {
+                let client = surface.client().map(|client| client.id());
+                client.is_some() && client == self.xwayland.client
+            })
+            .cloned();
         pointer.motion(self, under, &event);
+        // Xwayland makes a pointer entering an X11 window without relative motion in the same
+        // frame into raw motion by the absolute position, which games reading raw motion take
+        // for a move by that much (when coming back to a game that caught the pointer). With a
+        // relative motion of nothing it gives them none.
+        if let Some(focus) = entering {
+            let still = RelativeMotionEvent {
+                delta: Point::default(),
+                delta_unaccel: Point::default(),
+                time,
+            };
+            pointer.relative_motion(self, Some(focus), &still);
+        }
         pointer.frame(self);
         self.needs_redraw = true;
         let position = self.pointer_position();
@@ -1566,6 +1626,64 @@ impl Wirbel {
                 .monitor_at(location)
                 .map(|index| self.monitors[index].output.name()),
         }
+    }
+
+    /// Moves the pointer to where it shows `point` of `surface`, if it is over that surface now.
+    pub fn warp_pointer_onto(&mut self, surface: &WlSurface, point: Point<f64, Logical>) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        if let Some(location) = self.pointer_showing(surface, point, pointer.current_location()) {
+            self.warp_pointer(location);
+        }
+    }
+
+    /// Where the pointer shows `point` of `surface`, starting from `start`, which has to be over
+    /// that surface. Where a filter routes the pointer, the point on a surface need not be a fixed
+    /// offset from the pointer (the surface may be shown scaled or turned), so this homes in on it
+    /// and ends at the nearest place still on the surface.
+    pub fn pointer_showing(
+        &self,
+        surface: &WlSurface,
+        point: Point<f64, Logical>,
+        start: Point<f64, Logical>,
+    ) -> Option<Point<f64, Logical>> {
+        let local_at = |location: Point<f64, Logical>| {
+            self.pointer_target(location)
+                .filter(|(under, _)| under == surface)
+                .map(|(_, origin)| location - origin)
+        };
+        let (mut location, mut local) = (start, local_at(start)?);
+        // Surface pixels per pointer pixel along each axis, learnt from each step.
+        let mut scale = (1.0, 1.0);
+        for _ in 0..8 {
+            let error = point - local;
+            if error.x.abs() < 0.01 && error.y.abs() < 0.01 {
+                break;
+            }
+            // A step that leaves the surface is cut in half until it stays on it.
+            let mut step = Point::from((error.x / scale.0, error.y / scale.1));
+            let mut found = None;
+            for _ in 0..8 {
+                if let Some(next_local) = local_at(location + step) {
+                    found = Some((location + step, next_local));
+                    break;
+                }
+                step = step.downscale(2.0);
+            }
+            let Some((next, next_local)) = found else {
+                break;
+            };
+            let (moved, changed) = (next - location, next_local - local);
+            if moved.x.abs() > 1e-6 && changed.x / moved.x > 1e-3 {
+                scale.0 = changed.x / moved.x;
+            }
+            if moved.y.abs() > 1e-6 && changed.y / moved.y > 1e-3 {
+                scale.1 = changed.y / moved.y;
+            }
+            (location, local) = (next, next_local);
+        }
+        Some(location)
     }
 
     /// Moves the pointer on the compositor's own behalf. A grab keeps it where it is.
@@ -1690,6 +1808,8 @@ pub struct XwaylandState {
     pub server: Option<XWayland>,
     /// When it was started, to give up on a server that keeps dying.
     pub starts: Vec<Instant>,
+    /// Its connection as a Wayland client, once it is ready.
+    pub client: Option<smithay::reexports::wayland_server::backend::ClientId>,
 }
 
 /// Per-client data.
