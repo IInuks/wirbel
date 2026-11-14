@@ -121,6 +121,14 @@ impl Wirbel {
             .filter(|slot| slot.output() == output && !slot.is_broken() && !self.lock.is_active())
     }
 
+    /// The overlay drawn over `output` now (`Wirbel::set_overlay`): one that works, and the
+    /// session is not locked.
+    pub fn shown_overlay(&self, output: &Output) -> Option<&SceneOverrideSlot> {
+        self.overlay
+            .as_ref()
+            .filter(|slot| slot.output() == output && !slot.is_broken() && !self.lock.is_active())
+    }
+
     /// The layer surfaces drawn over the render override of `output` (its
     /// `SceneOverride::layers_above`), front to back, each with its popups. None without an
     /// override drawing there.
@@ -147,8 +155,9 @@ impl Wirbel {
             .collect()
     }
 
-    /// What a backend draws on `output`: the cursor and the layer surfaces it keeps on top of the
-    /// render override of that output, if there is one that works, otherwise the scene. A locked
+    /// What a backend draws on `output`: the overlay of that output in front, if there is one that
+    /// works, then the cursor and the layer surfaces it keeps on top of the render override of
+    /// that output, if there is one that works, otherwise the scene. A locked
     /// session always gets the scene, which then is the lock surface. Overrides retired from the
     /// output come first, to release their GL objects (`Wirbel::set_scene_override`).
     pub fn output_elements<R>(&self, renderer: &mut R, output: &Output) -> Vec<OutputElement<R>>
@@ -161,6 +170,10 @@ impl Wirbel {
             .release_elements(output)
             .map(OutputElement::Override)
             .collect();
+        // An overlay is in front of everything else.
+        if let Some(slot) = self.shown_overlay(output) {
+            elements.push(OutputElement::Override(slot.element()));
+        }
         match self.shown_override(output) {
             Some(slot) => {
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -204,7 +217,12 @@ impl Wirbel {
             .map(|geometry| geometry.loc)
             .unwrap_or_default();
 
-        let mut elements = self.cursor_elements(renderer, origin, scale);
+        // A filter that holds the input has no pointer to show (it may draw its own).
+        let mut elements = if self.input_held() {
+            Vec::new()
+        } else {
+            self.cursor_elements(renderer, origin, scale)
+        };
 
         if self.lock.is_active() {
             if let Some(surface) = self.lock.surface_on(output) {

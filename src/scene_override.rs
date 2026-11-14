@@ -16,6 +16,10 @@
 //! (`SceneOverride::layers_above`): the core draws them over it, flat at their place as on the 2D
 //! desktop, and while an input filter routes the input they get the pointer first, since they
 //! are on top (`Wirbel::override_layers`).
+//!
+//! The same trait can draw an overlay instead (`SceneOverrideSlot::overlay`, set with
+//! `Wirbel::set_overlay`): over whatever the output shows (the scene or an override), in front of
+//! everything, covering nothing it does not draw over. It is guarded and released the same way.
 
 use std::{
     cell::Cell,
@@ -101,6 +105,8 @@ pub struct SceneOverrideSlot {
     broken: Rc<Cell<bool>>,
     /// Whether `release` ran, after the slot was retired.
     released: Rc<Cell<bool>>,
+    /// Drawn over the output's picture instead of in place of the scene.
+    over: bool,
 }
 
 impl fmt::Debug for SceneOverrideSlot {
@@ -121,7 +127,22 @@ impl SceneOverrideSlot {
             commit: Cell::new(CommitCounter::default()),
             broken: Rc::new(Cell::new(false)),
             released: Rc::new(Cell::new(false)),
+            over: false,
         }
+    }
+
+    /// An overlay for `output`: `scene` draws over the output's picture, which stays (see the
+    /// module documentation).
+    pub fn overlay(output: Output, scene: Rc<dyn SceneOverride>) -> Self {
+        Self {
+            over: true,
+            ..Self::new(output, scene)
+        }
+    }
+
+    /// Whether this is an overlay.
+    pub fn is_overlay(&self) -> bool {
+        self.over
     }
 
     /// Whether this slot holds `scene`.
@@ -185,6 +206,7 @@ impl SceneOverrideSlot {
             scene: self.scene.clone(),
             broken: self.broken.clone(),
             release: release.then(|| self.released.clone()),
+            over: self.over,
         }
     }
 }
@@ -203,6 +225,20 @@ impl crate::Wirbel {
                 .retain(|old| !Rc::ptr_eq(&old.scene, &new.scene));
         }
         self.scene_override = slot;
+    }
+
+    /// Puts `slot` (made with `SceneOverrideSlot::overlay`) in place of the current overlay, or
+    /// just removes that one; a removed overlay is released like an override.
+    pub fn set_overlay(&mut self, slot: Option<SceneOverrideSlot>) {
+        self.retired_overrides.retain(|old| !old.is_released());
+        if let Some(old) = self.overlay.take() {
+            self.retired_overrides.push(old);
+        }
+        if let Some(new) = &slot {
+            self.retired_overrides
+                .retain(|old| !Rc::ptr_eq(&old.scene, &new.scene));
+        }
+        self.overlay = slot;
     }
 
     /// The elements that release the overrides retired from `output`, for the front of the list.
@@ -227,6 +263,8 @@ pub struct OverrideElement {
     broken: Rc<Cell<bool>>,
     /// Set for a release element: whether the release ran.
     release: Option<Rc<Cell<bool>>>,
+    /// An overlay's: opaque nowhere.
+    over: bool,
 }
 
 impl fmt::Debug for OverrideElement {
@@ -351,7 +389,7 @@ impl Element for OverrideElement {
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        if self.broken.get() || self.release.is_some() {
+        if self.broken.get() || self.release.is_some() || self.over {
             return OpaqueRegions::default();
         }
         OpaqueRegions::from_slice(&[Rectangle::from_size(self.geometry(scale).size)])
@@ -714,6 +752,25 @@ mod tests {
                 .damage_since(scale, Some(second.current_commit()))
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn an_overlay_covers_nothing() {
+        let recorder = Rc::new(Recorder {
+            failed: Cell::new(0),
+        });
+        let slot = SceneOverrideSlot::overlay(output(Transform::Normal), recorder);
+        assert!(slot.is_overlay());
+        let element = slot.element();
+        let scale = Scale::from(1.0);
+        assert_eq!(
+            element.geometry(scale),
+            Rectangle::from_size((800, 600).into())
+        );
+        assert!(element.opaque_regions(scale).is_empty());
+        assert!(
+            !SceneOverrideSlot::new(output(Transform::Normal), slot.scene.clone()).is_overlay()
         );
     }
 

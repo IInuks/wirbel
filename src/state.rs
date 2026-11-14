@@ -269,7 +269,10 @@ pub struct Wirbel {
     pub extensions: crate::extension::Extensions,
     /// What draws an output instead of the scene, see `crate::scene_override`.
     pub scene_override: Option<crate::scene_override::SceneOverrideSlot>,
-    /// Overrides taken off their output that still have to release their GL objects.
+    /// What draws over an output's picture (the scene or the override), see
+    /// `crate::scene_override`.
+    pub overlay: Option<crate::scene_override::SceneOverrideSlot>,
+    /// Overrides and overlays taken off their output that still have to release their GL objects.
     pub retired_overrides: Vec<crate::scene_override::SceneOverrideSlot>,
     /// What gets the input before binds and clients, see `crate::input_filter`.
     pub input_filter: Option<crate::input_filter::InputFilterSlot>,
@@ -400,6 +403,7 @@ impl Wirbel {
             plugin_state: PluginState::default(),
             extensions: Default::default(),
             scene_override: None,
+            overlay: None,
             retired_overrides: Vec::new(),
             input_filter: None,
             window_hook: None,
@@ -513,7 +517,9 @@ impl Wirbel {
         self.start(command, true);
     }
 
-    fn start(&self, command: &str, autostart: bool) {
+    /// A shell command set up as `spawn` runs it (environment, folder, no input), not started
+    /// yet: for a caller that wants to watch the child itself (its output, how it ends).
+    pub fn client_command(&self, command: &str) -> Command {
         let mut child = Command::new("sh");
         child
             .args(["-c", command])
@@ -533,6 +539,11 @@ impl Wirbel {
             Some(display) => child.env("DISPLAY", format!(":{display}")),
             None => child.env_remove("DISPLAY"),
         };
+        child
+    }
+
+    fn start(&self, command: &str, autostart: bool) {
+        let mut child = self.client_command(command);
         if autostart {
             child.process_group(0);
         }
@@ -618,6 +629,11 @@ impl Wirbel {
             location.is_some_and(|location| self.monitor_at(location) == Some(index));
         // A render override has nothing to draw on any more: its owner gets to fall back.
         if let Some(slot) = &self.scene_override
+            && slot.output() == output
+        {
+            slot.fail("its output was removed");
+        }
+        if let Some(slot) = &self.overlay
             && slot.output() == output
         {
             slot.fail("its output was removed");

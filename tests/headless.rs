@@ -6363,3 +6363,62 @@ fn injected_input_takes_the_real_paths() {
     assert!(input.contains(&Input::Button(BTN_RIGHT, wl_pointer::ButtonState::Released)));
     assert!(input.contains(&Input::AxisV120(wl_pointer::Axis::VerticalScroll, 240)));
 }
+
+/// An overlay that draws nothing.
+struct NoOverlay;
+
+impl wirbel::scene_override::SceneOverride for NoOverlay {
+    fn draw(
+        &self,
+        _gl: &smithay::backend::renderer::gles::ffi::Gles2,
+        _target: &wirbel::scene_override::OverrideTarget,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn failed(&self, _error: &str) {}
+}
+
+#[test]
+fn an_overlay_is_drawn_in_front_of_the_scene_which_stays() {
+    use wirbel::scene_override::{OutputElement, SceneOverrideSlot};
+    let compositor = Compositor::start();
+    let mut client = Client::connect(&compositor);
+    client.open_window(0xff0000);
+    client.sync();
+    let drawn = || {
+        compositor.with(|state| {
+            state.space.refresh();
+            let output = state.monitors[0].output.clone();
+            let mut renderer = PixmanRenderer::new().unwrap();
+            let elements = state.output_elements(&mut renderer, &output);
+            let first_is_overlay = matches!(
+                elements.first(),
+                Some(OutputElement::Override(element)) if !element.is_release()
+            );
+            let scene = elements
+                .iter()
+                .filter(|element| matches!(element, OutputElement::Scene(_)))
+                .count();
+            (first_is_overlay, scene)
+        })
+    };
+    let (overlay, scene) = drawn();
+    assert!(!overlay);
+    assert!(scene > 0);
+    compositor.with(|state| {
+        let output = state.monitors[0].output.clone();
+        let slot = SceneOverrideSlot::overlay(output, std::rc::Rc::new(NoOverlay));
+        assert!(slot.is_overlay());
+        state.set_overlay(Some(slot));
+    });
+    let (overlay, with) = drawn();
+    assert!(overlay);
+    assert_eq!(with, scene, "the scene is drawn behind it as before");
+    // Taken off, it is released once and the scene alone is left.
+    compositor.with(|state| state.set_overlay(None));
+    compositor.with(|state| {
+        assert!(state.overlay.is_none());
+        assert_eq!(state.retired_overrides.len(), 1);
+    });
+}
