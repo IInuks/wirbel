@@ -39,6 +39,7 @@ Positions are pixels from the top left corner of the window. The window is 1280x
 | `text NAME [--via a11y\|ocr\|clipboard] [--find GLOB] [--where]`, `click-text NAME GLOB` | read text, click on text |
 | `ui NAME tree`, `ui NAME press LABEL`, `ui NAME set LABEL TEXT` | controls through the accessibility interface |
 | `audio NAME listen on\|off`, `audio NAME level`, `audio NAME record FILE.wav [S]` | its sound |
+| `record NAME FILE [--fps N] [--audio] [S]` | film it with ffmpeg (.mp4, .webm, .gif) |
 | `wait NAME CONDITION [--timeout S]` | wait for a state |
 
 `wirbel vwm --help` has every option. A wait whose time runs out exits with status 3, so shell
@@ -97,5 +98,5 @@ wirbel vwm release music
 
 ## Not there yet
 
-Input into parked windows, video recording, the remote control protocol of browsers and a window to look into an
+Input into parked windows, the remote control protocol of browsers and a window to look into an
 invisible one are planned; [PROGRESS.md](PROGRESS.md) says how far they are.

@@ -14,8 +14,9 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 9, step 9.1 (video). Step 7.4 is optional and can wait. If `tesseract` is installed by
-then, first try `wirbel vwm text NAME --via ocr` on a real window (see the notes).
+Phase 10, step 10.1 (browser protocol), then phase 11. Step 7.4 is optional and can wait. If
+`tesseract` is installed by then, first try `wirbel vwm text NAME --via ocr` on a real window
+(see the notes).
 
 ## Phases
 
@@ -73,7 +74,7 @@ then, first try `wirbel vwm text NAME --via ocr` on a real window (see the notes
 - [x] 8.1 null sink per instance, `record`, `listen`, `level`, sound and silence events
 
 ### 9 Video
-- [ ] 9.1 `record` through `ffmpeg`, frame export
+- [x] 9.1 `record` through `ffmpeg`, frame export
 
 ### 10 Browser protocol
 - [ ] 10.1 `vwm web`, `loaded` and `text` through it
@@ -154,5 +155,8 @@ then, first try `wirbel vwm text NAME --via ocr` on a real window (see the notes
   one too (macros run the same `open`); windows opened through the socket alone do not.
 - `audio listen on` was not tried by ear. `sound`, `silence`, `level` and `record` were tried
   with a tone played in an invisible terminal.
+- `vwm record` feeds PNG pictures to `ffmpeg -f image2pipe`, a new one only when the window
+  changed, each at its time. Tried: mp4 with sound and gif of an invisible terminal. No frame
+  export of its own: `shot` in a loop does that.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

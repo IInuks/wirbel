@@ -29,7 +29,7 @@ close page
 
 Every command of `wirbel vwm` is a step with the same words: `open`, `close`, `type`, `key`,
 `click`, `move`, `drag`, `scroll`, `shot`, `clip`, `paste`, `resize`, `status`, `pixel`, `find`,
-`text`, `click-text`, `ui`, `audio`, `adopt`, `release`, `windows`, `list`, `info`. `wirbel vwm --help` describes them.
+`text`, `click-text`, `ui`, `audio`, `record`, `adopt`, `release`, `windows`, `list`, `info`. `wirbel vwm --help` describes them.
 
 - `open NAME = COMMAND...` starts a program and names its window. `open COMMAND...` picks a name
   and yields it: `let w = open kitty`. Options go first: `open page = --size 800x600 firefox`.

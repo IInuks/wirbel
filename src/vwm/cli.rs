@@ -45,7 +45,8 @@ pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--sh
        wirbel vwm text NAME [--via a11y|ocr|clipboard] [--find GLOB] [--where] [--lang LANGUAGES]
        wirbel vwm click-text NAME GLOB [left|right|middle]
        wirbel vwm ui NAME tree | press LABEL | set LABEL TEXT...
-       wirbel vwm audio NAME listen on|off | level [SECONDS] | record FILE.wav [SECONDS]";
+       wirbel vwm audio NAME listen on|off | level [SECONDS] | record FILE.wav [SECONDS]
+       wirbel vwm record NAME FILE [--fps N] [--audio] [SECONDS]";
 
 pub const HELP: &str =
     "vwm runs programs in invisible windows: they never show on the screen and never take the
@@ -106,6 +107,10 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
                  listen on routes that sink to the speakers and off stops that, level prints
                  how loud it is right now from 0 to 1, record writes it to a WAV file for
                  SECONDS or until Ctrl+C. The wait conditions sound and silence [MS] use it
+      record     film the window into a video file with the program ffmpeg, which picks the
+                 format by the ending of FILE (.mp4, .webm, .mkv, .gif). 10 pictures a second
+                 unless --fps says otherwise, --audio adds the sound of the window. For SECONDS,
+                 or until Ctrl+C
       click-text click the middle of the first line that matches GLOB (ocr)
 Exit status: 0 done, 1 failed, 2 wrong usage, 3 the time of a wait ran out.
 `wirbel vwm invisible create|close|screenshot ...` mean the same as `wirbel vwm open|close|shot ...`.
@@ -1117,6 +1122,149 @@ fn audio(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// What `record` was asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordArgs {
+    pub name: String,
+    pub file: String,
+    pub fps: u32,
+    pub audio: bool,
+    pub time: Option<Duration>,
+}
+
+pub fn parse_record(args: &[String]) -> Result<RecordArgs, String> {
+    let (mut fps, mut audio) = (10, false);
+    let mut plain = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--audio" => audio = true,
+            "--fps" => {
+                let value = args.next().and_then(|value| value.parse::<u32>().ok());
+                fps = value
+                    .filter(|fps| (1..=60).contains(fps))
+                    .ok_or("--fps needs a number from 1 to 60")?;
+            }
+            flag if flag.starts_with("--") => return Err(USAGE.into()),
+            _ => plain.push(arg),
+        }
+    }
+    let (name, file, time) = match plain[..] {
+        [name, file] => (name, file, None),
+        [name, file, time] => {
+            let seconds = number(time.trim_end_matches('s'))?;
+            let time =
+                Duration::try_from_secs_f64(seconds).map_err(|_| "the time cannot be negative")?;
+            (name, file, Some(time))
+        }
+        _ => return Err(USAGE.into()),
+    };
+    Ok(RecordArgs {
+        name: name.clone(),
+        file: file.clone(),
+        fps,
+        audio,
+        time,
+    })
+}
+
+/// The arguments of ffmpeg for a film of PNG pictures on its input.
+pub fn ffmpeg_args(record: &RecordArgs, file: &str) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "image2pipe",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.extend([
+        "-framerate".into(),
+        record.fps.to_string(),
+        "-c:v".into(),
+        "png".into(),
+    ]);
+    args.extend(["-i".into(), "-".into()]);
+    if record.audio {
+        let source = format!("{}.monitor", super::audio::sink_name(&record.name));
+        args.extend([
+            "-f".into(),
+            "pulse".into(),
+            "-i".into(),
+            source,
+            "-shortest".into(),
+        ]);
+    }
+    // Sizes that are not even, and pixel formats players do not know, are the usual traps.
+    if !file.ends_with(".gif") {
+        args.extend(["-vf".into(), "pad=ceil(iw/2)*2:ceil(ih/2)*2".into()]);
+        args.extend(["-pix_fmt".into(), "yuv420p".into()]);
+    }
+    args.push(file.to_string());
+    args
+}
+
+fn record(args: &[String]) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let record = parse_record(args)?;
+    let file = absolute(&record.file)?;
+    let display = display_of(&record.name)?;
+    let mut session = Session::on(&display)?;
+    let scratch = Scratch::new("frame.png")?;
+    let mut ffmpeg = Command::new("ffmpeg")
+        .args(ffmpeg_args(&record, &file))
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("the program `ffmpeg` is needed to film a window: {err}"))?;
+    let mut input = ffmpeg.stdin.take().ok_or("ffmpeg takes no input")?;
+    let step = Duration::from_secs(1) / record.fps;
+    let start = std::time::Instant::now();
+    let mut picture: Vec<u8> = Vec::new();
+    let mut taken_at = None;
+    let mut frames: u32 = 0;
+    let ended = loop {
+        if record.time.is_some_and(|time| start.elapsed() >= time) {
+            break Ok(());
+        }
+        // A new picture only when the window changed; the film gets the old one again.
+        let status = match session
+            .ask("shadow status")
+            .and_then(|line| Status::parse(&line))
+        {
+            Ok(status) => status,
+            Err(_) if frames > 0 => break Ok(()),
+            Err(err) => break Err(err),
+        };
+        if taken_at != Some(status.damage) {
+            if let Err(err) = session.ask(&format!("shadow shot\t{}", scratch.path())) {
+                break Err(err);
+            }
+            match std::fs::read(scratch.file()) {
+                Ok(bytes) => picture = bytes,
+                Err(err) => break Err(format!("no picture: {err}")),
+            }
+            taken_at = Some(status.damage);
+        }
+        if input.write_all(&picture).is_err() {
+            break Err("ffmpeg stopped taking pictures, see its message above".into());
+        }
+        frames += 1;
+        // Each picture at its time, so that the film runs as fast as the window did.
+        let due = step * frames;
+        std::thread::sleep(due.saturating_sub(start.elapsed()));
+    };
+    drop(input);
+    let status = ffmpeg.wait().map_err(|err| format!("ffmpeg: {err}"))?;
+    ended?;
+    if !status.success() {
+        return Err("ffmpeg could not write the film, see its message above".into());
+    }
+    emit(file);
+    Ok(())
+}
+
 fn click_text(args: &[String]) -> Result<(), String> {
     let (name, pattern, rest) = match args {
         [name, pattern, rest @ ..] if rest.len() <= 1 => (name, pattern, rest),
@@ -1198,6 +1346,7 @@ pub const COMMANDS: &[&str] = &[
     "click-text",
     "ui",
     "audio",
+    "record",
     "adopt",
     "release",
     "windows",
@@ -1251,6 +1400,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "click-text" => click_text(rest),
         "ui" => ui(rest),
         "audio" => audio(rest),
+        "record" => record(rest),
         "--help" | "-h" | "help" => {
             emit(format!("{USAGE}\n\n{HELP}"));
             Ok(())
@@ -1418,6 +1568,37 @@ mod tests {
             (vec!["quiet".to_string()], false)
         );
         assert_eq!(changes(&rest, &rest, false), (Vec::new(), false));
+    }
+
+    #[test]
+    fn records_parse_and_ask_ffmpeg_for_the_right_thing() {
+        let record = parse_record(&words("b1 out.mp4 --fps 25 --audio 3.5s")).unwrap();
+        assert_eq!(record.name, "b1");
+        assert_eq!((record.fps, record.audio), (25, true));
+        assert_eq!(record.time, Some(Duration::from_millis(3500)));
+        let args = ffmpeg_args(&record, "/tmp/out.mp4").join(" ");
+        assert!(
+            args.contains("-f image2pipe -framerate 25 -c:v png -i -"),
+            "{args}"
+        );
+        assert!(
+            args.contains("-f pulse -i wirbel-vwm-b1.monitor -shortest"),
+            "{args}"
+        );
+        assert!(args.ends_with("-pix_fmt yuv420p /tmp/out.mp4"), "{args}");
+
+        let record = parse_record(&words("b1 out.gif")).unwrap();
+        assert_eq!((record.fps, record.audio, record.time), (10, false, None));
+        let args = ffmpeg_args(&record, "/tmp/out.gif").join(" ");
+        assert!(
+            !args.contains("pulse") && !args.contains("yuv420p"),
+            "{args}"
+        );
+        assert!(parse_record(&words("b1")).is_err());
+        assert!(parse_record(&words("b1 a.mp4 --fps 0")).is_err());
+        assert!(parse_record(&words("b1 a.mp4 --fps 500")).is_err());
+        assert!(parse_record(&words("b1 a.mp4 1 2")).is_err());
+        assert!(parse_record(&words("b1 a.mp4 --what")).is_err());
     }
 
     #[test]
