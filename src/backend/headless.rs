@@ -301,13 +301,21 @@ impl Headless {
                     &elements,
                     state.config.background_color,
                 )
-                .map(|result| result.states)
+                .map(|result| {
+                    let damaged = result.damage.is_some_and(|damage| !damage.is_empty());
+                    (damaged, result.states)
+                })
                 .map_err(|err| format!("{err:?}")),
             Err(err) => Err(err.to_string()),
         };
         drop(elements);
         let states = match result {
-            Ok(states) => states,
+            Ok((damaged, states)) => {
+                if let Some(shadow) = state.shadow.as_mut().filter(|_| damaged) {
+                    shadow.damaged();
+                }
+                states
+            }
             Err(err) => {
                 tracing::error!(err, "failed to render");
                 return;

@@ -30,6 +30,13 @@ impl SelectionHandler for Wirbel {
         source: Option<SelectionSource>,
         _seat: Seat<Self>,
     ) {
+        if let Some(shadow) = self
+            .shadow
+            .as_mut()
+            .filter(|_| target == SelectionTarget::Clipboard)
+        {
+            shadow.clipboard += 1;
+        }
         if let Some(xwm) = self.xwm.as_mut()
             && let Err(err) = xwm.new_selection(target, source.map(|source| source.mime_types()))
         {

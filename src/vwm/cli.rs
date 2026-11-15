@@ -8,7 +8,12 @@ use std::{
     time::Duration,
 };
 
-use super::{DEFAULT_SIZE, manager::Open, manager::shell_quote, valid_name};
+use super::{
+    DEFAULT_SIZE,
+    manager::{Open, shell_quote},
+    valid_name,
+    wait::{Condition, DEFAULT_TIMEOUT, Status, WaitError, Watcher, color_name},
+};
 use crate::{
     backend::headless::parse_size,
     cli::ask_lines,
@@ -28,7 +33,12 @@ pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--sh
        wirbel vwm scroll NAME STEPS [X Y]
        wirbel vwm shot NAME [FILE.png] [--region X,Y,W,H] [--cursor]
        wirbel vwm clip NAME get | set TEXT...
-       wirbel vwm paste NAME [--key MODS+KEY] TEXT...";
+       wirbel vwm paste NAME [--key MODS+KEY] TEXT...
+       wirbel vwm wait NAME CONDITION... [--timeout SECONDS]
+       wirbel vwm status NAME
+       wirbel vwm events NAME
+       wirbel vwm pixel NAME X Y
+       wirbel vwm find NAME FILE.png [SIMILARITY]";
 
 pub const HELP: &str =
     "vwm runs programs in invisible windows: they never show on the screen and never take the
@@ -57,6 +67,16 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
                  window's own clipboard, not the one of the desktop
       paste      put TEXT in that clipboard and press CTRL+v, or what --key names (terminals
                  want CTRL+SHIFT+v)
+      wait       wait until CONDITION holds, at most 30 seconds or what --timeout says, and
+                 print what it answers. Conditions: ready, window [GLOB], title GLOB, closed,
+                 exited, stable [MS], changed [X,Y,W,H], pixel X Y #RRGGBB [TOLERANCE],
+                 image FILE.png [SIMILARITY], cursor NAME, clipboard, file PATH. A GLOB matches
+                 the whole text with * and ?, without them it matches a part of the text
+      status     how the window is right now
+      events     print what happens to the window, until it is gone or Ctrl+C
+      pixel      print the colour of a pixel as #rrggbb
+      find       print where the picture FILE.png shows in the window, the middle of it
+Exit status: 0 done, 1 failed, 2 wrong usage, 3 the time of a wait ran out.
 `wirbel vwm invisible create|close|screenshot ...` mean the same as `wirbel vwm open|close|shot ...`.
 Positions are pixels from the top left corner of the window.";
 
@@ -650,21 +670,26 @@ fn shot(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// A file for passing text to or from a shadow, private to this user and gone afterwards.
-struct Scratch(std::path::PathBuf);
+/// A file for passing text or a picture to or from a shadow, in the runtime folder of this
+/// user and gone afterwards.
+pub(crate) struct Scratch(std::path::PathBuf);
 
 impl Scratch {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new(kind: &str) -> Result<Self, String> {
         let dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is not set")?;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |time| time.subsec_nanos());
-        let name = format!("wirbel-vwm-clip-{}-{nanos}", std::process::id());
+        let name = format!("wirbel-vwm-{}-{nanos}-{kind}", std::process::id());
         Ok(Self(std::path::PathBuf::from(dir).join(name)))
     }
 
-    fn path(&self) -> String {
+    pub(crate) fn path(&self) -> String {
         self.0.to_string_lossy().into_owned()
+    }
+
+    pub(crate) fn file(&self) -> &std::path::Path {
+        &self.0
     }
 }
 
@@ -676,7 +701,7 @@ impl Drop for Scratch {
 
 /// The text in the clipboard of the shadow behind `name`.
 pub fn clip_get(name: &str) -> Result<String, String> {
-    let scratch = Scratch::new()?;
+    let scratch = Scratch::new("clip")?;
     ask_shadow(name, &format!("shadow clip get\t{}", scratch.path()))?;
     let bytes = std::fs::read(&scratch.0).map_err(|err| format!("no clipboard text: {err}"))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -685,7 +710,7 @@ pub fn clip_get(name: &str) -> Result<String, String> {
 /// Puts `text` in the clipboard of the shadow behind `name`.
 pub fn clip_set(name: &str, text: &str) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
-    let scratch = Scratch::new()?;
+    let scratch = Scratch::new("clip")?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -728,6 +753,154 @@ fn paste(args: &[String]) -> Result<(), String> {
     ask_shadow(name, &key_request(key)).map(drop)
 }
 
+/// The condition and the time limit of `wait NAME CONDITION... [--timeout SECONDS]`.
+pub fn parse_wait(args: &[String]) -> Result<(Condition, Duration), String> {
+    let mut timeout = DEFAULT_TIMEOUT;
+    let mut words = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--timeout" {
+            let seconds = args.next().ok_or("--timeout needs seconds")?;
+            let seconds = number(seconds.trim_end_matches('s'))?;
+            timeout = Duration::try_from_secs_f64(seconds)
+                .map_err(|_| "the time limit cannot be negative")?;
+        } else {
+            words.push(arg.as_str());
+        }
+    }
+    Ok((Condition::parse(&words)?, timeout))
+}
+
+fn wait(args: &[String]) -> Result<(), String> {
+    let [name, rest @ ..] = args else {
+        return Err(USAGE.into());
+    };
+    let (condition, timeout) = parse_wait(rest)?;
+    let answer = super::wait::wait(name, &condition, timeout, &mut || Ok(()));
+    let answer = answer.map_err(|err| err.message())?;
+    if !answer.is_empty() {
+        println!("{answer}");
+    }
+    Ok(())
+}
+
+fn status(args: &[String]) -> Result<(), String> {
+    let [name] = args else {
+        return Err(USAGE.into());
+    };
+    let status = Watcher::of(name)?.status()?;
+    println!("windows    {}", status.windows);
+    println!("title      {}", status.title);
+    match status.exited {
+        Some(code) => println!("program    exited with {code}"),
+        None => println!("program    running"),
+    }
+    println!("cursor     {}", status.cursor);
+    println!("frames     {}", status.damage);
+    println!("quiet      {} ms", status.quiet.as_millis());
+    println!("clipboard  {}", status.clipboard);
+    Ok(())
+}
+
+/// How long the picture has to rest before `events` calls it quiet.
+const QUIET: Duration = Duration::from_millis(300);
+
+/// What changed between two looks at a window, as lines for `events`.
+pub fn changes(old: &Status, new: &Status, was_busy: bool) -> (Vec<String>, bool) {
+    let mut lines = Vec::new();
+    if old.windows != new.windows {
+        lines.push(format!("windows {}", new.windows));
+    }
+    if old.title != new.title {
+        lines.push(format!("title {}", new.title));
+    }
+    if old.cursor != new.cursor {
+        lines.push(format!("cursor {}", new.cursor));
+    }
+    if old.clipboard != new.clipboard {
+        lines.push("clipboard".into());
+    }
+    if let (None, Some(code)) = (old.exited, new.exited) {
+        lines.push(format!("exited {code}"));
+    }
+    let busy = match was_busy {
+        false => old.damage != new.damage,
+        true => new.quiet < QUIET,
+    };
+    if busy != was_busy {
+        lines.push(if busy { "busy" } else { "quiet" }.into());
+    }
+    (lines, busy)
+}
+
+fn events(args: &[String]) -> Result<(), String> {
+    let [name] = args else {
+        return Err(USAGE.into());
+    };
+    let mut watcher = Watcher::of(name)?;
+    let mut old = watcher.status()?;
+    let mut busy = false;
+    println!("windows {}", old.windows);
+    if !old.title.is_empty() {
+        println!("title {}", old.title);
+    }
+    loop {
+        std::thread::sleep(Duration::from_millis(40));
+        let Ok(new) = watcher.status() else {
+            println!("gone");
+            return Ok(());
+        };
+        let (lines, now_busy) = changes(&old, &new, busy);
+        for line in lines {
+            println!("{line}");
+        }
+        (old, busy) = (new, now_busy);
+    }
+}
+
+fn pixel(args: &[String]) -> Result<(), String> {
+    let [name, x, y] = args else {
+        return Err(USAGE.into());
+    };
+    let (x, y) = (number(x)? as i32, number(y)? as i32);
+    let mut watcher = Watcher::of(name)?;
+    let status = watcher.status()?;
+    let color = watcher.picture(&status)?.pixel(x, y);
+    println!(
+        "{}",
+        color_name(color.ok_or("the pixel is outside the window")?)
+    );
+    Ok(())
+}
+
+fn find(args: &[String]) -> Result<(), String> {
+    let (name, words) = match args {
+        [name, rest @ ..] if (1..=2).contains(&rest.len()) => (name, rest),
+        _ => return Err(USAGE.into()),
+    };
+    let mut condition = vec!["image"];
+    condition.extend(words.iter().map(String::as_str));
+    let condition = Condition::parse(&condition)?;
+    let found = super::wait::wait(name, &condition, Duration::ZERO, &mut || Ok(()));
+    match found {
+        Ok(place) => println!("{place}"),
+        Err(WaitError::Timeout(_)) => return Err("the picture does not show in the window".into()),
+        Err(err) => return Err(err.message()),
+    }
+    Ok(())
+}
+
+/// What `wirbel vwm` exits with for this error.
+pub fn exit_code(error: &str) -> i32 {
+    if error.starts_with("timeout: ") {
+        3
+    } else if error.starts_with("usage: ") {
+        2
+    } else {
+        1
+    }
+}
+
 /// `wirbel vwm ARGS`.
 pub fn run(args: &[String]) -> Result<(), String> {
     // `invisible` is an optional word, and two commands have a second name.
@@ -753,6 +926,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "shot" | "screenshot" => shot(rest),
         "clip" => clip(rest),
         "paste" => paste(rest),
+        "wait" => wait(rest),
+        "status" => status(rest),
+        "events" => events(rest),
+        "pixel" => pixel(rest),
+        "find" => find(rest),
         "--help" | "-h" | "help" => {
             println!("{USAGE}\n\n{HELP}");
             Ok(())
@@ -874,6 +1052,52 @@ mod tests {
         assert!(parse_shot(&words("b1 --region 1,2")).is_err());
         assert!(parse_shot(&words("b1 --what")).is_err());
         assert!(parse_shot(&[]).is_err());
+    }
+
+    #[test]
+    fn waits_parse_and_errors_map_to_exit_codes() {
+        let (condition, timeout) = parse_wait(&words("title *Done* --timeout 2.5")).unwrap();
+        assert_eq!(condition, Condition::Title("*Done*".into()));
+        assert_eq!(timeout, Duration::from_millis(2500));
+        let (condition, timeout) = parse_wait(&words("--timeout 20s ready")).unwrap();
+        assert_eq!(
+            (condition, timeout),
+            (Condition::Ready, Duration::from_secs(20))
+        );
+        assert_eq!(parse_wait(&words("ready")).unwrap().1, DEFAULT_TIMEOUT);
+        assert!(parse_wait(&words("ready --timeout")).is_err());
+        assert!(parse_wait(&words("ready --timeout -1")).is_err());
+        assert!(parse_wait(&words("--timeout 1")).is_err());
+        assert_eq!(exit_code("timeout: 1 window(s)"), 3);
+        assert_eq!(exit_code(USAGE), 2);
+        assert_eq!(exit_code("no invisible window `x`"), 1);
+    }
+
+    #[test]
+    fn events_are_the_differences() {
+        let old = Status::parse("status 5 900 1 running default 0 One").unwrap();
+        let new = Status::parse("status 6 0 2 exited:3 text 1 Two").unwrap();
+        let (lines, busy) = changes(&old, &new, false);
+        assert_eq!(
+            lines,
+            [
+                "windows 2",
+                "title Two",
+                "cursor text",
+                "clipboard",
+                "exited 3",
+                "busy"
+            ]
+        );
+        assert!(busy);
+        let rest = Status::parse("status 6 100 2 exited:3 text 1 Two").unwrap();
+        assert_eq!(changes(&new, &rest, true), (Vec::new(), true));
+        let rest = Status::parse("status 6 400 2 exited:3 text 1 Two").unwrap();
+        assert_eq!(
+            changes(&new, &rest, true),
+            (vec!["quiet".to_string()], false)
+        );
+        assert_eq!(changes(&rest, &rest, false), (Vec::new(), false));
     }
 
     #[test]

@@ -239,8 +239,15 @@ fn windows_of_a_shadow_stay_off_the_desktop_and_get_its_input() {
 
     // Closing asks the windows and ends the shadow once they are gone.
     assert_eq!(desk.ask("vwm close hidden"), ["ok"]);
-    hidden.sync();
-    assert_eq!(hidden.state.closed.len(), 2);
+    let start = Instant::now();
+    while hidden.state.closed.len() < 2 {
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the windows were never asked to close"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        hidden.sync();
+    }
 }
 
 /// A shadow with one green window of a test client that fills it.
@@ -418,4 +425,149 @@ fn the_clipboard_of_a_shadow_is_read_and_set_from_outside() {
             .unwrap()
             .starts_with("error ")
     );
+}
+
+#[test]
+fn waiting_sees_windows_pictures_files_and_the_end() {
+    use wirbel::vwm::{
+        shot::write_png,
+        wait::{Condition, WaitError, wait_on},
+    };
+    let desk = Desk::start("wait");
+    assert_eq!(desk.open(Some("hidden"), "sleep 60"), "ok hidden");
+    let display = desk.display("hidden");
+    let soon = Duration::from_millis(200);
+    let wait = |condition: Condition, timeout: Duration| {
+        wait_on(&display, &condition, timeout, &mut || Ok(()))
+    };
+    let timed_out =
+        |result: Result<String, WaitError>| matches!(result, Err(WaitError::Timeout(_)));
+
+    // Nothing there yet.
+    assert!(timed_out(wait(Condition::Ready, soon)));
+    assert_eq!(wait(Condition::Closed, soon), Ok(String::new()));
+    assert!(timed_out(wait(Condition::Exited, soon)));
+
+    let mut hidden = Client::connect_path(&socket_of(&display));
+    let window = hidden.open_unmapped_window_with(|toplevel| {
+        toplevel.set_title("Report (loading)".into());
+        toplevel.set_app_id("reports".into());
+    });
+    hidden.draw(window, GREEN);
+    hidden.sync();
+    assert_eq!(
+        wait(Condition::Ready, PATIENCE),
+        Ok("Report (loading)".into())
+    );
+    assert_eq!(
+        wait(Condition::Window(Some("reports".into())), soon),
+        Ok("Report (loading)".into())
+    );
+    assert!(timed_out(wait(
+        Condition::Window(Some("other".into())),
+        soon
+    )));
+    assert_eq!(
+        wait(Condition::Title("Report*".into()), soon),
+        Ok("Report (loading)".into())
+    );
+    assert!(timed_out(wait(Condition::Title("*done*".into()), soon)));
+    assert!(timed_out(wait(Condition::Closed, soon)));
+    assert_eq!(
+        wait(Condition::Stable(Duration::from_millis(100)), PATIENCE),
+        Ok(String::new())
+    );
+
+    // The picture: a pixel, a part that changes, a small picture found in it.
+    let green = Condition::Pixel {
+        x: 5,
+        y: 5,
+        color: [0, 255, 0],
+        tolerance: 8,
+    };
+    let blue = Condition::Pixel {
+        x: 5,
+        y: 5,
+        color: [0, 0, 255],
+        tolerance: 8,
+    };
+    assert_eq!(wait(green, soon), Ok("#00ff00".into()));
+    assert!(timed_out(wait(blue.clone(), soon)));
+    let outside = Condition::Pixel {
+        x: 5000,
+        y: 5,
+        color: [0, 0, 0],
+        tolerance: 0,
+    };
+    assert!(matches!(wait(outside, soon), Err(WaitError::Failed(_))));
+    assert!(timed_out(wait(Condition::Changed(None), soon)));
+    assert!(timed_out(wait(
+        Condition::Changed(Some((0, 0, 10, 10))),
+        soon
+    )));
+
+    let small = desk.root.join("small.png");
+    let pixels: Vec<u8> = [0, 0, 255, 255].repeat(8 * 6);
+    write_png(&small, &pixels, 8, (0, 0, 8, 6)).unwrap();
+    let image = Condition::Image {
+        path: small.clone(),
+        similarity: 0.95,
+    };
+    assert!(timed_out(wait(image.clone(), soon)));
+
+    // The window turns blue while someone waits for that.
+    let waiting = {
+        let (display, blue) = (display.clone(), blue.clone());
+        std::thread::spawn(move || wait_on(&display, &blue, PATIENCE, &mut || Ok(())))
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    hidden.draw(window, BLUE);
+    hidden.sync();
+    assert_eq!(waiting.join().unwrap(), Ok("#0000ff".into()));
+    assert_eq!(wait(image, soon), Ok("4 3".into()));
+    let missing = Condition::Image {
+        path: desk.root.join("nothing.png"),
+        similarity: 0.95,
+    };
+    assert!(matches!(wait(missing, soon), Err(WaitError::Failed(_))));
+
+    // A file, the clipboard, the tick of whoever waits.
+    let file = desk.root.join("made.txt");
+    assert!(timed_out(wait(Condition::File(file.clone()), soon)));
+    std::fs::write(&file, "x").unwrap();
+    assert_eq!(
+        wait(Condition::File(file.clone()), soon),
+        Ok(file.display().to_string())
+    );
+    assert!(timed_out(wait(Condition::Clipboard, soon)));
+    let mut ticks = 0;
+    let mut tick = || {
+        ticks += 1;
+        if ticks == 2 {
+            let set = format!("shadow clip set\t{}", file.display());
+            assert_eq!(ask_display(&display, &set).unwrap(), "ok");
+        }
+        Ok(())
+    };
+    assert_eq!(
+        wait_on(&display, &Condition::Clipboard, PATIENCE, &mut tick),
+        Ok(String::new())
+    );
+    let stopped = wait_on(&display, &Condition::Exited, PATIENCE, &mut || {
+        Err("stop".into())
+    });
+    assert_eq!(stopped, Err(WaitError::Failed("stop".into())));
+
+    // The end: the window closes, then the shadow is gone, which also counts as closed.
+    hidden.close(window);
+    hidden.sync();
+    assert_eq!(wait(Condition::Closed, PATIENCE), Ok(String::new()));
+    assert_eq!(desk.ask("vwm close hidden kill"), ["ok"]);
+    desk.wait_gone("hidden");
+    assert_eq!(wait(Condition::Closed, soon), Ok(String::new()));
+    assert_eq!(wait(Condition::Exited, soon), Ok(String::new()));
+    assert!(matches!(
+        wait(Condition::Ready, soon),
+        Err(WaitError::Failed(_))
+    ));
 }

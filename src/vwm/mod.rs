@@ -10,9 +10,11 @@
 
 pub mod cli;
 pub mod clip;
+pub mod json;
 pub mod manager;
 pub mod shadow;
 pub mod shot;
+pub mod wait;
 
 use smithay::reexports::calloop::channel::{self, Sender};
 

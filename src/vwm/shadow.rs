@@ -47,6 +47,11 @@ pub struct Shadow {
     /// Whether `shadow close` was asked: no grace then.
     closing: bool,
     parent: Option<libc::pid_t>,
+    /// How many frames changed the picture, and when the last one did.
+    pub damage: u64,
+    pub last_damage: Option<Instant>,
+    /// How often the clipboard got a new content.
+    pub clipboard: u64,
 }
 
 /// The configuration of a shadow.
@@ -111,6 +116,9 @@ pub fn start(
         empty_since: None,
         closing: false,
         parent,
+        damage: 0,
+        last_damage: None,
+        clipboard: 0,
     });
     let x = state.xwayland.display;
     let x = x.map_or("-".to_string(), |display| display.to_string());
@@ -133,6 +141,12 @@ pub fn start(
 }
 
 impl Shadow {
+    /// A frame changed the picture.
+    pub fn damaged(&mut self) {
+        self.damage += 1;
+        self.last_damage = Some(Instant::now());
+    }
+
     /// How the first command ended, if it has.
     fn exit_code(&mut self) -> Option<i32> {
         let status = self.children.first_mut()?.try_wait().ok()??;
@@ -223,8 +237,49 @@ fn plain_request(state: &mut Wirbel, rest: &str) -> Result<String, String> {
                 .ok_or("no output")?;
             Ok(format!("{}x{}", size.w, size.h))
         }
-        _ => Err("expected close, resize WxH or size".into()),
+        (Some("status"), None, None) => Ok(status(state)),
+        _ => Err("expected close, resize WxH, size, status, shot or clip".into()),
     }
+}
+
+/// The state of a shadow in one line, for whoever waits for something:
+/// `status DAMAGE QUIET_MS WINDOWS running|exited:CODE CURSOR CLIPBOARD TITLE`. DAMAGE counts
+/// the frames that changed the picture, QUIET_MS is the time since the last of them, WINDOWS
+/// the windows that have drawn, CURSOR the name of the pointer shape (`custom` for a picture of
+/// the program, `hidden`), CLIPBOARD counts its contents, TITLE is the title of the window
+/// with the keyboard and may hold spaces.
+fn status(state: &mut Wirbel) -> String {
+    use smithay::input::pointer::CursorImageStatus;
+    let windows = state.listed_windows();
+    let title = state
+        .focused
+        .as_ref()
+        .or(windows.first())
+        .map(|window| crate::handlers::window_names(window).0)
+        .unwrap_or_default();
+    let cursor = match &state.cursor_status {
+        CursorImageStatus::Hidden => "hidden".to_string(),
+        CursorImageStatus::Surface(_) => "custom".to_string(),
+        CursorImageStatus::Named(icon) => icon.name().to_string(),
+    };
+    let Some(shadow) = state.shadow.as_mut() else {
+        return "error this wirbel is not a shadow".into();
+    };
+    let command = match shadow.children.first_mut().map(Child::try_wait) {
+        Some(Ok(Some(status))) => format!("exited:{}", status.code().unwrap_or(-1)),
+        Some(_) => "running".to_string(),
+        None => "exited:0".to_string(),
+    };
+    let quiet = shadow
+        .last_damage
+        .map_or(0, |last| last.elapsed().as_millis());
+    format!(
+        "status {} {quiet} {} {command} {cursor} {} {}",
+        shadow.damage,
+        windows.len(),
+        shadow.clipboard,
+        title.replace(['\n', '\r'], " ")
+    )
 }
 
 impl Wirbel {

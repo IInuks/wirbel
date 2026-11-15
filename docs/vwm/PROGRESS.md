@@ -14,7 +14,7 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 3, step 3.1.
+Phase 4, step 4.1.
 
 ## Phases
 
@@ -40,11 +40,11 @@ Phase 3, step 3.1.
 - [x] 2.5 tests
 
 ### 3 Events and waiting
-- [ ] 3.1 shadow events: damage, client exit, cursor, clipboard
-- [ ] 3.2 wait engine with deadlines; conditions ready, window, title, closed, exited, stable,
+- [x] 3.1 shadow events: damage, client exit, cursor, clipboard
+- [x] 3.2 wait engine with deadlines; conditions ready, window, title, closed, exited, stable,
       changed, pixel, image, file
-- [ ] 3.3 command line `vwm wait|events`
-- [ ] 3.4 tests
+- [x] 3.3 command line `vwm wait|events`
+- [x] 3.4 tests
 
 ### 4 Macros
 - [ ] 4.1 lexer and parser with line numbers
@@ -99,5 +99,14 @@ Phase 3, step 3.1.
   render). Parked windows (phase 7) need the same from the other backends.
 - The clipboard type of the compositor is `vwm::clip::Held`: `None` stands for the X server,
   `Some` is text set from outside.
+- Waiting polls instead of listening: `shadow status` answers damage count, quiet time, window
+  count, program state, cursor, clipboard count and title in one line, and `vwm::wait` asks it
+  every 40 ms. Pictures are taken only when the damage count moved. That replaced the pushed
+  events and inotify of the design: same behaviour, far less code. `vwm events` prints the
+  differences between two looks.
+- A moving pointer and a blinking text cursor are damage too, so `stable` needs a time shorter
+  than the blink of a terminal, and `changed` without a region fires on them.
+- Still to come as conditions: `text GLOB` (phase 5), `loaded` (phase 6 and 10), `sound` and
+  `silence` (phase 8). `Condition::parse` and `check` in `src/vwm/wait.rs` are the place.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

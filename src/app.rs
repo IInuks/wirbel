@@ -402,7 +402,11 @@ pub fn main(extensions: Vec<Rc<dyn Extension>>) {
         };
         if let Err(err) = result {
             eprintln!("wirbel {command}: {err}");
-            process::exit(1);
+            let code = match command.as_str() {
+                "vwm" => crate::vwm::cli::exit_code(&err),
+                _ => 1,
+            };
+            process::exit(code);
         }
         return;
     }

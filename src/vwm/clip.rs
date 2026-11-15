@@ -98,6 +98,9 @@ impl Wirbel {
         let types = TEXT_TYPES.iter().map(|name| name.to_string()).collect();
         let held: Held = Some(Arc::new(text));
         set_data_device_selection(&self.display_handle, &self.seat, types, held);
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.clipboard += 1;
+        }
     }
 
     /// Writes the text in the clipboard to `path` and answers `peer` when that is done.
