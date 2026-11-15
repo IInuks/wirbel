@@ -119,5 +119,6 @@ like any window: keys, clicks, `text`, `ui`.
 
 ## Not there yet
 
-Input into parked windows and a window to look into an invisible one are planned;
+Input into parked windows and a window to look into an invisible one live are planned (until
+then `shot` and `record` show what it looks like);
 [PROGRESS.md](PROGRESS.md) says how far they are.

@@ -59,7 +59,9 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
                  hand the start to a visible instance of itself; --share-bus gives it the bus of
                  the desktop. Browsers get a profile of their own in
                  ~/.local/state/wirbel/vwm/NAME/. Options of the program itself go after `--`
-      list       the invisible windows: name, state, process group, size, age, command
+      list       the invisible windows: name, kind (shadow: started invisibly, parked: taken
+                 from the desktop), state, id, size, age, the memory of the hidden wirbel and
+                 its program together, and the command (the title for a parked window)
       info       one of them, with the windows its program has open
       resize     give the window another size
       close      ask the windows to close and end what does not; --kill ends it at once
@@ -172,6 +174,40 @@ impl Row {
     }
 }
 
+/// The memory in use by the processes of a process group, in kilobytes: the hidden wirbel, the
+/// program and what it started. `None` if there is no such process.
+pub fn group_memory(group: i32) -> Option<u64> {
+    let mut pages = None;
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let numeric = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.parse::<u32>().is_ok());
+        let stat = numeric
+            .then(|| std::fs::read_to_string(entry.path().join("stat")).ok())
+            .flatten();
+        if let Some((process_group, resident)) = stat.as_deref().and_then(parse_stat)
+            && process_group == group
+        {
+            *pages.get_or_insert(0) += resident;
+        }
+    }
+    pages.map(|pages| pages * 4)
+}
+
+/// The process group and the resident pages in a line of `/proc/PID/stat`.
+fn parse_stat(stat: &str) -> Option<(i32, u64)> {
+    // The name of the program is in brackets and may hold anything; what follows is numbers.
+    let mut fields = stat.rsplit_once(')')?.1.split_ascii_whitespace();
+    let group = fields.nth(2)?.parse().ok()?;
+    let resident = fields.nth(18)?.parse().ok()?;
+    Some((group, resident))
+}
+
+fn megabytes(kilobytes: u64) -> String {
+    format!("{} MB", kilobytes.div_ceil(1024))
+}
+
 fn age(seconds: u64) -> String {
     match seconds {
         0..60 => format!("{seconds}s"),
@@ -182,9 +218,10 @@ fn age(seconds: u64) -> String {
 
 /// The rows as a table with a header.
 fn table(rows: &[Row]) -> String {
-    let cells: Vec<[String; 7]> = rows
+    let cells: Vec<[String; 8]> = rows
         .iter()
         .map(|row| {
+            let group = row.group.parse().ok().filter(|_| row.kind == "shadow");
             [
                 row.name.clone(),
                 row.kind.clone(),
@@ -192,17 +229,20 @@ fn table(rows: &[Row]) -> String {
                 row.group.clone(),
                 row.size.clone(),
                 age(row.seconds),
+                group.and_then(group_memory).map_or("-".into(), megabytes),
                 row.command.clone(),
             ]
         })
         .collect();
     // For a parked window the id is that of the window and the last column its title.
-    let header = ["NAME", "KIND", "STATE", "ID", "SIZE", "AGE", "COMMAND"];
+    let header = [
+        "NAME", "KIND", "STATE", "ID", "SIZE", "AGE", "MEM", "COMMAND",
+    ];
     let width = |column: usize| {
         let longest = cells.iter().map(|row| row[column].chars().count()).max();
         longest.unwrap_or(0).max(header[column].len())
     };
-    let widths: Vec<usize> = (0..6).map(width).collect();
+    let widths: Vec<usize> = (0..7).map(width).collect();
     let line = |row: &[&str]| {
         let mut text = String::new();
         for (column, cell) in row.iter().enumerate() {
@@ -1518,17 +1558,26 @@ mod tests {
         let mut lines = table.lines();
         assert_eq!(
             lines.next(),
-            Some("NAME  KIND    STATE  ID    SIZE      AGE  COMMAND")
+            Some("NAME  KIND    STATE  ID    SIZE      AGE  MEM  COMMAND")
         );
         assert_eq!(
             lines.next(),
-            Some("b1    shadow  ready  4242  1280x800  1m   firefox -x\ty")
+            Some("b1    shadow  ready  4242  1280x800  1m   -    firefox -x\ty")
         );
         assert!(
             row.json()
                 .starts_with("{\"name\":\"b1\",\"kind\":\"shadow\"")
         );
         assert!(row.json().contains("\"pid\":4242"));
+        let stat = "4242 (Web Content) x) S 1 77 77 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 9 0 1000 2000000 1234 18446744073709551615 1 1 0";
+        assert_eq!(parse_stat(stat), Some((77, 1234)));
+        assert_eq!(parse_stat("nonsense"), None);
+        assert_eq!(megabytes(1), "1 MB");
+        assert_eq!(megabytes(2049), "3 MB");
+        // This very process is in some group, and uses memory.
+        // Safety: getpgrp has no preconditions.
+        let own = unsafe { libc::getpgrp() };
+        assert!(group_memory(own).is_some_and(|kilobytes| kilobytes > 0));
     }
 
     #[test]

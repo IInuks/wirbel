@@ -14,9 +14,19 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 11 (viewer `vwm show|hide`, limits and a memory column in `vwm list`). Step 7.4 is
-optional. If `tesseract` is installed by then, first try `wirbel vwm text NAME --via ocr` on a
-real window (see the notes).
+What is left, in the order of use:
+
+1. Install and try on a real desktop (nothing was run there yet, only in a headless wirbel):
+   the checklist is at the end of this file.
+2. If `tesseract` gets installed: try `wirbel vwm text NAME --via ocr` on a real window and tune
+   `vwm::text::recognise` (see the notes).
+3. Step 11.1, the viewer `vwm show|hide`: a normal window on the desktop that shows an
+   invisible one live and passes keys and pointer on. Plan: a small Wayland client in the
+   command (crates `wayland-client` and `wayland-protocols`, already optional dependencies of
+   the test harness) that draws the pictures of `shadow shot` into shm buffers and sends what
+   it gets from its seat as `inject at`, `inject button` and a new `inject code EVDEV down|up`.
+4. Step 7.4, input into parked windows, if it is wanted at all.
+5. The crash of a headless wirbel on the nvidia card (see the notes).
 
 ## Phases
 
@@ -81,7 +91,7 @@ real window (see the notes).
 
 ### 11 Viewer and finish
 - [ ] 11.1 `vwm show|hide`
-- [ ] 11.2 limits, memory column (README section and GUIDE.md are written; keep them current)
+- [x] 11.2 limits (32 shadows at once), memory column in `vwm list`, README section, GUIDE.md
 
 ## Notes and known problems
 
@@ -167,3 +177,17 @@ real window (see the notes).
 - `vwm web` always acts on the first tab.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.
+
+## Checklist for the first try on a real desktop
+
+After installing the new binary and restarting wirbel:
+
+- `wirbel vwm open --name t kitty`, nothing shows, no focus change, the taskbar is unchanged.
+- `wirbel vwm list` shows `t`; `wirbel vwm type t 'echo hi'`, `wirbel vwm key t ENTER`,
+  `wirbel vwm shot t /tmp/t.png` shows the line.
+- `wirbel macro run examples/macros/page-title.wm` prints the title of example.com.
+- `wirbel vwm adopt focused x` hides the focused window, `wirbel vwm release x` brings it back.
+- Sound: play something in an invisible browser, nothing is heard; `wirbel vwm audio NAME
+  listen on` makes it heard.
+- Logging out or `wirbel restart` leaves no `wirbel --shadow` process behind
+  (`pgrep -af -- --shadow`) and no sink (`pactl list short sinks | grep wirbel-vwm`).
