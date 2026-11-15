@@ -15,6 +15,8 @@
 //!   (8 if not given).
 //! - `image FILE.png [SIMILARITY]`: the picture in FILE shows somewhere in the window, with at
 //!   least that share of its pixels alike (0.95 if not given). Answers the middle of where.
+//! - `text GLOB`: a line of text in the window matches, as far as the program `tesseract` can
+//!   read it from the picture. Answers the middle of the line and the line.
 //! - `cursor NAME`: the pointer has that shape, such as `text`, `pointer`, `wait`, `default`.
 //! - `clipboard`: something new was copied.
 //! - `file PATH`: that file exists.
@@ -156,6 +158,8 @@ pub enum Condition {
     Cursor(String),
     Clipboard,
     File(PathBuf),
+    /// A line of text that text recognition finds in the picture.
+    Text(String),
 }
 
 /// `#RRGGBB`, with or without the `#`.
@@ -209,6 +213,7 @@ impl Condition {
                     similarity: share.ok_or("the similarity is a number above 0, at most 1")?,
                 }
             }
+            ["text", pattern @ ..] if !pattern.is_empty() => Self::Text(pattern.join(" ")),
             ["cursor", name] => Self::Cursor(name.to_string()),
             ["clipboard"] => Self::Clipboard,
             ["file", path @ ..] if !path.is_empty() => Self::File(path.join(" ").into()),
@@ -216,7 +221,7 @@ impl Condition {
                 return Err(
                     "expected a condition: ready, window [GLOB], title GLOB, closed, exited, \
                      stable [MS], changed [X,Y,W,H], pixel X Y #RRGGBB [TOLERANCE], \
-                     image FILE [SIMILARITY], cursor NAME, clipboard or file PATH"
+                     image FILE [SIMILARITY], text GLOB, cursor NAME, clipboard or file PATH"
                         .into(),
                 );
             }
@@ -336,6 +341,8 @@ pub struct Watcher {
     scratch: Scratch,
     /// The picture, and the damage count it was taken at.
     picture: Option<(u64, Picture)>,
+    /// The lines of text read from the picture, and the damage count they are of.
+    lines: Option<(u64, Vec<super::text::Line>)>,
 }
 
 impl Watcher {
@@ -349,6 +356,7 @@ impl Watcher {
             session: Session::on(display)?,
             scratch: Scratch::new("shot.png")?,
             picture: None,
+            lines: None,
         })
     }
 
@@ -366,6 +374,17 @@ impl Watcher {
             self.picture = Some((status.damage, picture));
         }
         Ok(&self.picture.as_ref().expect("just taken").1)
+    }
+
+    /// The lines of text in the window as of `status`, read anew only if the picture changed.
+    pub fn lines(&mut self, status: &Status) -> Result<&[super::text::Line], String> {
+        let fresh = matches!(&self.lines, Some((damage, _)) if *damage == status.damage);
+        if !fresh {
+            self.picture(status)?;
+            let lines = super::text::recognise(self.scratch.file(), None)?;
+            self.lines = Some((status.damage, lines));
+        }
+        Ok(&self.lines.as_ref().expect("just read").1)
     }
 
     /// The titles and app ids of the windows.
@@ -444,6 +463,11 @@ fn check(
             let small = start.image.as_ref().expect("loaded at the start");
             let found = watcher.picture(status)?.find(small, *similarity);
             Ok(found.map(|(x, y)| format!("{} {}", x + small.width / 2, y + small.height / 2)))
+        }
+        Condition::Text(pattern) => {
+            let lines = watcher.lines(status)?;
+            let found = lines.iter().find(|line| glob(pattern, &line.text));
+            Ok(found.map(|line| format!("{} {} {}", line.middle().0, line.middle().1, line.text)))
         }
         Condition::Cursor(name) => seen(status.cursor == *name, status.cursor.clone()),
         Condition::Clipboard => seen(status.clipboard != start.status.clipboard, String::new()),

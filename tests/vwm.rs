@@ -571,3 +571,61 @@ fn waiting_sees_windows_pictures_files_and_the_end() {
         Err(WaitError::Failed(_))
     ));
 }
+
+#[test]
+fn text_is_read_through_the_clipboard_and_recognition_says_if_it_cannot() {
+    use wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager;
+    use wirbel::vwm::{
+        text::{NO_TESSERACT, by_clipboard},
+        wait::{Condition, WaitError, wait_on},
+    };
+    let desk = Desk::start("text");
+    let (display, mut hidden, _) = hidden_window(&desk, "hidden");
+    let manager: WlDataDeviceManager = hidden.bind(1..=3);
+    let seat = hidden.seat();
+    let device = manager.get_data_device(&seat, &hidden.handle, ());
+    let source = manager.create_data_source(&hidden.handle, ());
+    source.offer("text/plain".into());
+
+    // The window copies when it sees the key, as a program does on select all and copy.
+    let reading = {
+        let display = display.clone();
+        std::thread::spawn(move || by_clipboard(&display, &["c"]))
+    };
+    let mut copied = false;
+    while !reading.is_finished() {
+        hidden.sync();
+        if !copied
+            && hidden
+                .take_input()
+                .iter()
+                .any(|input| matches!(input, Input::Key(..)))
+        {
+            device.set_selection(Some(&source), hidden.state.key_serial);
+            copied = true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(reading.join().unwrap().unwrap().as_bytes(), CLIPBOARD_TEXT);
+
+    // A program that copies nothing is told apart from an empty text.
+    let nothing = by_clipboard(&display, &["x"]);
+    assert_eq!(
+        nothing,
+        Err("the program copied nothing after select all and copy".into())
+    );
+
+    // The test window shows no text; without the helper program the wait says what is missing.
+    let installed = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .any(|dir| dir.join("tesseract").is_file());
+    let waited = wait_on(
+        &display,
+        &Condition::Text("anything".into()),
+        Duration::from_millis(100),
+        &mut || Ok(()),
+    );
+    match installed {
+        true => assert!(matches!(waited, Err(WaitError::Timeout(_))), "{waited:?}"),
+        false => assert_eq!(waited, Err(WaitError::Failed(NO_TESSERACT.into()))),
+    }
+}

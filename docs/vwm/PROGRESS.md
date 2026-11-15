@@ -14,7 +14,7 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 5, step 5.1.
+Phase 6, step 6.1. Before that, if `tesseract` is installed by then: try `wirbel vwm text NAME --via ocr` on a real window and tune `vwm::text::recognise` (see the notes).
 
 ## Phases
 
@@ -54,8 +54,8 @@ Phase 5, step 5.1.
 - [x] 4.5 MACROS.md, examples, tests
 
 ### 5 Text I
-- [ ] 5.1 clipboard trick
-- [ ] 5.2 OCR through `tesseract`, positions, `wait text`
+- [x] 5.1 clipboard trick
+- [x] 5.2 OCR through `tesseract`, positions, `wait text`
 
 ### 6 Text II
 - [ ] 6.1 AT-SPI: tree, text, press, set
@@ -116,5 +116,10 @@ Phase 5, step 5.1.
 - `wirbel vwm close` returns once the window is gone, so its name is free again.
 - `examples/macros/page-title.wm` is checked for syntax only; run it with a real browser in
   the smoke test.
+- Text recognition was written without `tesseract` on the machine: only the reading of its TSV
+  output is tested. Still to try with the real program: whether small interface fonts need the
+  picture enlarged first, and whether `--psm 11` (sparse text) reads windows better than the
+  default. `WIRBEL_OCR_LANG` or `--lang` picks languages.
+- `vwm text --via clipboard` presses CTRL+a and CTRL+c; terminals do not select all that way.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

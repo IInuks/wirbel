@@ -14,6 +14,7 @@ pub mod json;
 pub mod manager;
 pub mod shadow;
 pub mod shot;
+pub mod text;
 pub mod wait;
 
 use smithay::reexports::calloop::channel::{self, Sender};

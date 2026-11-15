@@ -11,8 +11,9 @@ use std::{
 use super::{
     DEFAULT_SIZE,
     manager::{Open, shell_quote},
+    text::{Line, by_clipboard, matching, recognise},
     valid_name,
-    wait::{Condition, DEFAULT_TIMEOUT, Status, WaitError, Watcher, color_name},
+    wait::{Condition, DEFAULT_TIMEOUT, Status, WaitError, Watcher, color_name, glob},
 };
 use crate::{
     backend::headless::parse_size,
@@ -38,7 +39,9 @@ pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--sh
        wirbel vwm status NAME
        wirbel vwm events NAME
        wirbel vwm pixel NAME X Y
-       wirbel vwm find NAME FILE.png [SIMILARITY]";
+       wirbel vwm find NAME FILE.png [SIMILARITY]
+       wirbel vwm text NAME [--via ocr|clipboard] [--find GLOB] [--where] [--lang LANGUAGES]
+       wirbel vwm click-text NAME GLOB [left|right|middle]";
 
 pub const HELP: &str =
     "vwm runs programs in invisible windows: they never show on the screen and never take the
@@ -76,6 +79,14 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
       events     print what happens to the window, until it is gone or Ctrl+C
       pixel      print the colour of a pixel as #rrggbb
       find       print where the picture FILE.png shows in the window, the middle of it
+      text       print the text the window shows. --via ocr reads a picture of it with the
+                 program tesseract (any program, with places, may misread; --lang eng+deu picks
+                 languages), --via clipboard presses CTRL+a and CTRL+c in the window and reads
+                 its clipboard (exact, but changes the selection). Without --via it is ocr if
+                 tesseract is installed, else the clipboard. --find prints only the lines that
+                 match, and fails if none does. --where puts the middle of each line before
+                 it, as X Y (ocr only)
+      click-text click the middle of the first line that matches GLOB (ocr)
 Exit status: 0 done, 1 failed, 2 wrong usage, 3 the time of a wait ran out.
 `wirbel vwm invisible create|close|screenshot ...` mean the same as `wirbel vwm open|close|shot ...`.
 Positions are pixels from the top left corner of the window.";
@@ -723,8 +734,14 @@ impl Drop for Scratch {
 
 /// The text in the clipboard of the shadow behind `name`.
 pub fn clip_get(name: &str) -> Result<String, String> {
+    clip_get_on(&display_of(name)?)
+}
+
+/// The text in the clipboard of the shadow on this display.
+pub fn clip_get_on(display: &str) -> Result<String, String> {
     let scratch = Scratch::new("clip")?;
-    ask_shadow(name, &format!("shadow clip get\t{}", scratch.path()))?;
+    let request = format!("shadow clip get\t{}", scratch.path());
+    answer_of(&ask_display(display, &request)?)?;
     let bytes = std::fs::read(&scratch.0).map_err(|err| format!("no clipboard text: {err}"))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -905,6 +922,82 @@ fn find(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The lines of text in the window on this display, read from a picture of it.
+pub fn recognise_on(display: &str, language: Option<&str>) -> Result<Vec<Line>, String> {
+    let scratch = Scratch::new("ocr.png")?;
+    answer_of(&ask_display(
+        display,
+        &format!("shadow shot\t{}", scratch.path()),
+    )?)?;
+    recognise(scratch.file(), language)
+}
+
+fn tesseract_installed() -> bool {
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&paths).any(|dir| dir.join("tesseract").is_file())
+}
+
+fn text(args: &[String]) -> Result<(), String> {
+    let (mut via, mut pattern, mut place, mut language) = (None, None, false, None);
+    let mut name = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let mut value = |what: &str| args.next().ok_or(format!("{arg} needs {what}"));
+        match arg.as_str() {
+            "--via" => via = Some(value("ocr or clipboard")?.clone()),
+            "--find" | "find" => pattern = Some(value("a pattern")?.clone()),
+            "--lang" => language = Some(value("languages")?.clone()),
+            "--where" => place = true,
+            word if name.is_none() && !word.starts_with("--") => name = Some(word.to_string()),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let display = display_of(&name.ok_or(USAGE)?)?;
+    let via = via.unwrap_or_else(|| {
+        let ocr = tesseract_installed() || place;
+        if ocr { "ocr" } else { "clipboard" }.to_string()
+    });
+    let lines: Vec<String> = match via.as_str() {
+        "ocr" => {
+            let lines = recognise_on(&display, language.as_deref())?;
+            let found = matching(&lines, pattern.as_deref());
+            let show = |line: &&Line| match place {
+                true => format!("{} {} {}", line.middle().0, line.middle().1, line.text),
+                false => line.text.clone(),
+            };
+            found.iter().map(show).collect()
+        }
+        "clipboard" if place => return Err("--where needs --via ocr".into()),
+        "clipboard" => {
+            let text = by_clipboard(&display, &["CTRL+a", "CTRL+c"])?;
+            let fits = |line: &&str| pattern.as_deref().is_none_or(|p| glob(p, line));
+            text.lines().filter(fits).map(str::to_string).collect()
+        }
+        other => return Err(format!("expected --via ocr or clipboard, got `{other}`")),
+    };
+    if lines.is_empty() && pattern.is_some() {
+        return Err("no such text in the window".into());
+    }
+    emit(lines.join("\n"));
+    Ok(())
+}
+
+fn click_text(args: &[String]) -> Result<(), String> {
+    let (name, pattern, rest) = match args {
+        [name, pattern, rest @ ..] if rest.len() <= 1 => (name, pattern, rest),
+        _ => return Err(USAGE.into()),
+    };
+    let button = button(rest.first())?;
+    let display = display_of(name)?;
+    let lines = recognise_on(&display, None)?;
+    let found = matching(&lines, Some(pattern));
+    let line = found.first().ok_or("no such text in the window")?;
+    let (x, y) = line.middle();
+    let mut session = Session::on(&display)?;
+    session.glide((f64::from(x), f64::from(y)), Duration::ZERO)?;
+    session.press(button)
+}
+
 /// What `wirbel vwm` exits with for this error.
 pub fn exit_code(error: &str) -> i32 {
     if error.starts_with("timeout: ") {
@@ -949,8 +1042,25 @@ pub fn capture(args: &[String]) -> Result<String, String> {
 
 /// The commands of `wirbel vwm` that are steps of a macro too.
 pub const COMMANDS: &[&str] = &[
-    "open", "list", "info", "resize", "close", "type", "key", "click", "move", "drag", "scroll",
-    "shot", "clip", "paste", "status", "pixel", "find",
+    "open",
+    "list",
+    "info",
+    "resize",
+    "close",
+    "type",
+    "key",
+    "click",
+    "move",
+    "drag",
+    "scroll",
+    "shot",
+    "clip",
+    "paste",
+    "status",
+    "pixel",
+    "find",
+    "text",
+    "click-text",
 ];
 
 /// `wirbel vwm ARGS`.
@@ -983,6 +1093,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "events" => events(rest),
         "pixel" => pixel(rest),
         "find" => find(rest),
+        "text" => text(rest),
+        "click-text" => click_text(rest),
         "--help" | "-h" | "help" => {
             emit(format!("{USAGE}\n\n{HELP}"));
             Ok(())
