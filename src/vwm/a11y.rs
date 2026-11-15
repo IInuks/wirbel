@@ -115,6 +115,9 @@ mod bus {
         pub fn set(&self, _item: &Item, _text: &str) -> Result<(), String> {
             Err(MISSING.into())
         }
+        pub fn extents(&self, _item: &Item) -> Result<(i32, i32, i32, i32), String> {
+            Err(MISSING.into())
+        }
     }
 }
 
@@ -300,9 +303,21 @@ mod bus {
             Ok((item.address.0.clone(), path))
         }
 
+        /// Brings a control into the part of its document that shows, if it is outside.
+        fn scroll_to(&self, at: &Address) {
+            // 6 is "anywhere": as little scrolling as it takes. Not every control can.
+            if self
+                .call(at, "org.a11y.atspi.Component", "ScrollTo", &(6u32,))
+                .is_ok()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+
         /// Does what a click on the control does.
         pub fn press(&self, item: &Item) -> Result<(), String> {
             let at = Self::address(item)?;
+            self.scroll_to(&at);
             let reply = self
                 .call(&at, "org.a11y.atspi.Action", "DoAction", &(0i32,))
                 .map_err(|err| fail("the control cannot be pressed", err))?;
@@ -310,6 +325,30 @@ mod bus {
                 Ok(false) => Err("accessibility: the control refused".into()),
                 _ => Ok(()),
             }
+        }
+
+        /// Where the control is in its window: left, top, width, height.
+        pub fn extents(&self, item: &Item) -> Result<(i32, i32, i32, i32), String> {
+            let at = Self::address(item)?;
+            self.scroll_to(&at);
+            // 1 asks for the place within the window; places on the screen mean nothing here.
+            // A document that has just scrolled or loaded may need a moment to know its places.
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                let reply = self
+                    .call(&at, "org.a11y.atspi.Component", "GetExtents", &(1u32,))
+                    .map_err(|err| fail("the control has no place", err))?;
+                let place: (i32, i32, i32, i32) = reply
+                    .body()
+                    .deserialize()
+                    .map_err(|err| fail("bad place", err))?;
+                if place.2 > 0 && place.3 > 0 {
+                    return Ok(place);
+                }
+            }
+            Err("accessibility: the control is not on the screen".into())
         }
 
         /// Replaces the text of a field.

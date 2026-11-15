@@ -37,7 +37,7 @@ Positions are pixels from the top left corner of the window. The window is 1280x
 | `find NAME FILE.png [SIMILARITY]` | where a small picture shows in the window |
 | `clip NAME get\|set TEXT` | the window's own clipboard |
 | `text NAME [--via a11y\|ocr\|clipboard] [--find GLOB] [--where]`, `click-text NAME GLOB` | read text, click on text |
-| `ui NAME tree`, `ui NAME press LABEL`, `ui NAME set LABEL TEXT` | controls through the accessibility interface |
+| `ui NAME tree`, `ui NAME press LABEL`, `ui NAME click LABEL`, `ui NAME where LABEL`, `ui NAME set LABEL TEXT` | controls through the accessibility interface; `click` for links |
 | `audio NAME listen on\|off`, `audio NAME level`, `audio NAME record FILE.wav [S]` | its sound |
 | `record NAME FILE [--fps N] [--audio] [S]` | film it with ffmpeg (.mp4, .webm, .gif) |
 | `web NAME goto URL`, `web NAME text [SELECTOR]`, `web NAME click SELECTOR`, `web NAME fill SELECTOR TEXT`, `web NAME eval SCRIPT` | the page of a browser opened with `open --web` |

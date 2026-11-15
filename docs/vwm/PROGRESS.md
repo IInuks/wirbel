@@ -147,14 +147,16 @@ What is left, in the order of use:
 - Accessibility (`src/vwm/a11y.rs`, feature `vwm-a11y`, crate `zbus`) asks instead of
   listening: `wait loaded` reads the tree again while the picture rests, which is a few
   hundred D-Bus calls for a browser. Signals would be cheaper; not needed so far.
-- Tried with Firefox: `ui tree`, `text --via a11y` and `wait loaded` are right. `ui press` on a
-  link answered ok but the page did not visibly change within a second: check whether links
-  need another action than the first, or just more time.
+- Tried with Firefox: `ui tree`, `text --via a11y`, `wait loaded`, `ui where` and `ui click`
+  are right. `ui press` on a link of a page answers ok and does nothing there, also when the
+  link is in view: links take `ui click` (scrolls the control into view, then clicks its
+  middle with the pointer) or `web click`.
 - With `open --share-bus` the accessibility tree is the one of the whole desktop, not of the
   window alone. Filtering by the processes of the shadow is still to do.
 - Parked windows (`src/vwm/park.rs`) are held windows of the core (`Wirbel::held_windows`)
   with a name. An extension that sets a window hook and shows all held windows would show the
-  parked ones too; it has to skip `Wirbel::is_parked`.
+  parked ones too; it has to skip `Wirbel::is_parked`. The 3D town does that in its
+  `src/windows.rs` (it chains `held_windows`); it still compiles against this branch.
 - `status`, `wait`, `text` and `ui` do not work on parked windows yet: they go to the control
   socket of a shadow. Pictures of parked windows are taken by every backend
   (`vwm::shot::take_parked`), tried on the headless one with a real terminal.

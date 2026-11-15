@@ -44,7 +44,7 @@ pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--sh
        wirbel vwm find NAME FILE.png [SIMILARITY]
        wirbel vwm text NAME [--via a11y|ocr|clipboard] [--find GLOB] [--where] [--lang LANGUAGES]
        wirbel vwm click-text NAME GLOB [left|right|middle]
-       wirbel vwm ui NAME tree | press LABEL | set LABEL TEXT...
+       wirbel vwm ui NAME tree | press LABEL | click LABEL | where LABEL | set LABEL TEXT...
        wirbel vwm audio NAME listen on|off | level [SECONDS] | record FILE.wav [SECONDS]
        wirbel vwm record NAME FILE [--fps N] [--audio] [SECONDS]
        wirbel vwm web NAME goto URL | eval SCRIPT... | text [SELECTOR] | html SELECTOR | click SELECTOR
@@ -104,8 +104,10 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
                  --via a11y asks the program itself through the accessibility interface:
                  exact and quick where the program offers it (GTK, Qt, browsers)
       ui         the controls of the window by the accessibility interface: tree prints them,
-                 press does what a click on the one named LABEL does, set replaces the text of
-                 the field named LABEL. LABEL is a GLOB on the name or the text
+                 press asks the one named LABEL to do what a click does, click moves the
+                 pointer to its middle and clicks (for what does not react to press, such as
+                 links in a browser), where prints that middle, set replaces the text of the
+                 field named LABEL. LABEL is a GLOB on the name or the text
       audio      the sound of the window. A program started invisibly is silent: it plays into
                  a sink of its own (open --sound lets it play on the speakers instead).
                  listen on routes that sink to the speakers and off stops that, level prints
@@ -1142,8 +1144,18 @@ fn ui(args: &[String]) -> Result<(), String> {
     let [name, command, rest @ ..] = args else {
         return Err(USAGE.into());
     };
-    let tree = Tree::of(&display_of(name)?)?;
+    let display = display_of(name)?;
+    let tree = Tree::of(&display)?;
     let items = tree.items()?;
+    let middle = |label: &String| -> Result<(i32, i32), String> {
+        // The deepest match is the control itself, not what it sits in.
+        let named = |item: &&super::a11y::Item| glob(label, &item.name) || glob(label, &item.text);
+        let exact = items.iter().rev().find(|item| item.name == *label);
+        let item = exact.or_else(|| items.iter().rev().find(named));
+        let item = item.ok_or_else(|| format!("no control `{label}`"))?;
+        let (x, y, w, h) = tree.extents(item)?;
+        Ok((x + w / 2, y + h / 2))
+    };
     match (command.as_str(), rest) {
         ("tree", []) => {
             let lines: Vec<String> = items.iter().map(super::a11y::Item::line).collect();
@@ -1153,6 +1165,17 @@ fn ui(args: &[String]) -> Result<(), String> {
         ("press", [label]) => {
             let item = find(&items, label, |item| item.actions);
             tree.press(item.ok_or_else(|| format!("no control `{label}` to press"))?)
+        }
+        ("where", [label]) => {
+            let (x, y) = middle(label)?;
+            emit(format!("{x} {y}"));
+            Ok(())
+        }
+        ("click", [label]) => {
+            let (x, y) = middle(label)?;
+            let mut session = Session::on(&display)?;
+            session.glide((f64::from(x), f64::from(y)), Duration::ZERO)?;
+            session.press("left")
         }
         ("set", [label, words @ ..]) if !words.is_empty() => {
             let item = find(&items, label, |item| item.editable);
