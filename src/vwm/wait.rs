@@ -17,9 +17,9 @@
 //!   least that share of its pixels alike (0.95 if not given). Answers the middle of where.
 //! - `text GLOB`: a line of text in the window matches, as far as the program `tesseract` can
 //!   read it from the picture. Answers the middle of the line and the line.
-//! - `loaded`: the document in the window is no longer loading. The program is asked through
-//!   the accessibility interface; where it has none, the window counts as loaded when its
-//!   picture has rested for 0.8 s and the pointer is no busy one. Answers which of the two.
+//! - `loaded`: the document in the window is no longer loading. A browser with remote control
+//!   is asked itself, other programs through the accessibility interface; where there is none, the window counts as loaded when its
+//!   picture has rested for 0.8 s and the pointer is no busy one. Answers which of them it was.
 //! - `sound`: the window plays something. `silence [MS]`: it has played nothing for MS
 //!   milliseconds, 500 if not given. Both need the sink of its own that `open` gives a window.
 //! - `cursor NAME`: the pointer has that shape, such as `text`, `pointer`, `wait`, `default`.
@@ -435,6 +435,14 @@ impl Watcher {
         Ok(&self.lines.as_ref().expect("just read").1)
     }
 
+    /// Whether the page of a browser with remote control has loaded. `None` if the window is
+    /// no such browser.
+    pub fn page_loaded(&mut self) -> Option<bool> {
+        let dir = super::manager::state_dir(self.name.as_deref()?)?.join("profile");
+        let endpoint = super::web::endpoint(&dir).ok()?;
+        super::web::Page::open(&endpoint).ok()?.loaded().ok()
+    }
+
     /// Whether the documents in the window have loaded, if the programs say.
     pub fn documents_loaded(&mut self) -> Option<bool> {
         let display = &self.display;
@@ -530,6 +538,9 @@ fn check(
             // Asking takes a moment, so only when the picture has come to rest a little.
             if status.windows == 0 || status.quiet < Duration::from_millis(150) {
                 return Ok(None);
+            }
+            if let Some(loaded) = watcher.page_loaded() {
+                return seen(loaded, "browser".into());
             }
             if let Some(loaded) = watcher.documents_loaded() {
                 return seen(loaded, "accessibility".into());

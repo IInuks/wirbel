@@ -21,7 +21,7 @@ use crate::{
     ipc::{json_string, socket_path},
 };
 
-pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--share-bus] [--sound] [--env KEY=VALUE]... [--] COMMAND...
+pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--share-bus] [--sound] [--web] [--env KEY=VALUE]... [--] COMMAND...
        wirbel vwm list [--json]
        wirbel vwm info NAME
        wirbel vwm resize NAME WxH
@@ -46,7 +46,9 @@ pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--sh
        wirbel vwm click-text NAME GLOB [left|right|middle]
        wirbel vwm ui NAME tree | press LABEL | set LABEL TEXT...
        wirbel vwm audio NAME listen on|off | level [SECONDS] | record FILE.wav [SECONDS]
-       wirbel vwm record NAME FILE [--fps N] [--audio] [SECONDS]";
+       wirbel vwm record NAME FILE [--fps N] [--audio] [SECONDS]
+       wirbel vwm web NAME goto URL | eval SCRIPT... | text [SELECTOR] | html SELECTOR | click SELECTOR
+                           | fill SELECTOR TEXT... | exists SELECTOR | count SELECTOR | title | url";
 
 pub const HELP: &str =
     "vwm runs programs in invisible windows: they never show on the screen and never take the
@@ -111,6 +113,12 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
                  format by the ending of FILE (.mp4, .webm, .mkv, .gif). 10 pictures a second
                  unless --fps says otherwise, --audio adds the sound of the window. For SECONDS,
                  or until Ctrl+C
+      web        the page of a browser started with open --web, by its remote control: goto
+                 loads an address and waits for it, eval runs JavaScript and prints the result,
+                 text prints the text of the page or of the element a CSS selector names,
+                 click and fill act on such an element, exists and count ask for it. open --web
+                 makes the browser listen on a port of this machine, which lets every program
+                 of this machine control that browser
       click-text click the middle of the first line that matches GLOB (ocr)
 Exit status: 0 done, 1 failed, 2 wrong usage, 3 the time of a wait ran out.
 `wirbel vwm invisible create|close|screenshot ...` mean the same as `wirbel vwm open|close|shot ...`.
@@ -328,20 +336,28 @@ pub fn parse_open(args: &[String]) -> Result<Open, String> {
 }
 
 fn open(args: &[String]) -> Result<(), String> {
-    let sound = args
-        .iter()
-        .take_while(|arg| *arg != "--")
-        .any(|arg| arg == "--sound");
-    let args: Vec<String> = match args.iter().position(|arg| arg == "--sound") {
-        Some(at) if sound => args
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != at)
-            .map(|(_, a)| a.clone())
-            .collect(),
-        _ => args.to_vec(),
+    // Two options are for this command alone, the rest is for the compositor.
+    let own = |flag: &str| {
+        let before = args.iter().take_while(|arg| *arg != "--");
+        before.into_iter().any(|arg| arg == flag)
     };
+    let (sound, web) = (own("--sound"), own("--web"));
+    let dashes = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let kept = args
+        .iter()
+        .enumerate()
+        .filter(|(at, arg)| *at >= dashes || !["--sound", "--web"].contains(&arg.as_str()));
+    let args: Vec<String> = kept.map(|(_, arg)| arg.clone()).collect();
     let mut open = parse_open(&args)?;
+    if web {
+        let program = super::manager::program_of(&open.command);
+        let options = super::web::listen_options(program);
+        let options = options.ok_or_else(|| format!("--web knows no browser `{program}`"))?;
+        open.command = format!("{} {options}", open.command);
+    }
     let taken: Vec<String> = rows()
         .map(|rows| rows.into_iter().map(|row| row.name).collect())
         .unwrap_or_default();
@@ -1265,6 +1281,40 @@ fn record(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The page of the browser in the invisible window `name`.
+pub fn page_of(name: &str) -> Result<super::web::Page, String> {
+    let dir = super::manager::state_dir(name).ok_or("cannot tell where the state folder is")?;
+    super::web::Page::open(&super::web::endpoint(&dir.join("profile"))?)
+}
+
+fn web(args: &[String]) -> Result<(), String> {
+    use super::web::{script, show};
+    let [name, command, rest @ ..] = args else {
+        return Err(USAGE.into());
+    };
+    let mut page = page_of(name)?;
+    let selector = rest.first().map(String::as_str).unwrap_or_default();
+    let value = match (command.as_str(), rest) {
+        ("goto", [url]) => return page.goto(url),
+        ("eval", [_, ..]) => page.eval(&rest.join(" "))?,
+        ("text", [] | [_]) | ("title" | "url", []) => {
+            page.eval(&script(command, selector, "").ok_or(USAGE)?)?
+        }
+        ("html" | "click" | "exists" | "count", [_]) => {
+            page.eval(&script(command, selector, "").ok_or(USAGE)?)?
+        }
+        ("fill", [_, text @ ..]) if !text.is_empty() => {
+            page.eval(&script(command, selector, &text.join(" ")).ok_or(USAGE)?)?
+        }
+        _ => return Err(USAGE.into()),
+    };
+    // Acting on an element has nothing to say.
+    if !["click", "fill"].contains(&command.as_str()) {
+        emit(show(&value));
+    }
+    Ok(())
+}
+
 fn click_text(args: &[String]) -> Result<(), String> {
     let (name, pattern, rest) = match args {
         [name, pattern, rest @ ..] if rest.len() <= 1 => (name, pattern, rest),
@@ -1347,6 +1397,7 @@ pub const COMMANDS: &[&str] = &[
     "ui",
     "audio",
     "record",
+    "web",
     "adopt",
     "release",
     "windows",
@@ -1401,6 +1452,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "ui" => ui(rest),
         "audio" => audio(rest),
         "record" => record(rest),
+        "web" => web(rest),
         "--help" | "-h" | "help" => {
             emit(format!("{USAGE}\n\n{HELP}"));
             Ok(())

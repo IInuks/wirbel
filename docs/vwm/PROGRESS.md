@@ -14,9 +14,9 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 10, step 10.1 (browser protocol), then phase 11. Step 7.4 is optional and can wait. If
-`tesseract` is installed by then, first try `wirbel vwm text NAME --via ocr` on a real window
-(see the notes).
+Phase 11 (viewer `vwm show|hide`, limits and a memory column in `vwm list`). Step 7.4 is
+optional. If `tesseract` is installed by then, first try `wirbel vwm text NAME --via ocr` on a
+real window (see the notes).
 
 ## Phases
 
@@ -77,7 +77,7 @@ Phase 10, step 10.1 (browser protocol), then phase 11. Step 7.4 is optional and 
 - [x] 9.1 `record` through `ffmpeg`, frame export
 
 ### 10 Browser protocol
-- [ ] 10.1 `vwm web`, `loaded` and `text` through it
+- [x] 10.1 `vwm web`, `loaded` and `text` through it
 
 ### 11 Viewer and finish
 - [ ] 11.1 `vwm show|hide`
@@ -158,5 +158,12 @@ Phase 10, step 10.1 (browser protocol), then phase 11. Step 7.4 is optional and 
 - `vwm record` feeds PNG pictures to `ffmpeg -f image2pipe`, a new one only when the window
   changed, each at its time. Tried: mp4 with sound and gif of an invisible terminal. No frame
   export of its own: `shot` in a loop does that.
+- The browser protocols (`src/vwm/web.rs`) need no crate: the WebSocket client is in the file.
+  `open --web` adds `--remote-debugging-port` to the command; the port is read from the
+  profile folder (`WebDriverBiDiServer.json` of Firefox, `DevToolsActivePort` of Chromium), so
+  `vwm web` needs the profile wirbel made, not one given with the browser's own option.
+  Firefox takes one BiDi session at a time: each command ends its session (`Drop for Page`).
+  Tried with Firefox and Chromium: goto, title, eval, count, click, fill.
+- `vwm web` always acts on the first tab.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

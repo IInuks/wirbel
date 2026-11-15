@@ -19,6 +19,7 @@ pub mod shadow;
 pub mod shot;
 pub mod text;
 pub mod wait;
+pub mod web;
 
 use smithay::reexports::calloop::channel::{self, Sender};
 

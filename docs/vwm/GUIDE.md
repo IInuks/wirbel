@@ -40,6 +40,7 @@ Positions are pixels from the top left corner of the window. The window is 1280x
 | `ui NAME tree`, `ui NAME press LABEL`, `ui NAME set LABEL TEXT` | controls through the accessibility interface |
 | `audio NAME listen on\|off`, `audio NAME level`, `audio NAME record FILE.wav [S]` | its sound |
 | `record NAME FILE [--fps N] [--audio] [S]` | film it with ffmpeg (.mp4, .webm, .gif) |
+| `web NAME goto URL`, `web NAME text [SELECTOR]`, `web NAME click SELECTOR`, `web NAME fill SELECTOR TEXT`, `web NAME eval SCRIPT` | the page of a browser opened with `open --web` |
 | `wait NAME CONDITION [--timeout S]` | wait for a state |
 
 `wirbel vwm --help` has every option. A wait whose time runs out exits with status 3, so shell
@@ -96,7 +97,27 @@ wirbel vwm shot music now.png
 wirbel vwm release music
 ```
 
+## Browsers
+
+`open --web` starts Firefox or a Chromium with its remote control switched on, and `web` talks
+to the page itself: exact text, elements by CSS selector, JavaScript.
+
+```sh
+wirbel vwm open --name shop --web firefox
+wirbel vwm wait shop ready
+wirbel vwm web shop goto https://example.com      # returns when the page has loaded
+wirbel vwm web shop text h1
+wirbel vwm web shop fill 'input[name=q]' rust
+wirbel vwm web shop click 'button[type=submit]'
+wirbel vwm wait shop loaded
+wirbel vwm web shop eval 'document.links.length'
+```
+
+The remote control is a port on this machine that any program of this machine can use to
+steer that browser, so it is only on where `--web` asks for it. Without it a browser is driven
+like any window: keys, clicks, `text`, `ui`.
+
 ## Not there yet
 
-Input into parked windows, the remote control protocol of browsers and a window to look into an
-invisible one are planned; [PROGRESS.md](PROGRESS.md) says how far they are.
+Input into parked windows and a window to look into an invisible one are planned;
+[PROGRESS.md](PROGRESS.md) says how far they are.
