@@ -10,6 +10,7 @@
 //!
 //! Requests on its control socket: `shadow close` asks every window to close, `shadow resize WxH`
 //! changes the size of the output and with it of the window, `shadow size` answers `WxH`.
+//! `shadow status` answers its state in a line, `shadow bus` the address of its session bus.
 //! `shadow shot` and `shadow clip` are in `super::shot` and `super::clip`.
 
 use std::{
@@ -104,7 +105,13 @@ pub fn start(
 ) {
     let mut children = Vec::new();
     for command in commands {
-        match state.client_command(command).spawn() {
+        let mut child = state.client_command(command);
+        // Toolkits build their accessibility tree only when told that someone listens.
+        child
+            .env("GNOME_ACCESSIBILITY", "1")
+            .env("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1")
+            .env("ACCESSIBILITY_ENABLED", "1");
+        match child.spawn() {
             Ok(child) => children.push(child),
             Err(err) => tracing::error!(%err, command, "failed to start"),
         }
@@ -238,6 +245,10 @@ fn plain_request(state: &mut Wirbel, rest: &str) -> Result<String, String> {
             Ok(format!("{}x{}", size.w, size.h))
         }
         (Some("status"), None, None) => Ok(status(state)),
+        // Where the programs of this shadow find their session bus, for `super::a11y`.
+        (Some("bus"), None, None) => env::var("DBUS_SESSION_BUS_ADDRESS")
+            .map(|address| format!("ok {address}"))
+            .map_err(|_| "the shadow has no session bus".into()),
         _ => Err("expected close, resize WxH, size, status, shot or clip".into()),
     }
 }

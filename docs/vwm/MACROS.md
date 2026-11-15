@@ -29,14 +29,14 @@ close page
 
 Every command of `wirbel vwm` is a step with the same words: `open`, `close`, `type`, `key`,
 `click`, `move`, `drag`, `scroll`, `shot`, `clip`, `paste`, `resize`, `status`, `pixel`, `find`,
-`list`, `info`. `wirbel vwm --help` describes them.
+`text`, `click-text`, `ui`, `list`, `info`. `wirbel vwm --help` describes them.
 
 - `open NAME = COMMAND...` starts a program and names its window. `open COMMAND...` picks a name
   and yields it: `let w = open kitty`. Options go first: `open page = --size 800x600 firefox`.
 - `wait NAME CONDITION [timeout TIME]` waits until the condition holds and yields what it
   answers. Conditions: `ready`, `window [GLOB]`, `title GLOB`, `closed`, `exited`, `stable [MS]`,
   `changed [X,Y,W,H]`, `pixel X Y #RRGGBB [TOLERANCE]`, `image FILE.png [SIMILARITY]`,
-  `cursor NAME`, `clipboard`, `file PATH`. When the time runs out the step fails; the limit is
+  `text GLOB`, `loaded`, `cursor NAME`, `clipboard`, `file PATH`. When the time runs out the step fails; the limit is
   30 seconds unless the step or an earlier `timeout TIME` says otherwise.
 
 ## Words

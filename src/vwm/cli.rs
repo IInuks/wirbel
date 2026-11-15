@@ -40,8 +40,9 @@ pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--sh
        wirbel vwm events NAME
        wirbel vwm pixel NAME X Y
        wirbel vwm find NAME FILE.png [SIMILARITY]
-       wirbel vwm text NAME [--via ocr|clipboard] [--find GLOB] [--where] [--lang LANGUAGES]
-       wirbel vwm click-text NAME GLOB [left|right|middle]";
+       wirbel vwm text NAME [--via a11y|ocr|clipboard] [--find GLOB] [--where] [--lang LANGUAGES]
+       wirbel vwm click-text NAME GLOB [left|right|middle]
+       wirbel vwm ui NAME tree | press LABEL | set LABEL TEXT...";
 
 pub const HELP: &str =
     "vwm runs programs in invisible windows: they never show on the screen and never take the
@@ -86,6 +87,11 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
                  tesseract is installed, else the clipboard. --find prints only the lines that
                  match, and fails if none does. --where puts the middle of each line before
                  it, as X Y (ocr only)
+                 --via a11y asks the program itself through the accessibility interface:
+                 exact and quick where the program offers it (GTK, Qt, browsers)
+      ui         the controls of the window by the accessibility interface: tree prints them,
+                 press does what a click on the one named LABEL does, set replaces the text of
+                 the field named LABEL. LABEL is a GLOB on the name or the text
       click-text click the middle of the first line that matches GLOB (ocr)
 Exit status: 0 done, 1 failed, 2 wrong usage, 3 the time of a wait ran out.
 `wirbel vwm invisible create|close|screenshot ...` mean the same as `wirbel vwm open|close|shot ...`.
@@ -967,19 +973,55 @@ fn text(args: &[String]) -> Result<(), String> {
             };
             found.iter().map(show).collect()
         }
+        "a11y" if place => return Err("--where needs --via ocr".into()),
+        "a11y" => {
+            let lines = super::a11y::text_of(&super::a11y::Tree::of(&display)?.items()?);
+            let fits = |line: &String| pattern.as_deref().is_none_or(|p| glob(p, line));
+            lines.into_iter().filter(fits).collect()
+        }
         "clipboard" if place => return Err("--where needs --via ocr".into()),
         "clipboard" => {
             let text = by_clipboard(&display, &["CTRL+a", "CTRL+c"])?;
             let fits = |line: &&str| pattern.as_deref().is_none_or(|p| glob(p, line));
             text.lines().filter(fits).map(str::to_string).collect()
         }
-        other => return Err(format!("expected --via ocr or clipboard, got `{other}`")),
+        other => {
+            return Err(format!(
+                "expected --via a11y, ocr or clipboard, got `{other}`"
+            ));
+        }
     };
     if lines.is_empty() && pattern.is_some() {
         return Err("no such text in the window".into());
     }
     emit(lines.join("\n"));
     Ok(())
+}
+
+fn ui(args: &[String]) -> Result<(), String> {
+    use super::a11y::{Tree, find};
+    let [name, command, rest @ ..] = args else {
+        return Err(USAGE.into());
+    };
+    let tree = Tree::of(&display_of(name)?)?;
+    let items = tree.items()?;
+    match (command.as_str(), rest) {
+        ("tree", []) => {
+            let lines: Vec<String> = items.iter().map(super::a11y::Item::line).collect();
+            emit(lines.join("\n"));
+            Ok(())
+        }
+        ("press", [label]) => {
+            let item = find(&items, label, |item| item.actions);
+            tree.press(item.ok_or_else(|| format!("no control `{label}` to press"))?)
+        }
+        ("set", [label, words @ ..]) if !words.is_empty() => {
+            let item = find(&items, label, |item| item.editable);
+            let item = item.ok_or_else(|| format!("no field `{label}` to fill"))?;
+            tree.set(item, &words.join(" "))
+        }
+        _ => Err(USAGE.into()),
+    }
 }
 
 fn click_text(args: &[String]) -> Result<(), String> {
@@ -1061,6 +1103,7 @@ pub const COMMANDS: &[&str] = &[
     "find",
     "text",
     "click-text",
+    "ui",
 ];
 
 /// `wirbel vwm ARGS`.
@@ -1095,6 +1138,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "find" => find(rest),
         "text" => text(rest),
         "click-text" => click_text(rest),
+        "ui" => ui(rest),
         "--help" | "-h" | "help" => {
             emit(format!("{USAGE}\n\n{HELP}"));
             Ok(())

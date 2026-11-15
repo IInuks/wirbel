@@ -14,7 +14,8 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 6, step 6.1. Before that, if `tesseract` is installed by then: try `wirbel vwm text NAME --via ocr` on a real window and tune `vwm::text::recognise` (see the notes).
+Phase 7, step 7.1. If `tesseract` is installed by then, first try `wirbel vwm text NAME --via ocr`
+on a real window and tune `vwm::text::recognise` (see the notes).
 
 ## Phases
 
@@ -58,8 +59,8 @@ Phase 6, step 6.1. Before that, if `tesseract` is installed by then: try `wirbel
 - [x] 5.2 OCR through `tesseract`, positions, `wait text`
 
 ### 6 Text II
-- [ ] 6.1 AT-SPI: tree, text, press, set
-- [ ] 6.2 AT-SPI signals, `loaded`
+- [x] 6.1 AT-SPI: tree, text, press, set
+- [x] 6.2 AT-SPI signals, `loaded`
 
 ### 7 Adoption
 - [ ] 7.1 parked list, hidden from taskbar, frame callbacks
@@ -130,5 +131,13 @@ Phase 6, step 6.1. Before that, if `tesseract` is installed by then: try `wirbel
 - Tried with real programs (headless desktop, see below): kitty (type, paste, drag, shot) and
   Firefox with its own profile; `examples/macros/page-title.wm` returned the title of
   example.com.
+- Accessibility (`src/vwm/a11y.rs`, feature `vwm-a11y`, crate `zbus`) asks instead of
+  listening: `wait loaded` reads the tree again while the picture rests, which is a few
+  hundred D-Bus calls for a browser. Signals would be cheaper; not needed so far.
+- Tried with Firefox: `ui tree`, `text --via a11y` and `wait loaded` are right. `ui press` on a
+  link answered ok but the page did not visibly change within a second: check whether links
+  need another action than the first, or just more time.
+- With `open --share-bus` the accessibility tree is the one of the whole desktop, not of the
+  window alone. Filtering by the processes of the shadow is still to do.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

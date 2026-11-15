@@ -17,6 +17,9 @@
 //!   least that share of its pixels alike (0.95 if not given). Answers the middle of where.
 //! - `text GLOB`: a line of text in the window matches, as far as the program `tesseract` can
 //!   read it from the picture. Answers the middle of the line and the line.
+//! - `loaded`: the document in the window is no longer loading. The program is asked through
+//!   the accessibility interface; where it has none, the window counts as loaded when its
+//!   picture has rested for 0.8 s and the pointer is no busy one. Answers which of the two.
 //! - `cursor NAME`: the pointer has that shape, such as `text`, `pointer`, `wait`, `default`.
 //! - `clipboard`: something new was copied.
 //! - `file PATH`: that file exists.
@@ -40,6 +43,8 @@ const POLL: Duration = Duration::from_millis(40);
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STABLE: Duration = Duration::from_millis(500);
 const DEFAULT_TOLERANCE: u8 = 8;
+/// How long the picture rests before a window without accessibility counts as loaded.
+const LOADED_QUIET: Duration = Duration::from_millis(800);
 const DEFAULT_SIMILARITY: f64 = 0.95;
 /// How far apart the parts of two pixels may be to count as alike in an image search.
 const ALIKE: u8 = 24;
@@ -160,6 +165,8 @@ pub enum Condition {
     File(PathBuf),
     /// A line of text that text recognition finds in the picture.
     Text(String),
+    /// The document in the window has loaded.
+    Loaded,
 }
 
 /// `#RRGGBB`, with or without the `#`.
@@ -214,6 +221,7 @@ impl Condition {
                 }
             }
             ["text", pattern @ ..] if !pattern.is_empty() => Self::Text(pattern.join(" ")),
+            ["loaded"] => Self::Loaded,
             ["cursor", name] => Self::Cursor(name.to_string()),
             ["clipboard"] => Self::Clipboard,
             ["file", path @ ..] if !path.is_empty() => Self::File(path.join(" ").into()),
@@ -221,7 +229,7 @@ impl Condition {
                 return Err(
                     "expected a condition: ready, window [GLOB], title GLOB, closed, exited, \
                      stable [MS], changed [X,Y,W,H], pixel X Y #RRGGBB [TOLERANCE], \
-                     image FILE [SIMILARITY], text GLOB, cursor NAME, clipboard or file PATH"
+                     image FILE [SIMILARITY], text GLOB, loaded, cursor NAME, clipboard or file PATH"
                         .into(),
                 );
             }
@@ -343,6 +351,9 @@ pub struct Watcher {
     picture: Option<(u64, Picture)>,
     /// The lines of text read from the picture, and the damage count they are of.
     lines: Option<(u64, Vec<super::text::Line>)>,
+    display: String,
+    /// The accessibility bus of the window: not tried yet, there, or not to be had.
+    tree: Option<Option<super::a11y::Tree>>,
 }
 
 impl Watcher {
@@ -357,6 +368,8 @@ impl Watcher {
             scratch: Scratch::new("shot.png")?,
             picture: None,
             lines: None,
+            display: display.to_string(),
+            tree: None,
         })
     }
 
@@ -385,6 +398,15 @@ impl Watcher {
             self.lines = Some((status.damage, lines));
         }
         Ok(&self.lines.as_ref().expect("just read").1)
+    }
+
+    /// Whether the documents in the window have loaded, if the programs say.
+    pub fn documents_loaded(&mut self) -> Option<bool> {
+        let display = &self.display;
+        let tree = self
+            .tree
+            .get_or_insert_with(|| super::a11y::Tree::of(display).ok());
+        super::a11y::loaded(&tree.as_ref()?.items().ok()?)
     }
 
     /// The titles and app ids of the windows.
@@ -468,6 +490,17 @@ fn check(
             let lines = watcher.lines(status)?;
             let found = lines.iter().find(|line| glob(pattern, &line.text));
             Ok(found.map(|line| format!("{} {} {}", line.middle().0, line.middle().1, line.text)))
+        }
+        Condition::Loaded => {
+            // Asking takes a moment, so only when the picture has come to rest a little.
+            if status.windows == 0 || status.quiet < Duration::from_millis(150) {
+                return Ok(None);
+            }
+            if let Some(loaded) = watcher.documents_loaded() {
+                return seen(loaded, "accessibility".into());
+            }
+            let busy = ["wait", "progress"].contains(&status.cursor.as_str());
+            seen(status.quiet >= LOADED_QUIET && !busy, "picture".into())
         }
         Condition::Cursor(name) => seen(status.cursor == *name, status.cursor.clone()),
         Condition::Clipboard => seen(status.clipboard != start.status.clipboard, String::new()),

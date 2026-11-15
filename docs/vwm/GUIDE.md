@@ -35,14 +35,15 @@ Positions are pixels from the top left corner of the window. The window is 1280x
 | `shot NAME [FILE] [--region X,Y,W,H] [--cursor]`, `pixel NAME X Y` | pictures |
 | `find NAME FILE.png [SIMILARITY]` | where a small picture shows in the window |
 | `clip NAME get\|set TEXT` | the window's own clipboard |
-| `text NAME [--via ocr\|clipboard] [--find GLOB] [--where]`, `click-text NAME GLOB` | read text, click on text |
+| `text NAME [--via a11y\|ocr\|clipboard] [--find GLOB] [--where]`, `click-text NAME GLOB` | read text, click on text |
+| `ui NAME tree`, `ui NAME press LABEL`, `ui NAME set LABEL TEXT` | controls through the accessibility interface |
 | `wait NAME CONDITION [--timeout S]` | wait for a state |
 
 `wirbel vwm --help` has every option. A wait whose time runs out exits with status 3, so shell
 scripts can tell it from a failure (1).
 
 Wait conditions: `ready`, `window [GLOB]`, `title GLOB`, `closed`, `exited`, `stable [MS]`,
-`changed [X,Y,W,H]`, `pixel X Y #RRGGBB`, `image FILE.png`, `text GLOB`, `cursor NAME`,
+`changed [X,Y,W,H]`, `pixel X Y #RRGGBB`, `image FILE.png`, `text GLOB`, `loaded`, `cursor NAME`,
 `clipboard`, `file PATH`.
 
 ## Good to know
@@ -58,6 +59,8 @@ Wait conditions: `ready`, `window [GLOB]`, `title GLOB`, `closed`, `exited`, `st
   `wirbel vwm open -- firefox --profile DIR`.
 - What the hidden wirbel and the program print is in `~/.local/state/wirbel/vwm/NAME/shadow.log`.
 - Invisible windows end with the desktop: logging out or `wirbel restart` closes them.
+- `text --via a11y` and `ui` ask the program itself (GTK, Qt, browsers): exact text, controls
+  by name, and `wait NAME loaded` knows when a page has loaded.
 - Reading text from a picture needs the program `tesseract` installed (and a language pack);
   without it `text --via clipboard` still works where a program has select all and copy.
 - Invisible windows are rendered by `vwm_gpu` of the configuration; without it by `render_gpu`,
@@ -76,6 +79,5 @@ wirbel macro run examples/macros/page-title.wm url=https://example.com
 
 ## Not there yet
 
-Taking over a window that is already open, reading text through the accessibility interface,
-sound and video recording, the remote control protocol of browsers and a window to look into an
+Taking over a window that is already open, sound and video recording, the remote control protocol of browsers and a window to look into an
 invisible one are planned; [PROGRESS.md](PROGRESS.md) says how far they are.

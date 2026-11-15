@@ -8,6 +8,7 @@
 //! `shadow ...` requests; everything else a shadow understands is what any wirbel understands
 //! (`inject`, `windows`, `subscribe`).
 
+pub mod a11y;
 pub mod cli;
 pub mod clip;
 pub mod json;
