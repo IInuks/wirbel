@@ -97,6 +97,10 @@ pub struct Manager {
     pub binary: Option<PathBuf>,
     /// Where the folders of the invisible windows go, if not the state folder.
     pub state_root: Option<PathBuf>,
+    /// In a shadow: the pictures that wait for the next frame, see `super::shot`.
+    pub shots: Vec<super::shot::Shot>,
+    /// See `Wirbel::reply_sender`.
+    pub(crate) replies: Option<Sender<(u64, String)>>,
 }
 
 /// What `vwm open` asks for.

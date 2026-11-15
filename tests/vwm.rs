@@ -242,3 +242,180 @@ fn windows_of_a_shadow_stay_off_the_desktop_and_get_its_input() {
     hidden.sync();
     assert_eq!(hidden.state.closed.len(), 2);
 }
+
+/// A shadow with one green window of a test client that fills it.
+fn hidden_window(desk: &Desk, name: &str) -> (String, Client, usize) {
+    assert_eq!(desk.open(Some(name), "sleep 60"), format!("ok {name}"));
+    let display = desk.display(name);
+    let mut client = Client::connect_path(&socket_of(&display));
+    let window = client.open_window(GREEN);
+    client.sync();
+    client.take_input();
+    (display, client, window)
+}
+
+#[test]
+fn the_pointer_goes_to_a_place_and_clicks_there() {
+    let desk = Desk::start("pointer");
+    let (display, mut hidden, _) = hidden_window(&desk, "hidden");
+    assert_eq!(ask_display(&display, "inject at 100 50").unwrap(), "ok");
+    assert_eq!(
+        ask_display(&display, "inject button left down").unwrap(),
+        "ok"
+    );
+    assert_eq!(
+        ask_display(&display, "inject button left up").unwrap(),
+        "ok"
+    );
+    assert_eq!(ask_display(&display, "inject at 9000 9000").unwrap(), "ok");
+    hidden.sync();
+    const BTN_LEFT: u32 = 0x110;
+    use wayland_client::protocol::wl_pointer::ButtonState;
+    assert_eq!(
+        hidden.take_input(),
+        [
+            // The pointer was over the window already, which opened under it.
+            Input::PointerMotion(100.0, 50.0),
+            Input::Button(BTN_LEFT, ButtonState::Pressed),
+            Input::Button(BTN_LEFT, ButtonState::Released),
+            // Kept on the output.
+            Input::PointerMotion(639.0, 399.0),
+        ]
+    );
+    assert!(
+        ask_display(&display, "inject at 1")
+            .unwrap()
+            .starts_with("error ")
+    );
+}
+
+#[test]
+fn a_picture_of_a_shadow_is_what_its_window_shows() {
+    use wirbel::vwm::shot::read_png;
+    let desk = Desk::start("shot");
+    let (display, _hidden, _) = hidden_window(&desk, "hidden");
+    let file = desk.root.join("shot.png");
+    let request = format!("shadow shot\t{}", file.display());
+    assert_eq!(ask_display(&display, &request).unwrap(), "ok 640x400");
+    let (rgb, width, height) = read_png(&file).unwrap();
+    assert_eq!((width, height), (640, 400));
+    assert!(
+        rgb.chunks_exact(3).all(|pixel| pixel == [0, 255, 0]),
+        "not all green"
+    );
+
+    // A part of it, and with the pointer, which is not green.
+    assert_eq!(ask_display(&display, "inject at 20 20").unwrap(), "ok");
+    let request = format!("shadow shot\t{}\t10,10,40,30\tcursor", file.display());
+    assert_eq!(ask_display(&display, &request).unwrap(), "ok 40x30");
+    let (rgb, width, height) = read_png(&file).unwrap();
+    assert_eq!((width, height), (40, 30));
+    assert!(
+        rgb.chunks_exact(3).any(|pixel| pixel != [0, 255, 0]),
+        "no pointer"
+    );
+    let request = format!("shadow shot\t{}\t10,10,40,30", file.display());
+    assert_eq!(ask_display(&display, &request).unwrap(), "ok 40x30");
+    let (rgb, ..) = read_png(&file).unwrap();
+    assert!(
+        rgb.chunks_exact(3).all(|pixel| pixel == [0, 255, 0]),
+        "a pointer"
+    );
+
+    let request = format!("shadow shot\t{}\t700,0,10,10", file.display());
+    assert!(
+        ask_display(&display, &request)
+            .unwrap()
+            .starts_with("error ")
+    );
+    assert!(
+        ask_display(&display, "shadow shot\tshot.png")
+            .unwrap()
+            .starts_with("error ")
+    );
+    // The desktop is no shadow.
+    let desktop = desk
+        .compositor
+        .wayland_display()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        ask_display(&desktop, &request)
+            .unwrap()
+            .starts_with("error this wirbel")
+    );
+}
+
+#[test]
+fn the_clipboard_of_a_shadow_is_read_and_set_from_outside() {
+    use wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager;
+    let desk = Desk::start("clip");
+    let (display, mut hidden, _) = hidden_window(&desk, "hidden");
+    let file = desk.root.join("clip.txt");
+    let get = format!("shadow clip get\t{}", file.display());
+    assert!(
+        ask_display(&display, &get)
+            .unwrap()
+            .starts_with("error the clipboard is empty")
+    );
+
+    // The window copies something.
+    let manager: WlDataDeviceManager = hidden.bind(1..=3);
+    let seat = hidden.seat();
+    let device = manager.get_data_device(&seat, &hidden.handle, ());
+    let source = manager.create_data_source(&hidden.handle, ());
+    source.offer("text/plain".into());
+    assert_eq!(ask_display(&display, "inject tap a").unwrap(), "ok");
+    hidden.sync();
+    device.set_selection(Some(&source), hidden.state.key_serial);
+    hidden.sync();
+
+    // The answer comes once the window has handed its text over.
+    let asking = {
+        let (display, get) = (display.clone(), get.clone());
+        std::thread::spawn(move || ask_display(&display, &get).unwrap())
+    };
+    while !asking.is_finished() {
+        hidden.sync();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        asking.join().unwrap(),
+        format!("ok {}", CLIPBOARD_TEXT.len())
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), CLIPBOARD_TEXT);
+
+    // Text from outside replaces it: the window loses its selection and can paste ours.
+    std::fs::write(&file, "from outside, with ümlauts").unwrap();
+    let set = format!("shadow clip set\t{}", file.display());
+    assert_eq!(ask_display(&display, &set).unwrap(), "ok");
+    hidden.sync();
+    assert!(hidden.state.source_events.contains(&SourceEvent::Cancelled));
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(ask_display(&display, &get).unwrap(), "ok 27");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "from outside, with ümlauts"
+    );
+
+    let offer = hidden
+        .state
+        .selection
+        .clone()
+        .expect("no offer of our text");
+    let (read, write) = std::io::pipe().unwrap();
+    use std::os::fd::AsFd;
+    offer.receive("text/plain;charset=utf-8".into(), write.as_fd());
+    hidden.sync();
+    drop(write);
+    let mut text = String::new();
+    use std::io::Read;
+    { read }.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "from outside, with ümlauts");
+
+    assert!(
+        ask_display(&display, "shadow clip get\tclip.txt")
+            .unwrap()
+            .starts_with("error ")
+    );
+}

@@ -21,7 +21,7 @@ use smithay::{
 use crate::Wirbel;
 
 impl SelectionHandler for Wirbel {
-    type SelectionUserData = ();
+    type SelectionUserData = crate::vwm::clip::Held;
 
     /// X11 clients get to see what Wayland clients copied.
     fn new_selection(
@@ -44,8 +44,13 @@ impl SelectionHandler for Wirbel {
         mime_type: String,
         fd: OwnedFd,
         _seat: Seat<Self>,
-        _user_data: &(),
+        held: &crate::vwm::clip::Held,
     ) {
+        // Text the compositor holds itself, see `crate::vwm::clip`.
+        if let Some(text) = held {
+            crate::vwm::clip::write_out(fd, text.clone());
+            return;
+        }
         if let Some(xwm) = self.xwm.as_mut()
             && let Err(err) = xwm.send_selection(target, mime_type, fd)
         {

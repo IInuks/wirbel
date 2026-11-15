@@ -29,6 +29,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 xcursor = "0.3"
+# Screenshots of invisible windows and comparing pictures, see `src/vwm`.
+png = "0.18"
 rustix = { version = "1", features = ["pipe"], optional = true }
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"], optional = true }

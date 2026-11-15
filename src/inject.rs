@@ -15,6 +15,8 @@
 //!   `chord SUPER+SHIFT+Escape`. The key is read like the key of a bind.
 //! - `inject type TEXT` types the rest of the line.
 //! - `inject motion DX DY` moves the mouse by that much, like a relative libinput motion.
+//! - `inject at X Y` puts the pointer at that place of the layout, like a tablet or a touchpad
+//!   in absolute mode would.
 //! - `inject button left|right|middle down|up`.
 //! - `inject wheel STEPS` turns the wheel by that many notches, positive is down.
 //!
@@ -56,6 +58,7 @@ pub enum Inject {
     Chord { modifiers: Modifiers, key: Keysym },
     Type(String),
     Motion { dx: f64, dy: f64 },
+    At { x: f64, y: f64 },
     Button { button: u32, down: bool },
     Wheel(f64),
 }
@@ -186,6 +189,7 @@ impl Inject {
             }
             Self::Type(text) => format!("inject type {text}"),
             Self::Motion { dx, dy } => format!("inject motion {dx:?} {dy:?}"),
+            Self::At { x, y } => format!("inject at {x:?} {y:?}"),
             Self::Button { button, down } => {
                 let direction = if *down { "down" } else { "up" };
                 format!("inject button {} {direction}", button_name(*button))
@@ -227,6 +231,10 @@ impl Inject {
                 dx: parse_number(dx)?,
                 dy: parse_number(dy)?,
             },
+            ["at", x, y] => Self::At {
+                x: parse_number(x)?,
+                y: parse_number(y)?,
+            },
             ["button", name, direction] => Self::Button {
                 button: parse_button_name(name)?,
                 down: parse_direction(direction)?,
@@ -235,7 +243,7 @@ impl Inject {
             _ => {
                 return Err(
                     "expected inject key NAME down|up, tap NAME, chord MODS+KEY, type TEXT, \
-                     motion DX DY, button left|right|middle down|up or wheel STEPS"
+                     motion DX DY, at X Y, button left|right|middle down|up or wheel STEPS"
                         .into(),
                 );
             }
@@ -297,6 +305,10 @@ impl Wirbel {
                 let delta = (dx, dy).into();
                 self.on_pointer_delta(delta, delta, InputTime::now());
             }
+            Inject::At { x, y } => {
+                let location = self.clamp_to_outputs((x, y).into());
+                self.on_pointer_absolute(location, InputTime::now());
+            }
             Inject::Button { button, down } => {
                 let state = if down {
                     ButtonState::Pressed
@@ -318,9 +330,9 @@ impl Wirbel {
         Ok(())
     }
 
-    /// The key that makes `keysym` in the active layout, and whether that takes Shift. Keys on
-    /// further levels (AltGr) are refused: which modifiers reach them depends on the key type.
-    fn key_for(&mut self, keysym: Keysym) -> Result<(Keycode, bool), String> {
+    /// The key that makes `keysym` in the active layout, and the level it is on: 0 plain,
+    /// 1 with Shift, 2 with AltGr, 3 with both, as the usual four-level keys have it.
+    fn key_for(&mut self, keysym: Keysym) -> Result<(Keycode, u32), String> {
         let keyboard = self.seat.get_keyboard().ok_or("no keyboard")?;
         let found = keyboard.with_xkb_state(self, |context| {
             let xkb = context.xkb().lock().unwrap();
@@ -330,7 +342,7 @@ impl Wirbel {
             let mut best: Option<(Keycode, u32)> = None;
             for raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
                 let code = Keycode::new(raw);
-                let levels = keymap.num_levels_for_key(code, layout).min(2);
+                let levels = keymap.num_levels_for_key(code, layout).min(4);
                 let level = (0..levels).find(|level| {
                     keymap
                         .key_get_syms_by_level(code, layout, *level)
@@ -346,21 +358,29 @@ impl Wirbel {
         });
         let (code, level) = found
             .ok_or_else(|| format!("no key makes `{}` in this keymap", keysym_name(keysym)))?;
-        Ok((code, level == 1))
+        Ok((code, level))
     }
 
     fn press_evdev(&mut self, evdev: u32, state: KeyState) {
         self.on_key((evdev + XKB_OFFSET).into(), state, InputTime::now());
     }
 
-    fn type_key(&mut self, (code, shift): (Keycode, bool)) {
-        if shift {
-            self.press_evdev(KEY_LEFTSHIFT, KeyState::Pressed);
+    fn type_key(&mut self, (code, level): (Keycode, u32)) {
+        let held: Vec<u32> = [
+            (level & 1 != 0, KEY_LEFTSHIFT),
+            (level & 2 != 0, KEY_RIGHTALT),
+        ]
+        .into_iter()
+        .filter(|(needed, _)| *needed)
+        .map(|(_, key)| key)
+        .collect();
+        for key in &held {
+            self.press_evdev(*key, KeyState::Pressed);
         }
         self.on_key(code, KeyState::Pressed, InputTime::now());
         self.on_key(code, KeyState::Released, InputTime::now());
-        if shift {
-            self.press_evdev(KEY_LEFTSHIFT, KeyState::Released);
+        for key in held.iter().rev() {
+            self.press_evdev(*key, KeyState::Released);
         }
     }
 }

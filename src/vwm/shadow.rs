@@ -10,6 +10,7 @@
 //!
 //! Requests on its control socket: `shadow close` asks every window to close, `shadow resize WxH`
 //! changes the size of the output and with it of the window, `shadow size` answers `WxH`.
+//! `shadow shot` and `shadow clip` are in `super::shot` and `super::clip`.
 
 use std::{
     env,
@@ -179,11 +180,24 @@ pub fn end(state: &mut Wirbel) {
     }
 }
 
-/// A `shadow ...` request.
-pub(crate) fn request(state: &mut Wirbel, rest: &str) -> Result<String, String> {
+/// A `shadow ...` request. `Ok(None)` answers later.
+pub(crate) fn request(state: &mut Wirbel, peer: u64, rest: &str) -> Result<Option<String>, String> {
     if state.shadow.is_none() {
         return Err("this wirbel is not a shadow".into());
     }
+    if let Some(shot) = rest.strip_prefix("shot\t") {
+        state.vwm.shots.push(super::shot::Shot::parse(peer, shot)?);
+        state.needs_redraw = true;
+        (state.redraw)();
+        return Ok(None);
+    }
+    if let Some(clip) = rest.strip_prefix("clip") {
+        return super::clip::request(state, peer, clip);
+    }
+    plain_request(state, rest).map(Some)
+}
+
+fn plain_request(state: &mut Wirbel, rest: &str) -> Result<String, String> {
     let mut words = rest.split_ascii_whitespace();
     match (words.next(), words.next(), words.next()) {
         (Some("close"), None, None) => {

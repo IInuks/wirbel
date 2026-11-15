@@ -14,7 +14,7 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 2, step 2.1.
+Phase 3, step 3.1.
 
 ## Phases
 
@@ -33,11 +33,11 @@ Phase 2, step 2.1.
 - [x] 1.8 integration tests `tests/vwm.rs`
 
 ### 2 Control
-- [ ] 2.1 absolute pointer requests: move, click, drag, scroll
-- [ ] 2.2 `capture` request writing a PNG
-- [ ] 2.3 clipboard get and set
-- [ ] 2.4 command line `vwm type|key|click|move|drag|scroll|shot|clip`
-- [ ] 2.5 tests
+- [x] 2.1 absolute pointer requests: move, click, drag, scroll
+- [x] 2.2 `capture` request writing a PNG
+- [x] 2.3 clipboard get and set
+- [x] 2.4 command line `vwm type|key|click|move|drag|scroll|shot|clip`
+- [x] 2.5 tests
 
 ### 3 Events and waiting
 - [ ] 3.1 shadow events: damage, client exit, cursor, clipboard
@@ -90,5 +90,14 @@ Phase 2, step 2.1.
   reason is in its `shadow.log`.
 - The browser recipes (own profile for Firefox and the Chromium family) are covered by unit
   tests only; try a real browser in the smoke script of phase 2.
+- `inject type` reaches the four levels of a key (plain, Shift, AltGr, both). Text the layout
+  has no key for goes through `vwm paste` (clipboard and CTRL+v).
+- Pictures and clipboard text travel as files named in the request, not over the socket: a
+  request line is at most 4096 bytes. Their answers come late, through `Wirbel::reply_sender`
+  or after the next frame.
+- `shadow shot` works in the headless backend only (`vwm::shot::take` is called from its
+  render). Parked windows (phase 7) need the same from the other backends.
+- The clipboard type of the compositor is `vwm::clip::Held`: `None` stands for the X server,
+  `Some` is text set from outside.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

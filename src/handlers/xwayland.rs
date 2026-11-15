@@ -425,6 +425,13 @@ impl XwmHandler for Wirbel {
         mime_type: String,
         fd: OwnedFd,
     ) {
+        if selection == SelectionTarget::Clipboard {
+            let held = current_data_device_selection_userdata(&self.seat).map(|held| held.clone());
+            if let Some(Some(text)) = held {
+                crate::vwm::clip::write_out(fd, text);
+                return;
+            }
+        }
         let sent = match selection {
             SelectionTarget::Clipboard => {
                 request_data_device_client_selection(&self.seat, mime_type, fd).map_err(|_| ())
@@ -441,10 +448,10 @@ impl XwmHandler for Wirbel {
     fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
         match selection {
             SelectionTarget::Clipboard => {
-                set_data_device_selection(&self.display_handle, &self.seat, mime_types, ());
+                set_data_device_selection(&self.display_handle, &self.seat, mime_types, None);
             }
             SelectionTarget::Primary => {
-                set_primary_selection(&self.display_handle, &self.seat, mime_types, ());
+                set_primary_selection(&self.display_handle, &self.seat, mime_types, None);
             }
         }
     }
@@ -452,7 +459,10 @@ impl XwmHandler for Wirbel {
     fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
         match selection {
             SelectionTarget::Clipboard => {
-                if current_data_device_selection_userdata(&self.seat).is_some() {
+                // Only what stands for the X server goes with it, not text of our own.
+                let ours = current_data_device_selection_userdata(&self.seat)
+                    .is_some_and(|held| held.is_none());
+                if ours {
                     clear_data_device_selection(&self.display_handle, &self.seat);
                 }
             }

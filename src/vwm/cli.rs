@@ -19,7 +19,16 @@ pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--sh
        wirbel vwm list [--json]
        wirbel vwm info NAME
        wirbel vwm resize NAME WxH
-       wirbel vwm close NAME...|all [--kill]";
+       wirbel vwm close NAME...|all [--kill]
+       wirbel vwm type NAME TEXT...
+       wirbel vwm key NAME KEY|MODS+KEY...
+       wirbel vwm click NAME X Y [left|right|middle] [COUNT]
+       wirbel vwm move NAME X Y [SECONDS]
+       wirbel vwm drag NAME X1 Y1 X2 Y2 [left|right|middle]
+       wirbel vwm scroll NAME STEPS [X Y]
+       wirbel vwm shot NAME [FILE.png] [--region X,Y,W,H] [--cursor]
+       wirbel vwm clip NAME get | set TEXT...
+       wirbel vwm paste NAME [--key MODS+KEY] TEXT...";
 
 pub const HELP: &str =
     "vwm runs programs in invisible windows: they never show on the screen and never take the
@@ -34,7 +43,22 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
       info       one of them, with the windows its program has open
       resize     give the window another size
       close      ask the windows to close and end what does not; --kill ends it at once
-`wirbel vwm invisible create|close ...` mean the same as `wirbel vwm open|close ...`.";
+      type       type TEXT on the keyboard of the window, a line end is Return. Only what the
+                 keyboard layout has keys for; `paste` takes any text
+      key        press keys one after another: a key name such as Return, Escape, Tab, F5, a, or
+                 a combination such as CTRL+l or CTRL+SHIFT+t. ENTER, ESC, DEL and the like work
+      click      move the pointer to X Y of the window and click, COUNT times (2 is a double click)
+      move       move the pointer there, in SECONDS if given, at once if not
+      drag       press at X1 Y1, move to X2 Y2, let go
+      scroll     turn the wheel STEPS notches, down if positive, at X Y if given
+      shot       write a picture of the window as PNG and print its path. Without FILE it is
+                 NAME.png in the current folder. --cursor draws the pointer too
+      clip       print the text in the clipboard of the window, or put TEXT there. It is the
+                 window's own clipboard, not the one of the desktop
+      paste      put TEXT in that clipboard and press CTRL+v, or what --key names (terminals
+                 want CTRL+SHIFT+v)
+`wirbel vwm invisible create|close|screenshot ...` mean the same as `wirbel vwm open|close|shot ...`.
+Positions are pixels from the top left corner of the window.";
 
 /// How long one answer of a compositor may take. Starting a shadow includes starting an X
 /// server and a session bus.
@@ -312,6 +336,398 @@ fn close(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// A connection to the control socket of a shadow, for several requests in a row.
+pub struct Session {
+    reader: BufReader<UnixStream>,
+}
+
+impl Session {
+    /// To the shadow behind this name.
+    pub fn of(name: &str) -> Result<Self, String> {
+        Self::on(&display_of(name)?)
+    }
+
+    /// To the wirbel of this Wayland display.
+    pub fn on(display: &str) -> Result<Self, String> {
+        let path = socket_path(display.as_ref()).ok_or("cannot tell where the socket is")?;
+        let stream = UnixStream::connect(&path)
+            .map_err(|err| format!("no wirbel on {display}: {err} ({})", path.display()))?;
+        let timeout = stream.set_read_timeout(Some(ANSWER_TIMEOUT));
+        timeout.map_err(|err| format!("failed to set a timeout: {err}"))?;
+        Ok(Self {
+            reader: BufReader::new(stream),
+        })
+    }
+
+    /// Sends one request and returns its answer without `ok `.
+    pub fn ask(&mut self, request: &str) -> Result<String, String> {
+        self.reader
+            .get_mut()
+            .write_all(format!("{request}\n").as_bytes())
+            .map_err(|err| format!("failed to send: {err}"))?;
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => Err("the invisible window went away".into()),
+            Ok(_) => answer_of(line.trim_end_matches(['\n', '\r'])),
+            Err(err) => Err(format!("no answer: {err}")),
+        }
+    }
+
+    /// Where the pointer is.
+    pub fn position(&mut self) -> Result<(f64, f64), String> {
+        let answer = self.ask("position")?;
+        let mut words = answer.split_ascii_whitespace().skip(1);
+        let mut number = || words.next().and_then(|word| word.parse::<f64>().ok());
+        match (number(), number()) {
+            (Some(x), Some(y)) => Ok((x, y)),
+            _ => Err(format!("unexpected answer `{answer}`")),
+        }
+    }
+
+    /// Moves the pointer to a place, in steps over `time` if that is not zero.
+    pub fn glide(&mut self, (x, y): (f64, f64), time: Duration) -> Result<(), String> {
+        if !time.is_zero() {
+            let (from_x, from_y) = self.position()?;
+            let steps = (time.as_millis() / GLIDE_STEP.as_millis()).max(1) as u32;
+            for step in 1..steps {
+                let part = f64::from(step) / f64::from(steps);
+                let (sx, sy) = (from_x + (x - from_x) * part, from_y + (y - from_y) * part);
+                self.ask(&format!("inject at {sx:?} {sy:?}"))?;
+                std::thread::sleep(GLIDE_STEP);
+            }
+        }
+        self.ask(&format!("inject at {x:?} {y:?}")).map(drop)
+    }
+
+    /// Presses a button, holds it as long as a finger would, and lets go.
+    pub fn press(&mut self, button: &str) -> Result<(), String> {
+        self.ask(&format!("inject button {button} down"))?;
+        std::thread::sleep(CLICK_HOLD);
+        self.ask(&format!("inject button {button} up")).map(drop)
+    }
+}
+
+/// How long a click holds the button: a program that looks once per frame has to see it down.
+const CLICK_HOLD: Duration = Duration::from_millis(30);
+/// Between the clicks of a double click.
+const CLICK_GAP: Duration = Duration::from_millis(60);
+/// How often a slow move sets the pointer.
+const GLIDE_STEP: Duration = Duration::from_millis(10);
+/// How long a drag takes, so that the program sees it as one.
+const DRAG_TIME: Duration = Duration::from_millis(300);
+/// The most text one request carries: a request line is at most 4096 bytes.
+const TYPE_CHUNK: usize = 500;
+
+/// The name of a key as the shadow takes it: names people type are turned into the keysym.
+pub fn key_name(name: &str) -> String {
+    let known = match name.to_ascii_uppercase().as_str() {
+        "ENTER" | "RETURN" => "Return",
+        "ESC" | "ESCAPE" => "Escape",
+        "DEL" | "DELETE" => "Delete",
+        "BACKSPACE" => "BackSpace",
+        "TAB" => "Tab",
+        "SPACE" => "space",
+        "UP" => "Up",
+        "DOWN" => "Down",
+        "LEFT" => "Left",
+        "RIGHT" => "Right",
+        "HOME" => "Home",
+        "END" => "End",
+        "PGUP" | "PAGEUP" => "Page_Up",
+        "PGDN" | "PAGEDOWN" => "Page_Down",
+        "INS" | "INSERT" => "Insert",
+        _ => return name.to_string(),
+    };
+    known.to_string()
+}
+
+/// The request that presses `key`: one key, or a combination like `CTRL+SHIFT+t`.
+pub fn key_request(key: &str) -> String {
+    match key.rsplit_once('+') {
+        Some((modifiers, name)) if !modifiers.is_empty() && !name.is_empty() => {
+            format!("inject chord {modifiers}+{}", key_name(name))
+        }
+        _ => format!("inject tap {}", key_name(key)),
+    }
+}
+
+/// The requests that type `text`: pieces that fit a request, Return for line ends.
+pub fn type_requests(text: &str) -> Vec<String> {
+    let mut requests = Vec::new();
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            requests.push("inject tap Return".to_string());
+        }
+        let chars: Vec<char> = line.chars().filter(|c| *c != '\r').collect();
+        for piece in chars.chunks(TYPE_CHUNK) {
+            requests.push(format!("inject type {}", piece.iter().collect::<String>()));
+        }
+    }
+    requests
+}
+
+fn number(text: &str) -> Result<f64, String> {
+    let value: f64 = text
+        .parse()
+        .map_err(|_| format!("expected a number, got `{text}`"))?;
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or(format!("not a number: {text}"))
+}
+
+fn button(name: Option<&String>) -> Result<&str, String> {
+    match name.map(String::as_str) {
+        None => Ok("left"),
+        Some(name @ ("left" | "right" | "middle")) => Ok(name),
+        Some(other) => Err(format!("expected left, right or middle, got `{other}`")),
+    }
+}
+
+fn type_text(args: &[String]) -> Result<(), String> {
+    let [name, words @ ..] = args else {
+        return Err(USAGE.into());
+    };
+    if words.is_empty() {
+        return Err(USAGE.into());
+    }
+    let mut session = Session::of(name)?;
+    for request in type_requests(&words.join(" ")) {
+        session.ask(&request)?;
+    }
+    Ok(())
+}
+
+fn keys(args: &[String]) -> Result<(), String> {
+    let [name, keys @ ..] = args else {
+        return Err(USAGE.into());
+    };
+    if keys.is_empty() {
+        return Err(USAGE.into());
+    }
+    let mut session = Session::of(name)?;
+    for key in keys {
+        session.ask(&key_request(key))?;
+    }
+    Ok(())
+}
+
+fn click(args: &[String]) -> Result<(), String> {
+    let (name, x, y, rest) = match args {
+        [name, x, y, rest @ ..] if rest.len() <= 2 => (name, number(x)?, number(y)?, rest),
+        _ => return Err(USAGE.into()),
+    };
+    // The button and the count may come in either order or not at all.
+    let count = rest.iter().find_map(|word| word.parse::<u32>().ok());
+    let named = rest.iter().find(|word| word.parse::<u32>().is_err());
+    let button = button(named)?;
+    let count = count.unwrap_or(1).clamp(1, 10);
+    let mut session = Session::of(name)?;
+    session.glide((x, y), Duration::ZERO)?;
+    for index in 0..count {
+        if index > 0 {
+            std::thread::sleep(CLICK_GAP);
+        }
+        session.press(button)?;
+    }
+    Ok(())
+}
+
+fn move_pointer(args: &[String]) -> Result<(), String> {
+    let (name, x, y, time) = match args {
+        [name, x, y] => (name, number(x)?, number(y)?, 0.0),
+        [name, x, y, time] => (name, number(x)?, number(y)?, number(time)?),
+        _ => return Err(USAGE.into()),
+    };
+    let time = Duration::try_from_secs_f64(time).map_err(|_| "the time cannot be negative")?;
+    Session::of(name)?.glide((x, y), time)
+}
+
+fn drag(args: &[String]) -> Result<(), String> {
+    let (name, from, to, button) = match args {
+        [name, x1, y1, x2, y2, rest @ ..] if rest.len() <= 1 => (
+            name,
+            (number(x1)?, number(y1)?),
+            (number(x2)?, number(y2)?),
+            button(rest.first())?,
+        ),
+        _ => return Err(USAGE.into()),
+    };
+    let mut session = Session::of(name)?;
+    session.glide(from, Duration::ZERO)?;
+    session.ask(&format!("inject button {button} down"))?;
+    std::thread::sleep(CLICK_HOLD);
+    let moved = session.glide(to, DRAG_TIME);
+    std::thread::sleep(CLICK_HOLD);
+    // Whatever went wrong on the way, the button comes up again.
+    session.ask(&format!("inject button {button} up"))?;
+    moved
+}
+
+fn scroll(args: &[String]) -> Result<(), String> {
+    let (name, steps, place) = match args {
+        [name, steps] => (name, number(steps)?, None),
+        [name, steps, x, y] => (name, number(steps)?, Some((number(x)?, number(y)?))),
+        _ => return Err(USAGE.into()),
+    };
+    let mut session = Session::of(name)?;
+    if let Some(place) = place {
+        session.glide(place, Duration::ZERO)?;
+    }
+    session.ask(&format!("inject wheel {steps:?}")).map(drop)
+}
+
+/// `path` from the root, so that the shadow, which runs in another folder, finds it.
+fn absolute(path: &str) -> Result<String, String> {
+    let path = std::path::absolute(path).map_err(|err| format!("{path}: {err}"))?;
+    let text = path.to_str().ok_or("the path is no valid text")?;
+    if text.contains(['\t', '\n']) {
+        return Err("the path must not hold tabs or line ends".into());
+    }
+    Ok(text.to_string())
+}
+
+/// What `shot` was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShotArgs {
+    pub name: String,
+    pub file: Option<String>,
+    pub region: Option<String>,
+    pub cursor: bool,
+}
+
+pub fn parse_shot(args: &[String]) -> Result<ShotArgs, String> {
+    let mut plain = Vec::new();
+    let (mut region, mut cursor) = (None, false);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--cursor" => cursor = true,
+            "--region" => {
+                let text = args.next().ok_or("--region needs X,Y,W,H")?;
+                super::shot::parse_region(text)?;
+                region = Some(text.clone());
+            }
+            flag if flag.starts_with("--") => return Err(USAGE.into()),
+            _ => plain.push(arg.clone()),
+        }
+    }
+    let mut plain = plain.into_iter();
+    let name = plain.next().ok_or(USAGE)?;
+    let file = plain.next();
+    if plain.next().is_some() {
+        return Err(USAGE.into());
+    }
+    Ok(ShotArgs {
+        name,
+        file,
+        region,
+        cursor,
+    })
+}
+
+/// Takes a picture of the shadow behind `name` into `file` and returns its size, `WxH`.
+pub fn take_shot(
+    name: &str,
+    file: &str,
+    region: Option<&str>,
+    cursor: bool,
+) -> Result<String, String> {
+    let request = format!(
+        "shadow shot\t{file}\t{}\t{}",
+        region.unwrap_or("-"),
+        if cursor { "cursor" } else { "-" }
+    );
+    ask_shadow(name, &request)
+}
+
+fn shot(args: &[String]) -> Result<(), String> {
+    let shot = parse_shot(args)?;
+    let file = shot.file.unwrap_or_else(|| format!("{}.png", shot.name));
+    let file = absolute(&file)?;
+    take_shot(&shot.name, &file, shot.region.as_deref(), shot.cursor)?;
+    println!("{file}");
+    Ok(())
+}
+
+/// A file for passing text to or from a shadow, private to this user and gone afterwards.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new() -> Result<Self, String> {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is not set")?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |time| time.subsec_nanos());
+        let name = format!("wirbel-vwm-clip-{}-{nanos}", std::process::id());
+        Ok(Self(std::path::PathBuf::from(dir).join(name)))
+    }
+
+    fn path(&self) -> String {
+        self.0.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The text in the clipboard of the shadow behind `name`.
+pub fn clip_get(name: &str) -> Result<String, String> {
+    let scratch = Scratch::new()?;
+    ask_shadow(name, &format!("shadow clip get\t{}", scratch.path()))?;
+    let bytes = std::fs::read(&scratch.0).map_err(|err| format!("no clipboard text: {err}"))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Puts `text` in the clipboard of the shadow behind `name`.
+pub fn clip_set(name: &str, text: &str) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let scratch = Scratch::new()?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&scratch.0)
+        .map_err(|err| format!("no scratch file: {err}"))?;
+    file.write_all(text.as_bytes())
+        .map_err(|err| format!("no scratch file: {err}"))?;
+    drop(file);
+    ask_shadow(name, &format!("shadow clip set\t{}", scratch.path())).map(drop)
+}
+
+fn clip(args: &[String]) -> Result<(), String> {
+    match args {
+        [name, get] if get == "get" => {
+            let text = clip_get(name)?;
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
+            Ok(())
+        }
+        [name, set, words @ ..] if set == "set" && !words.is_empty() => {
+            clip_set(name, &words.join(" "))
+        }
+        _ => Err(USAGE.into()),
+    }
+}
+
+fn paste(args: &[String]) -> Result<(), String> {
+    let (name, key, words) = match args {
+        [name, flag, key, words @ ..] if flag == "--key" => (name, key.as_str(), words),
+        [name, words @ ..] => (name, "CTRL+v", words),
+        _ => return Err(USAGE.into()),
+    };
+    if words.is_empty() {
+        return Err(USAGE.into());
+    }
+    clip_set(name, &words.join(" "))?;
+    ask_shadow(name, &key_request(key)).map(drop)
+}
+
 /// `wirbel vwm ARGS`.
 pub fn run(args: &[String]) -> Result<(), String> {
     // `invisible` is an optional word, and two commands have a second name.
@@ -328,6 +744,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "info" => info(rest),
         "resize" => resize(rest),
         "close" => close(rest),
+        "type" => type_text(rest),
+        "key" => keys(rest),
+        "click" => click(rest),
+        "move" => move_pointer(rest),
+        "drag" => drag(rest),
+        "scroll" => scroll(rest),
+        "shot" | "screenshot" => shot(rest),
+        "clip" => clip(rest),
+        "paste" => paste(rest),
         "--help" | "-h" | "help" => {
             println!("{USAGE}\n\n{HELP}");
             Ok(())
@@ -404,6 +829,51 @@ mod tests {
                 .starts_with("{\"name\":\"b1\",\"kind\":\"shadow\"")
         );
         assert!(row.json().contains("\"pid\":4242"));
+    }
+
+    #[test]
+    fn keys_by_the_names_people_type() {
+        assert_eq!(key_request("ENTER"), "inject tap Return");
+        assert_eq!(key_request("esc"), "inject tap Escape");
+        assert_eq!(key_request("a"), "inject tap a");
+        assert_eq!(key_request("F5"), "inject tap F5");
+        assert_eq!(key_request("CTRL+l"), "inject chord CTRL+l");
+        assert_eq!(key_request("CTRL+SHIFT+tab"), "inject chord CTRL+SHIFT+Tab");
+        // A lone plus is the plus key, not a combination without a key.
+        assert_eq!(key_request("+"), "inject tap +");
+    }
+
+    #[test]
+    fn text_is_typed_in_pieces_with_return_between_lines() {
+        assert_eq!(type_requests("hello"), ["inject type hello"]);
+        assert_eq!(
+            type_requests("a b\r\nc\n"),
+            [
+                "inject type a b",
+                "inject tap Return",
+                "inject type c",
+                "inject tap Return"
+            ]
+        );
+        let long = "x".repeat(TYPE_CHUNK + 1);
+        let requests = type_requests(&long);
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.len() < 4096));
+    }
+
+    #[test]
+    fn shots_parse() {
+        let shot = parse_shot(&words("b1 out.png --region 1,2,3,4 --cursor")).unwrap();
+        assert_eq!(shot.name, "b1");
+        assert_eq!(shot.file.as_deref(), Some("out.png"));
+        assert_eq!(shot.region.as_deref(), Some("1,2,3,4"));
+        assert!(shot.cursor);
+        let shot = parse_shot(&words("--cursor b1")).unwrap();
+        assert!(shot.file.is_none() && shot.region.is_none());
+        assert!(parse_shot(&words("b1 a.png b.png")).is_err());
+        assert!(parse_shot(&words("b1 --region 1,2")).is_err());
+        assert!(parse_shot(&words("b1 --what")).is_err());
+        assert!(parse_shot(&[]).is_err());
     }
 
     #[test]
