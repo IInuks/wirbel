@@ -28,7 +28,8 @@ use smithay::reexports::{
 
 const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]... [--timeout SECONDS] [--log FILE]
                      [--headless [WxH]] [--test-input]
-       wirbel vwm open|list|info|resize|close ..., see `wirbel vwm --help`
+       wirbel vwm open|list|close|type|key|click|shot|wait ..., see `wirbel vwm --help`
+       wirbel macro run|check|list ..., see `wirbel macro --help`
        wirbel check [CONFIG]
        wirbel pos [(now|MILLISECONDS|loop) [x|y|xy] [DECIMALS|max]] [--once] [--json]
        wirbel distance [SECONDS|loop] [DECIMALS|max]
@@ -380,6 +381,10 @@ pub fn main(extensions: Vec<Rc<dyn Extension>>) {
         return;
     }
     let mut args = env::args().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "macro") {
+        let args: Vec<String> = args.skip(1).collect();
+        process::exit(crate::macros::main(&args));
+    }
     if let Some(
         command @ ("pos" | "distance" | "move" | "click" | "ws" | "mmsg" | "plug" | "restart"
         | "inject" | "vwm"),

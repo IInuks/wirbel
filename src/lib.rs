@@ -16,6 +16,7 @@ pub mod input;
 pub mod input_filter;
 pub mod ipc;
 pub mod layout;
+pub mod macros;
 pub mod monitor;
 pub mod plugin;
 pub mod plugin_api;

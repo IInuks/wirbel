@@ -14,7 +14,7 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 4, step 4.1.
+Phase 5, step 5.1.
 
 ## Phases
 
@@ -47,11 +47,11 @@ Phase 4, step 4.1.
 - [x] 3.4 tests
 
 ### 4 Macros
-- [ ] 4.1 lexer and parser with line numbers
-- [ ] 4.2 interpreter: values, variables, expressions, control flow, functions, try
-- [ ] 4.3 vwm steps, `on` handlers, timeouts
-- [ ] 4.4 `wirbel macro run|check|list`, bind action `macro`
-- [ ] 4.5 MACROS.md, examples, tests
+- [x] 4.1 lexer and parser with line numbers
+- [x] 4.2 interpreter: values, variables, expressions, control flow, functions, try
+- [x] 4.3 vwm steps, `on` handlers, timeouts
+- [x] 4.4 `wirbel macro run|check|list`, bind action `macro`
+- [x] 4.5 MACROS.md, examples, tests
 
 ### 5 Text I
 - [ ] 5.1 clipboard trick
@@ -108,5 +108,13 @@ Phase 4, step 4.1.
   than the blink of a terminal, and `changed` without a region fires on them.
 - Still to come as conditions: `text GLOB` (phase 5), `loaded` (phase 6 and 10), `sound` and
   `silence` (phase 8). `Condition::parse` and `check` in `src/vwm/wait.rs` are the place.
+- Macros reuse the commands: `vwm::cli::capture` runs `wirbel vwm ARGS` and returns what it
+  would print, so a new command is a macro step once its word is in `vwm::cli::COMMANDS`.
+  `wait` is the exception (handlers run during it). Tests of the interpreter use a fake
+  `macros::interp::Host`.
+- No bind action `macro`: `bind = MODS, KEY, spawn, wirbel macro run NAME` does it.
+- `wirbel vwm close` returns once the window is gone, so its name is free again.
+- `examples/macros/page-title.wm` is checked for syntax only; run it with a real browser in
+  the smoke test.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

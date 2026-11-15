@@ -291,18 +291,18 @@ pub fn parse_open(args: &[String]) -> Result<Open, String> {
 
 fn open(args: &[String]) -> Result<(), String> {
     let open = parse_open(args)?;
-    println!("{}", ask_main(&open.to_line())?);
+    emit(ask_main(&open.to_line())?.to_string());
     Ok(())
 }
 
 fn list(args: &[String]) -> Result<(), String> {
     let rows = rows()?;
     match args {
-        [] if rows.is_empty() => println!("no invisible windows"),
-        [] => println!("{}", table(&rows)),
+        [] if rows.is_empty() => emit("no invisible windows".to_string()),
+        [] => emit(table(&rows).to_string()),
         [flag] if flag == "--json" => {
             let rows: Vec<String> = rows.iter().map(Row::json).collect();
-            println!("[{}]", rows.join(","));
+            emit(format!("[{}]", rows.join(",")));
         }
         _ => return Err(USAGE.into()),
     }
@@ -317,18 +317,21 @@ fn info(args: &[String]) -> Result<(), String> {
         .into_iter()
         .find(|row| row.name == *name)
         .ok_or_else(|| format!("no invisible window `{name}`"))?;
-    println!("name     {}", row.name);
-    println!("state    {}", row.state);
-    println!("pid      {}", row.group);
-    println!("display  {}", row.display);
-    println!("size     {}", row.size);
-    println!("age      {}", age(row.seconds));
-    println!("command  {}", row.command);
+    emit(format!("name     {}", row.name));
+    emit(format!("state    {}", row.state));
+    emit(format!("pid      {}", row.group));
+    emit(format!("display  {}", row.display));
+    emit(format!("size     {}", row.size));
+    emit(format!("age      {}", age(row.seconds)));
+    emit(format!("command  {}", row.command));
     if let Some(dir) = super::manager::state_dir(&row.name) {
-        println!("log      {}", dir.join("shadow.log").display());
+        emit(format!("log      {}", dir.join("shadow.log").display()));
     }
     if row.display != "-" {
-        println!("windows  {}", ask_display(&row.display, "windows")?);
+        emit(format!(
+            "windows  {}",
+            ask_display(&row.display, "windows")?
+        ));
     }
     Ok(())
 }
@@ -349,12 +352,31 @@ fn close(args: &[String]) -> Result<(), String> {
     if names.is_empty() || names.iter().any(|name| name.starts_with('-')) {
         return Err(USAGE.into());
     }
-    for name in names {
+    for name in &names {
         let kill = if kill { " kill" } else { "" };
         ask_main(&format!("vwm close {name}{kill}"))?;
     }
-    Ok(())
+    // Back only once they are gone, so that the name is free for the next one.
+    let start = std::time::Instant::now();
+    loop {
+        let left = rows()?;
+        let all = names.iter().any(|name| *name == "all");
+        let gone = match all {
+            true => left.is_empty(),
+            false => !left.iter().any(|row| names.contains(&&row.name)),
+        };
+        if gone {
+            return Ok(());
+        }
+        if start.elapsed() > CLOSE_PATIENCE {
+            return Err("still closing, `--kill` ends it at once".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
+
+/// How long `close` waits for the windows to go: longer than the compositor gives them.
+const CLOSE_PATIENCE: Duration = Duration::from_secs(12);
 
 /// A connection to the control socket of a shadow, for several requests in a row.
 pub struct Session {
@@ -666,7 +688,7 @@ fn shot(args: &[String]) -> Result<(), String> {
     let file = shot.file.unwrap_or_else(|| format!("{}.png", shot.name));
     let file = absolute(&file)?;
     take_shot(&shot.name, &file, shot.region.as_deref(), shot.cursor)?;
-    println!("{file}");
+    emit(file.to_string());
     Ok(())
 }
 
@@ -726,11 +748,7 @@ pub fn clip_set(name: &str, text: &str) -> Result<(), String> {
 fn clip(args: &[String]) -> Result<(), String> {
     match args {
         [name, get] if get == "get" => {
-            let text = clip_get(name)?;
-            print!("{text}");
-            if !text.ends_with('\n') {
-                println!();
-            }
+            emit(clip_get(name)?.trim_end_matches('\n').to_string());
             Ok(())
         }
         [name, set, words @ ..] if set == "set" && !words.is_empty() => {
@@ -779,7 +797,7 @@ fn wait(args: &[String]) -> Result<(), String> {
     let answer = super::wait::wait(name, &condition, timeout, &mut || Ok(()));
     let answer = answer.map_err(|err| err.message())?;
     if !answer.is_empty() {
-        println!("{answer}");
+        emit(answer.to_string());
     }
     Ok(())
 }
@@ -789,16 +807,16 @@ fn status(args: &[String]) -> Result<(), String> {
         return Err(USAGE.into());
     };
     let status = Watcher::of(name)?.status()?;
-    println!("windows    {}", status.windows);
-    println!("title      {}", status.title);
+    emit(format!("windows    {}", status.windows));
+    emit(format!("title      {}", status.title));
     match status.exited {
-        Some(code) => println!("program    exited with {code}"),
-        None => println!("program    running"),
+        Some(code) => emit(format!("program    exited with {code}")),
+        None => emit("program    running".to_string()),
     }
-    println!("cursor     {}", status.cursor);
-    println!("frames     {}", status.damage);
-    println!("quiet      {} ms", status.quiet.as_millis());
-    println!("clipboard  {}", status.clipboard);
+    emit(format!("cursor     {}", status.cursor));
+    emit(format!("frames     {}", status.damage));
+    emit(format!("quiet      {} ms", status.quiet.as_millis()));
+    emit(format!("clipboard  {}", status.clipboard));
     Ok(())
 }
 
@@ -840,19 +858,19 @@ fn events(args: &[String]) -> Result<(), String> {
     let mut watcher = Watcher::of(name)?;
     let mut old = watcher.status()?;
     let mut busy = false;
-    println!("windows {}", old.windows);
+    emit(format!("windows {}", old.windows));
     if !old.title.is_empty() {
-        println!("title {}", old.title);
+        emit(format!("title {}", old.title));
     }
     loop {
         std::thread::sleep(Duration::from_millis(40));
         let Ok(new) = watcher.status() else {
-            println!("gone");
+            emit("gone".to_string());
             return Ok(());
         };
         let (lines, now_busy) = changes(&old, &new, busy);
         for line in lines {
-            println!("{line}");
+            emit(line.to_string());
         }
         (old, busy) = (new, now_busy);
     }
@@ -866,10 +884,7 @@ fn pixel(args: &[String]) -> Result<(), String> {
     let mut watcher = Watcher::of(name)?;
     let status = watcher.status()?;
     let color = watcher.picture(&status)?.pixel(x, y);
-    println!(
-        "{}",
-        color_name(color.ok_or("the pixel is outside the window")?)
-    );
+    emit(color_name(color.ok_or("the pixel is outside the window")?).to_string());
     Ok(())
 }
 
@@ -883,7 +898,7 @@ fn find(args: &[String]) -> Result<(), String> {
     let condition = Condition::parse(&condition)?;
     let found = super::wait::wait(name, &condition, Duration::ZERO, &mut || Ok(()));
     match found {
-        Ok(place) => println!("{place}"),
+        Ok(place) => emit(place.to_string()),
         Err(WaitError::Timeout(_)) => return Err("the picture does not show in the window".into()),
         Err(err) => return Err(err.message()),
     }
@@ -900,6 +915,43 @@ pub fn exit_code(error: &str) -> i32 {
         1
     }
 }
+
+thread_local! {
+    /// What the commands printed while `capture` runs, instead of printing it.
+    static CAPTURED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Prints a line of output, or keeps it for `capture`.
+fn emit(line: String) {
+    let kept = CAPTURED.with(|captured| match captured.borrow_mut().as_mut() {
+        Some(text) => {
+            text.push_str(&line);
+            text.push('\n');
+            true
+        }
+        None => false,
+    });
+    if !kept {
+        println!("{line}");
+    }
+}
+
+/// Runs `wirbel vwm ARGS` and returns what it would print, without the last line end. For
+/// macros, whose steps are these commands.
+pub fn capture(args: &[String]) -> Result<String, String> {
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(String::new()));
+    let result = run(args);
+    let text = CAPTURED
+        .with(|captured| captured.borrow_mut().take())
+        .unwrap_or_default();
+    result.map(|()| text.trim_end_matches('\n').to_string())
+}
+
+/// The commands of `wirbel vwm` that are steps of a macro too.
+pub const COMMANDS: &[&str] = &[
+    "open", "list", "info", "resize", "close", "type", "key", "click", "move", "drag", "scroll",
+    "shot", "clip", "paste", "status", "pixel", "find",
+];
 
 /// `wirbel vwm ARGS`.
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -932,7 +984,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "pixel" => pixel(rest),
         "find" => find(rest),
         "--help" | "-h" | "help" => {
-            println!("{USAGE}\n\n{HELP}");
+            emit(format!("{USAGE}\n\n{HELP}"));
             Ok(())
         }
         _ => Err(USAGE.into()),

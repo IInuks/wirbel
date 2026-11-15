@@ -1,0 +1,42 @@
+# Opens a page in an invisible browser and returns the title of its window.
+#   wirbel macro run examples/macros/page-title.wm url=https://example.com
+param url = "https://example.com"
+param browser = firefox
+timeout 40s
+
+open page = $browser
+# Whatever asks a question first is dismissed as soon as it shows.
+on page title "*Cookies*" do
+    key page Escape
+end
+
+wait page ready
+wait page stable 500
+key page CTRL+l
+type page "$url"
+key page Return
+
+let wanted = replace(replace($url, "https://", ""), "http://", "")
+try
+    # The title follows the page once it has loaded.
+    wait page changed
+    wait page stable 800
+    let title = status page
+else
+    let why = $error
+    # It may be gone already; then there is nothing to close.
+    try
+        shot page page-failed.png
+        close page
+    end
+    fail "the page did not load, see page-failed.png: $why"
+end
+
+let found = ""
+for line in $title
+    if starts($line, "title")
+        set found = trim(slice($line, 5))
+    end
+end
+close page
+return $found

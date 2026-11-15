@@ -1,0 +1,29 @@
+# Runs a command in an invisible terminal and returns what it printed.
+#   wirbel macro run examples/macros/terminal.wm command="uname -s"
+param command = "echo hello from an invisible window"
+param terminal = kitty
+
+let out = "/tmp/wirbel-macro-$terminal.txt"
+shell rm -f $out
+
+open term = --size 700x300 $terminal
+try
+    wait term ready timeout 15s
+    wait term stable 300
+    # Any text goes through the clipboard; typing only knows the keys of the layout.
+    paste term --key CTRL+SHIFT+v "$command > $out"
+    key term Return
+    wait term file $out timeout 10s
+    sleep 200ms
+    let result = read $out
+else
+    let why = $error
+    # It may be gone already; then there is nothing to close.
+    try
+        close term
+    end
+    fail "the terminal did not do it: $why"
+end
+close term
+shell rm -f $out
+return trim($result)
