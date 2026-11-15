@@ -121,5 +121,14 @@ Phase 6, step 6.1. Before that, if `tesseract` is installed by then: try `wirbel
   picture enlarged first, and whether `--psm 11` (sparse text) reads windows better than the
   default. `WIRBEL_OCR_LANG` or `--lang` picks languages.
 - `vwm text --via clipboard` presses CTRL+a and CTRL+c; terminals do not select all that way.
+- KNOWN PROBLEM: a headless wirbel that renders on a card of the `nvidia` driver crashes
+  (SIGSEGV, no panic message) as soon as Firefox connects; a terminal works there. On the
+  other card everything works. Not found yet where: run
+  `WIRBEL_SHADOW_GPU=cardN wirbel --shadow x 800x600 -c firefox` under a debugger. Until then
+  shadows pick the card that is not nvidia (`manager::quiet_card`), `vwm_gpu` in the config
+  overrides. A machine with only an nvidia card is affected.
+- Tried with real programs (headless desktop, see below): kitty (type, paste, drag, shot) and
+  Firefox with its own profile; `examples/macros/page-title.wm` returned the title of
+  example.com.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

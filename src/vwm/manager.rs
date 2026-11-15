@@ -236,6 +236,17 @@ pub fn with_recipe(command: &str, dir: &Path) -> String {
     command.to_string()
 }
 
+/// The card for shadows when the configuration names none: with several cards, one that is not
+/// driven by `nvidia`. That is the integrated one, which is enough for windows nobody looks at
+/// and leaves the other to the screen; and a headless wirbel on the nvidia driver was seen to
+/// crash when a browser connects. `None` leaves the choice to the headless backend.
+pub fn quiet_card(cards: impl Iterator<Item = (String, String)>) -> Option<String> {
+    let mut cards: Vec<(String, String)> = cards.collect();
+    cards.sort();
+    let other = cards.iter().find(|(_, driver)| driver != "nvidia")?;
+    (cards.len() > 1).then(|| other.0.clone())
+}
+
 /// `text` as one word of a shell command.
 pub fn shell_quote(text: &str) -> String {
     let plain = |c: char| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c);
@@ -319,6 +330,8 @@ impl Wirbel {
             .vwm
             .dir_of(&name)
             .ok_or("cannot tell where the state folder is")?;
+        // The shadow runs in another folder, and the path goes into commands.
+        let dir = std::path::absolute(&dir).unwrap_or(dir);
         fs::create_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
         let log = fs::File::create(dir.join("shadow.log"))
             .map_err(|err| format!("no log for the shadow: {err}"))?;
@@ -343,7 +356,31 @@ impl Wirbel {
             }
             None => Command::new(binary),
         };
-        match &self.config.render_gpu {
+        let gpu = self.config.vwm_gpu.clone();
+        let gpu = gpu.or_else(|| self.config.render_gpu.clone()).or_else(|| {
+            let cards = fs::read_dir("/sys/class/drm")
+                .into_iter()
+                .flatten()
+                .flatten();
+            let cards = cards.filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let driver = fs::read_link(entry.path().join("device/driver")).ok()?;
+                let card = name
+                    .strip_prefix("card")?
+                    .chars()
+                    .all(|c| c.is_ascii_digit());
+                card.then(|| (name, driver.file_name().map(|d| d.to_os_string())))
+            });
+            quiet_card(cards.map(|(name, driver)| {
+                (
+                    name,
+                    driver
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            }))
+        });
+        match gpu {
             Some(gpu) => child.env(shadow::GPU_ENV, gpu),
             None => child.env_remove(shadow::GPU_ENV),
         };
@@ -617,6 +654,29 @@ mod tests {
             with_recipe("firefox --profile /x", dir),
             "firefox --profile /x"
         );
+    }
+
+    #[test]
+    fn shadows_keep_off_the_nvidia_card_if_there_is_another() {
+        let cards = |list: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> = list
+                .iter()
+                .map(|(n, d)| (n.to_string(), d.to_string()))
+                .collect();
+            quiet_card(owned.into_iter())
+        };
+        assert_eq!(
+            cards(&[("card1", "nvidia"), ("card0", "amdgpu")]),
+            Some("card0".into())
+        );
+        assert_eq!(
+            cards(&[("card0", "nvidia"), ("card1", "i915")]),
+            Some("card1".into())
+        );
+        assert_eq!(cards(&[("card0", "nvidia")]), None);
+        assert_eq!(cards(&[("card0", "amdgpu")]), None);
+        assert_eq!(cards(&[("card0", "nvidia"), ("card1", "nvidia")]), None);
+        assert_eq!(cards(&[]), None);
     }
 
     #[test]

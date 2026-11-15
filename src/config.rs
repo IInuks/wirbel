@@ -194,6 +194,8 @@ pub struct Config {
     pub cursor_size: Option<u32>,
     /// The card that renders, by name like `card1`. `None` means the boot GPU.
     pub render_gpu: Option<String>,
+    /// The card that renders the invisible windows, see `crate::vwm`. `None` lets wirbel pick.
+    pub vwm_gpu: Option<String>,
     /// How to run X11 programs.
     pub xwayland: Xwayland,
     pub monitor_rules: Vec<MonitorRule>,
@@ -257,6 +259,7 @@ impl Config {
             cursor_theme: None,
             cursor_size: None,
             render_gpu: None,
+            vwm_gpu: None,
             xwayland: Xwayland::Find,
             monitor_rules: Vec::new(),
             binds: Vec::new(),
@@ -355,6 +358,7 @@ impl Config {
             }
             "cursor_size" => self.cursor_size = Some(parse_size(value)? as u32),
             "render_gpu" => self.render_gpu = Some(value).filter(|v| !v.is_empty()).map(Into::into),
+            "vwm_gpu" => self.vwm_gpu = Some(value).filter(|v| !v.is_empty()).map(Into::into),
             "xwayland" => {
                 self.xwayland = match value {
                     "" | "auto" => Xwayland::Find,
