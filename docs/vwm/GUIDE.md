@@ -71,8 +71,9 @@ Wait conditions: `ready`, `window [GLOB]`, `title GLOB`, `closed`, `exited`, `st
   without it `text --via clipboard` still works where a program has select all and copy.
 - Invisible windows are rendered by `vwm_gpu` of the configuration; without it by `render_gpu`,
   else by a card that is not driven by nvidia if the machine has several.
-- Each invisible window costs a small process and its program; nothing is drawn while the
-  program does not change its picture.
+- Each invisible window costs about 60 MB besides its program (a hidden wirbel, an X server
+  and a session bus of its own); `wirbel vwm list` shows the memory of each. Nothing is drawn
+  while the program does not change its picture.
 
 ## Macros
 

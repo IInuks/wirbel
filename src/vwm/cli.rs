@@ -175,9 +175,11 @@ impl Row {
 }
 
 /// The memory in use by the processes of a process group, in kilobytes: the hidden wirbel, the
-/// program and what it started. `None` if there is no such process.
+/// program and what it started. Pages that several processes share count once, by their
+/// share (the "Pss" of the kernel), so that the numbers of several windows add up. `None` if
+/// there is no such process.
 pub fn group_memory(group: i32) -> Option<u64> {
-    let mut pages = None;
+    let mut kilobytes = None;
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let numeric = entry
             .file_name()
@@ -186,13 +188,24 @@ pub fn group_memory(group: i32) -> Option<u64> {
         let stat = numeric
             .then(|| std::fs::read_to_string(entry.path().join("stat")).ok())
             .flatten();
-        if let Some((process_group, resident)) = stat.as_deref().and_then(parse_stat)
-            && process_group == group
-        {
-            *pages.get_or_insert(0) += resident;
+        let Some((process_group, resident)) = stat.as_deref().and_then(parse_stat) else {
+            continue;
+        };
+        if process_group != group {
+            continue;
         }
+        let rollup = std::fs::read_to_string(entry.path().join("smaps_rollup")).ok();
+        let share = rollup.as_deref().and_then(parse_pss);
+        // Without the fair number, all resident pages.
+        *kilobytes.get_or_insert(0) += share.unwrap_or(resident * 4);
     }
-    pages.map(|pages| pages * 4)
+    kilobytes
+}
+
+/// The proportional share of memory in `/proc/PID/smaps_rollup`, in kilobytes.
+fn parse_pss(rollup: &str) -> Option<u64> {
+    let line = rollup.lines().find_map(|line| line.strip_prefix("Pss:"))?;
+    line.split_ascii_whitespace().next()?.parse().ok()
 }
 
 /// The process group and the resident pages in a line of `/proc/PID/stat`.
@@ -1572,6 +1585,9 @@ mod tests {
         let stat = "4242 (Web Content) x) S 1 77 77 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 9 0 1000 2000000 1234 18446744073709551615 1 1 0";
         assert_eq!(parse_stat(stat), Some((77, 1234)));
         assert_eq!(parse_stat("nonsense"), None);
+        let rollup = "55d0-7ffd ---p 00000000 00:00 0 [rollup]\nRss:   81000 kB\nPss:   29123 kB\nPss_Dirty: 5 kB\n";
+        assert_eq!(parse_pss(rollup), Some(29123));
+        assert_eq!(parse_pss("Rss: 5 kB"), None);
         assert_eq!(megabytes(1), "1 MB");
         assert_eq!(megabytes(2049), "3 MB");
         // This very process is in some group, and uses memory.

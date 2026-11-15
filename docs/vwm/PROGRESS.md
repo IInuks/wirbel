@@ -175,6 +175,9 @@ What is left, in the order of use:
   Firefox takes one BiDi session at a time: each command ends its session (`Drop for Page`).
   Tried with Firefox and Chromium: goto, title, eval, count, click, fill.
 - `vwm web` always acts on the first tab.
+- Measured with an invisible terminal: the window itself costs about 60 MB (hidden wirbel 29,
+  Xwayland 26, session bus and portal 5; shared pages counted by their share), the rest is the
+  program. Starting Xwayland only when an X11 program connects would save a good part of it.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.
 
