@@ -340,6 +340,7 @@ impl Headless {
             Wirbel::output_elements,
         );
         crate::vwm::shot::take(state, &mut self.renderer, &self.output);
+        crate::vwm::shot::take_parked(state, &mut self.renderer);
         state.stats.rendered(start);
         state.stats.queued();
         state.stats.vblank(frame_time(), true, None);

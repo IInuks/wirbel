@@ -132,6 +132,10 @@ impl Wirbel {
     /// hook shows there.
     pub(crate) fn frame_windows(&self, output: &Output) -> Vec<Window> {
         let mut windows: Vec<Window> = self.space.elements_for_output(output).cloned().collect();
+        // Parked windows keep drawing, at the pace of the output that is in use.
+        if self.parking_output().as_ref() == Some(output) {
+            windows.extend(self.parked_windows());
+        }
         if let Some(hook) = &self.window_hook {
             for window in hook.shown_windows(self, output) {
                 if !windows.contains(&window) {
@@ -172,6 +176,13 @@ impl Wirbel {
                 }
             }
         }
+        if let Some(output) = self.parking_output() {
+            shown.extend(
+                self.parked_windows()
+                    .into_iter()
+                    .map(|window| (window, output.clone())),
+            );
+        }
         for (window, output) in &self.hook_outputs {
             let still = shown.iter().any(|(w, o)| w == window && o == output);
             // Back in the layout on that output, the space keeps its outputs.
@@ -201,6 +212,12 @@ impl Wirbel {
         self.hook_outputs = shown;
     }
 
+    /// The output parked windows count as being on: they have to be on one to keep drawing.
+    fn parking_output(&self) -> Option<Output> {
+        let monitor = self.monitors.get(self.active_monitor)?;
+        monitor.connected.then(|| monitor.output.clone())
+    }
+
     /// Whether the hook shows `window` on some output.
     pub(crate) fn hook_shows(&self, window: &Window) -> bool {
         self.window_hook.as_ref().is_some_and(|hook| {
@@ -213,14 +230,18 @@ impl Wirbel {
     /// Puts the held windows on the active workspace, tiled or floating as they would be when
     /// opened there. They do not take the keyboard: the user did not ask for them in 2D.
     fn release_held_windows(&mut self) {
-        let held = std::mem::take(&mut self.held_windows);
+        // Parked windows stay where they are: they are held for another reason.
+        let (parked, held): (Vec<Window>, Vec<Window>) = std::mem::take(&mut self.held_windows)
+            .into_iter()
+            .partition(|window| self.is_parked(window));
+        self.held_windows = parked;
         if held.is_empty() {
             return;
         }
         let Some(monitor) = self.monitors.get_mut(self.active_monitor) else {
             // No output to put them on: they stay held until there is one and a hook comes and
             // goes again. They still are known to the core.
-            self.held_windows = held;
+            self.held_windows.extend(held);
             return;
         };
         let workspace = monitor.workspace_mut();

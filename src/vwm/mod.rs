@@ -13,6 +13,7 @@ pub mod cli;
 pub mod clip;
 pub mod json;
 pub mod manager;
+pub mod park;
 pub mod shadow;
 pub mod shot;
 pub mod text;

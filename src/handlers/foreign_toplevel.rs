@@ -156,6 +156,8 @@ impl Wirbel {
             .flat_map(|workspace| workspace.windows())
             .chain(self.held_windows.iter().cloned())
             .filter(|window| !self.awaiting_buffer.contains(window))
+            // Parked windows show nowhere but in `wirbel vwm list`.
+            .filter(|window| !self.is_parked(window))
             .collect()
     }
 

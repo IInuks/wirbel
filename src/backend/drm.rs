@@ -888,6 +888,7 @@ fn render(drm: &Rc<RefCell<Drm>>, state: &mut Wirbel, node: DrmNode, crtc: crtc:
         {
             this.capturer
                 .run_with(state, &mut renderer, &output, Wirbel::output_elements);
+            crate::vwm::shot::take_parked(state, &mut renderer);
         }
         (output, outcome)
     };

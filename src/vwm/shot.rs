@@ -14,14 +14,15 @@ use smithay::{
     backend::{
         allocator::Fourcc,
         renderer::{
-            Bind, ExportMem, Offscreen,
+            Bind, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, Texture,
             damage::OutputDamageTracker,
-            element::{Element, Kind},
+            element::{AsRenderElements, Element, Kind, surface::WaylandSurfaceRenderElement},
             gles::{GlesRenderer, GlesTexture},
         },
     },
+    desktop::Window,
     output::Output,
-    utils::{Buffer, Rectangle, Size},
+    utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform},
 };
 
 use crate::Wirbel;
@@ -187,6 +188,65 @@ fn picture(
         .map_texture(&mapping)
         .map_err(|err| fail("failed to map the picture", &err))?;
     Ok((pixels.to_vec(), (mode.size.w, mode.size.h)))
+}
+
+/// Draws a window alone, as large as it is, and reads it back as rows of RGBA pixels.
+fn window_picture<R>(renderer: &mut R, window: &Window) -> Result<(Vec<u8>, (i32, i32)), String>
+where
+    R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture> + Bind<GlesTexture>,
+    R::TextureId: Clone + Texture + 'static,
+{
+    let geometry = window.geometry();
+    let (w, h) = (geometry.size.w, geometry.size.h);
+    if w < 1 || h < 1 {
+        return Err("the window has no size yet".into());
+    }
+    let fail = |what: &str, err: &dyn std::fmt::Debug| format!("{what}: {err:?}");
+    let mut texture: GlesTexture = renderer
+        .create_buffer(Fourcc::Abgr8888, Size::<i32, Buffer>::from((w, h)))
+        .map_err(|err| fail("no room for the picture", &err))?;
+    // What the window calls its content begins at the origin; shadows around it fall outside.
+    let origin: Point<i32, Physical> = (-geometry.loc.x, -geometry.loc.y).into();
+    let elements: Vec<WaylandSurfaceRenderElement<R>> =
+        window.render_elements(renderer, origin, Scale::from(1.0), 1.0);
+    let mut tracker = OutputDamageTracker::new((w, h), 1.0, Transform::Normal);
+    let mut framebuffer = renderer
+        .bind(&mut texture)
+        .map_err(|err| fail("failed to bind the picture", &err))?;
+    tracker
+        .render_output(
+            renderer,
+            &mut framebuffer,
+            0,
+            &elements,
+            [0.0, 0.0, 0.0, 1.0],
+        )
+        .map_err(|err| fail("failed to draw the picture", &err))?;
+    let region = Rectangle::from_size(Size::<i32, Buffer>::from((w, h)));
+    let mapping = renderer
+        .copy_framebuffer(&framebuffer, region, Fourcc::Abgr8888)
+        .map_err(|err| fail("failed to read the picture back", &err))?;
+    let pixels = renderer
+        .map_texture(&mapping)
+        .map_err(|err| fail("failed to map the picture", &err))?;
+    Ok((pixels.to_vec(), (w, h)))
+}
+
+/// Answers the pictures of parked windows that wait. Called by every backend after a frame.
+pub fn take_parked<R>(state: &mut Wirbel, renderer: &mut R)
+where
+    R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture> + Bind<GlesTexture>,
+    R::TextureId: Clone + Texture + 'static,
+{
+    for (shot, window) in std::mem::take(&mut state.vwm.parked_shots) {
+        let answer = window_picture(renderer, &window).and_then(|(pixels, size)| {
+            let part = crop(size, shot.region).ok_or("the region is outside the picture")?;
+            write_png(&shot.path, &pixels, size.0, part)?;
+            Ok(format!("ok {}x{}", part.2, part.3))
+        });
+        let answer = answer.unwrap_or_else(|err: String| format!("error {err}"));
+        state.ipc.reply(shot.peer, &answer);
+    }
 }
 
 /// Answers the pictures that wait. Called by the backend after a frame of `output`.

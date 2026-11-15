@@ -30,6 +30,7 @@ Positions are pixels from the top left corner of the window. The window is 1280x
 | `open [--name N] [--size WxH] [--share-bus] [--env K=V] [--] COMMAND` | start a program invisibly |
 | `list`, `info NAME`, `status NAME`, `events NAME` | look at them |
 | `close NAME...\|all [--kill]` | close politely, or at once |
+| `windows`, `adopt WINDOW\|focused [NAME]`, `release NAME` | park a window that is already open, bring it back |
 | `type NAME TEXT`, `key NAME KEY...`, `paste NAME TEXT` | keyboard; `paste` takes any text |
 | `click NAME X Y [BUTTON] [COUNT]`, `move`, `drag`, `scroll` | pointer |
 | `shot NAME [FILE] [--region X,Y,W,H] [--cursor]`, `pixel NAME X Y` | pictures |
@@ -77,7 +78,21 @@ Several steps with conditions, loops and error handling go in a macro file, see
 wirbel macro run examples/macros/page-title.wm url=https://example.com
 ```
 
+## Windows that are already open
+
+A running program cannot move into a hidden wirbel, so `adopt` parks its window instead: it
+leaves its workspace and the taskbar and keeps running out of sight, `release` brings it back.
+A parked window can be photographed (`shot`), listed and closed. It cannot be typed into or
+clicked: on the desktop there is one keyboard and one pointer, and they stay with you. Start a
+program with `open` when it is to be driven.
+
+```sh
+wirbel vwm adopt focused music     # the window with the focus disappears
+wirbel vwm shot music now.png
+wirbel vwm release music
+```
+
 ## Not there yet
 
-Taking over a window that is already open, sound and video recording, the remote control protocol of browsers and a window to look into an
+Input into parked windows, sound and video recording, the remote control protocol of browsers and a window to look into an
 invisible one are planned; [PROGRESS.md](PROGRESS.md) says how far they are.

@@ -26,6 +26,8 @@ pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--sh
        wirbel vwm info NAME
        wirbel vwm resize NAME WxH
        wirbel vwm close NAME...|all [--kill]
+       wirbel vwm adopt WINDOW|focused [NAME]
+       wirbel vwm release NAME
        wirbel vwm type NAME TEXT...
        wirbel vwm key NAME KEY|MODS+KEY...
        wirbel vwm click NAME X Y [left|right|middle] [COUNT]
@@ -57,6 +59,12 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
       info       one of them, with the windows its program has open
       resize     give the window another size
       close      ask the windows to close and end what does not; --kill ends it at once
+      adopt      park a window that is open on the desktop: it leaves its workspace and the
+                 taskbar and keeps running out of sight. WINDOW is its id from `wirbel vwm
+                 windows`, or `focused`. A parked window takes shot, release and close; typing
+                 and clicking need a window started with open
+      release    put a parked window on the current workspace again
+      windows    the windows on the desktop with their ids, as JSON
       type       type TEXT on the keyboard of the window, a line end is Return. Only what the
                  keyboard layout has keys for; `paste` takes any text
       key        press keys one after another: a key name such as Return, Escape, Tab, F5, a, or
@@ -155,11 +163,12 @@ fn age(seconds: u64) -> String {
 
 /// The rows as a table with a header.
 fn table(rows: &[Row]) -> String {
-    let cells: Vec<[String; 6]> = rows
+    let cells: Vec<[String; 7]> = rows
         .iter()
         .map(|row| {
             [
                 row.name.clone(),
+                row.kind.clone(),
                 row.state.clone(),
                 row.group.clone(),
                 row.size.clone(),
@@ -168,12 +177,13 @@ fn table(rows: &[Row]) -> String {
             ]
         })
         .collect();
-    let header = ["NAME", "STATE", "PID", "SIZE", "AGE", "COMMAND"];
+    // For a parked window the id is that of the window and the last column its title.
+    let header = ["NAME", "KIND", "STATE", "ID", "SIZE", "AGE", "COMMAND"];
     let width = |column: usize| {
         let longest = cells.iter().map(|row| row[column].chars().count()).max();
         longest.unwrap_or(0).max(header[column].len())
     };
-    let widths: Vec<usize> = (0..5).map(width).collect();
+    let widths: Vec<usize> = (0..6).map(width).collect();
     let line = |row: &[&str]| {
         let mut text = String::new();
         for (column, cell) in row.iter().enumerate() {
@@ -692,12 +702,15 @@ pub fn take_shot(
     region: Option<&str>,
     cursor: bool,
 ) -> Result<String, String> {
-    let request = format!(
-        "shadow shot\t{file}\t{}\t{}",
-        region.unwrap_or("-"),
-        if cursor { "cursor" } else { "-" }
-    );
-    ask_shadow(name, &request)
+    let region = region.unwrap_or("-");
+    // A parked window is photographed by the visible compositor, a shadow by itself.
+    let parked = ask_main(&format!("vwm shot\t{name}\t{file}\t{region}"));
+    match parked {
+        Err(err) if err.starts_with("no parked window") => {}
+        answer => return answer,
+    }
+    let cursor = if cursor { "cursor" } else { "-" };
+    ask_shadow(name, &format!("shadow shot\t{file}\t{region}\t{cursor}"))
 }
 
 fn shot(args: &[String]) -> Result<(), String> {
@@ -1104,6 +1117,9 @@ pub const COMMANDS: &[&str] = &[
     "text",
     "click-text",
     "ui",
+    "adopt",
+    "release",
+    "windows",
 ];
 
 /// `wirbel vwm ARGS`.
@@ -1122,6 +1138,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "info" => info(rest),
         "resize" => resize(rest),
         "close" => close(rest),
+        "adopt" => match rest {
+            [target] => ask_main(&format!("vwm adopt {target}")).map(emit),
+            [target, name] => ask_main(&format!("vwm adopt {target} {name}")).map(emit),
+            _ => Err(USAGE.into()),
+        },
+        "release" => match rest {
+            [name] => ask_main(&format!("vwm release {name}")).map(drop),
+            _ => Err(USAGE.into()),
+        },
+        "windows" => {
+            let display =
+                std::env::var("WAYLAND_DISPLAY").map_err(|_| "WAYLAND_DISPLAY is not set")?;
+            ask_display(&display, "windows").map(emit)
+        }
         "type" => type_text(rest),
         "key" => keys(rest),
         "click" => click(rest),
@@ -1204,11 +1234,11 @@ mod tests {
         let mut lines = table.lines();
         assert_eq!(
             lines.next(),
-            Some("NAME  STATE  PID   SIZE      AGE  COMMAND")
+            Some("NAME  KIND    STATE  ID    SIZE      AGE  COMMAND")
         );
         assert_eq!(
             lines.next(),
-            Some("b1    ready  4242  1280x800  1m   firefox -x\ty")
+            Some("b1    shadow  ready  4242  1280x800  1m   firefox -x\ty")
         );
         assert!(
             row.json()

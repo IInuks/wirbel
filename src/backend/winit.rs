@@ -245,6 +245,7 @@ impl Nested {
             &self.output,
             Wirbel::output_elements,
         );
+        crate::vwm::shot::take_parked(state, self.backend.renderer());
         state.stats.rendered(start);
         state.stats.queued();
         state.stats.vblank(

@@ -99,6 +99,10 @@ pub struct Manager {
     pub state_root: Option<PathBuf>,
     /// In a shadow: the pictures that wait for the next frame, see `super::shot`.
     pub shots: Vec<super::shot::Shot>,
+    /// Windows of the desktop taken out of sight, see `super::park`.
+    pub parked: Vec<super::park::Parked>,
+    /// Pictures of parked windows that wait for the next frame.
+    pub parked_shots: Vec<(super::shot::Shot, smithay::desktop::Window)>,
     /// See `Wirbel::reply_sender`.
     pub(crate) replies: Option<Sender<(u64, String)>>,
 }
@@ -320,7 +324,10 @@ impl Wirbel {
             return Err(format!("{MAX_SHADOWS} invisible windows run already"));
         }
         let name = match open.name {
-            Some(name) if self.vwm.find(&name).is_some() => {
+            Some(name)
+                if self.vwm.find(&name).is_some()
+                    || self.vwm.parked.iter().any(|parked| parked.name == name) =>
+            {
                 return Err(format!("there is an invisible window `{name}` already"));
             }
             Some(name) => name,
@@ -545,12 +552,15 @@ impl Wirbel {
                 entry.command.replace(['\t', '\n'], " "),
             );
         }
-        answer + "ok"
+        answer + &self.parked_list() + "ok"
     }
 }
 
 /// A `vwm ...` request. `Ok(None)` answers later.
 pub(crate) fn request(state: &mut Wirbel, peer: u64, rest: &str) -> Result<Option<String>, String> {
+    if let Some(answer) = super::park::request(state, peer, rest) {
+        return answer;
+    }
     if let Some(open) = rest.strip_prefix("open\t") {
         state.vwm_open(Open::parse(open)?, Some(peer))?;
         return Ok(None);
@@ -577,6 +587,11 @@ pub(crate) fn request(state: &mut Wirbel, peer: u64, rest: &str) -> Result<Optio
             "ok".into()
         }
         (Some("close"), Some(name), kill @ (None | Some("kill")), None) => {
+            if name == "all" {
+                for window in state.parked_windows() {
+                    state.close_window(&window);
+                }
+            }
             let names: Vec<String> = match name {
                 "all" => state.vwm.entries.iter().map(|e| e.name.clone()).collect(),
                 name => vec![name.to_string()],

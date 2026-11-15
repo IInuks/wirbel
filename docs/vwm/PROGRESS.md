@@ -14,8 +14,8 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 7, step 7.1. If `tesseract` is installed by then, first try `wirbel vwm text NAME --via ocr`
-on a real window and tune `vwm::text::recognise` (see the notes).
+Phase 8, step 8.1 (audio). Step 7.4 is optional and can wait. If `tesseract` is installed by
+then, first try `wirbel vwm text NAME --via ocr` on a real window (see the notes).
 
 ## Phases
 
@@ -63,9 +63,11 @@ on a real window and tune `vwm::text::recognise` (see the notes).
 - [x] 6.2 AT-SPI signals, `loaded`
 
 ### 7 Adoption
-- [ ] 7.1 parked list, hidden from taskbar, frame callbacks
-- [ ] 7.2 offscreen capture
-- [ ] 7.3 `adopt`, `release`, focus borrowing behind `vwm_adopt_input`
+- [x] 7.1 parked list, hidden from taskbar, frame callbacks
+- [x] 7.2 offscreen capture
+- [x] 7.3 `adopt`, `release`, `windows`
+- [ ] 7.4 input into parked windows: focus borrowing behind `vwm_adopt_input` (not started;
+      until then typing and clicking refuse parked windows with a clear message)
 
 ### 8 Audio
 - [ ] 8.1 null sink per instance, `record`, `listen`, `level`, sound and silence events
@@ -139,5 +141,11 @@ on a real window and tune `vwm::text::recognise` (see the notes).
   need another action than the first, or just more time.
 - With `open --share-bus` the accessibility tree is the one of the whole desktop, not of the
   window alone. Filtering by the processes of the shadow is still to do.
+- Parked windows (`src/vwm/park.rs`) are held windows of the core (`Wirbel::held_windows`)
+  with a name. An extension that sets a window hook and shows all held windows would show the
+  parked ones too; it has to skip `Wirbel::is_parked`.
+- `status`, `wait`, `text` and `ui` do not work on parked windows yet: they go to the control
+  socket of a shadow. Pictures of parked windows are taken by every backend
+  (`vwm::shot::take_parked`), tried on the headless one with a real terminal.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

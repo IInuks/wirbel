@@ -629,3 +629,80 @@ fn text_is_read_through_the_clipboard_and_recognition_says_if_it_cannot() {
         false => assert_eq!(waited, Err(WaitError::Failed(NO_TESSERACT.into()))),
     }
 }
+
+#[test]
+fn an_open_window_is_parked_out_of_sight_and_comes_back() {
+    let desk = Desk::start("park");
+    let mut stays = Client::connect(&desk.compositor);
+    let a = stays.open_window(RED);
+    let mut goes = Client::connect(&desk.compositor);
+    let b = goes.open_window(GREEN);
+    stays.sync();
+    goes.take_input();
+    stays.take_input();
+    assert_eq!(desk.compositor.frames().len(), 2);
+    let windows = || {
+        let display = desk
+            .compositor
+            .wayland_display()
+            .to_string_lossy()
+            .into_owned();
+        ask_display(&display, "windows").unwrap()
+    };
+    assert_eq!(windows().matches("\"id\"").count(), 2);
+
+    // The focused window, the newer one, leaves the layout; the other takes the room and
+    // the keyboard.
+    assert_eq!(desk.ask("vwm adopt focused mail"), ["ok mail"]);
+    assert_eq!(desk.compositor.frames(), [Rect::new(14, 14, 972, 572)]);
+    assert_eq!(windows().matches("\"id\"").count(), 1);
+    stays.sync();
+    assert!(stays.activated(a));
+    let list = desk.ask("vwm list");
+    let fields: Vec<&str> = list[0].split('\t').collect();
+    assert_eq!(fields[..4], ["entry", "mail", "parked", "ready"]);
+    assert!(
+        desk.ask("vwm adopt focused mail")[0].starts_with("error there is an invisible window")
+    );
+    assert!(desk.ask("vwm adopt 999")[0].starts_with("error no window 999"));
+    assert!(desk.ask("vwm where mail")[0].starts_with("error `mail` is a parked window"));
+
+    // It keeps drawing, and no key reaches it.
+    let before = goes.frames_done(b);
+    goes.request_frame(b);
+    desk.compositor.present();
+    goes.sync();
+    assert!(
+        goes.frames_done(b) > before,
+        "a parked window got no frame callback"
+    );
+    goes.take_input();
+    desk.compositor.tap_key(30);
+    goes.sync();
+    assert!(
+        !goes
+            .take_input()
+            .iter()
+            .any(|input| matches!(input, Input::Key(..)))
+    );
+
+    // Back on the workspace, with the keyboard.
+    assert_eq!(desk.ask("vwm release mail"), ["ok"]);
+    assert_eq!(desk.compositor.frames().len(), 2);
+    assert_eq!(windows().matches("\"id\"").count(), 2);
+    goes.sync();
+    assert!(goes.activated(b));
+    assert_eq!(desk.ask("vwm list"), ["ok"]);
+    assert!(desk.ask("vwm release mail")[0].starts_with("error no parked window"));
+
+    // Parked again and closed: the window is asked, and once it is gone the list forgets it.
+    assert_eq!(desk.ask("vwm adopt focused"), ["ok window1"]);
+    assert_eq!(desk.ask("vwm close window1"), ["ok"]);
+    goes.sync();
+    assert_eq!(goes.state.closed, [b]);
+    goes.close(b);
+    goes.sync();
+    stays.sync();
+    assert_eq!(desk.ask("vwm list"), ["ok"]);
+    assert_eq!(desk.compositor.frames().len(), 1);
+}
