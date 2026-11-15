@@ -288,6 +288,13 @@ pub struct Wirbel {
     pub held_windows: Vec<Window>,
     /// The windows the window hook showed on each output after the last event loop iteration.
     pub(crate) hook_outputs: Vec<(Window, Output)>,
+    /// Set in a shadow, see `crate::vwm::shadow`.
+    pub shadow: Option<crate::vwm::shadow::Shadow>,
+    /// The invisible windows this compositor started, see `crate::vwm::manager`.
+    pub vwm: crate::vwm::manager::Manager,
+    /// Gives the output another size and returns it. Set by the headless backend.
+    #[allow(clippy::type_complexity)]
+    pub resize_output: Option<Box<dyn FnMut((i32, i32)) -> Result<Output, String>>>,
     /// Asks the renderer whether it can use a dmabuf. Set by a backend that offers dmabufs.
     pub import_dmabuf: Box<dyn FnMut(&Dmabuf) -> bool>,
 
@@ -417,6 +424,9 @@ impl Wirbel {
             window_hook: None,
             held_windows: Vec::new(),
             hook_outputs: Vec::new(),
+            shadow: None,
+            vwm: Default::default(),
+            resize_output: None,
             import_dmabuf: Box::new(|_| false),
 
             needs_redraw: true,
@@ -868,6 +878,13 @@ impl Wirbel {
             return false;
         };
         let workspace = monitor.workspace_mut();
+        // In a shadow one window fills the output, what comes after it floats on top.
+        let placement = match placement {
+            Placement::Tiled if self.shadow.is_some() && !workspace.windows().is_empty() => {
+                Placement::Floating(Rect::new(0, 0, 0, 0))
+            }
+            placement => placement,
+        };
         workspace.put(window.clone(), placement);
         // Whoever covers the workspace would hide the newcomer.
         workspace.full = requested.map(|kind| (window.clone(), kind));
@@ -1306,8 +1323,27 @@ impl Wirbel {
             self.update_keyboard_focus();
         }
         self.retile();
+        self.shadow_promote();
         if known {
             self.window_event(window, crate::window_hook::WindowEvent::Unmapped);
+        }
+    }
+
+    /// In a shadow whose filling window went away, the oldest floating one takes its place:
+    /// a start window that made room for the real one.
+    fn shadow_promote(&mut self) {
+        if self.shadow.is_none() {
+            return;
+        }
+        let Some(monitor) = self.monitors.get(self.active_monitor) else {
+            return;
+        };
+        let workspace = monitor.workspace();
+        if !workspace.tiled.items().is_empty() {
+            return;
+        }
+        if let Some(window) = workspace.floating.first().map(|entry| entry.window.clone()) {
+            self.toggle_floating(&window);
         }
     }
 

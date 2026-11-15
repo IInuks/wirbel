@@ -214,6 +214,10 @@ pub fn init(
         let handle = event_loop.handle();
         Box::new(move || schedule(&headless, &handle))
     };
+    state.resize_output = Some({
+        let headless = headless.clone();
+        Box::new(move |size| headless.borrow_mut().resize(size))
+    });
     state.import_dmabuf = {
         let headless = headless.clone();
         Box::new(move |dmabuf| {
@@ -256,6 +260,32 @@ fn schedule(headless: &Rc<RefCell<Headless>>, handle: &LoopHandle<'static, Wirbe
 }
 
 impl Headless {
+    /// Gives the output and the buffer behind it another size.
+    fn resize(&mut self, size: (i32, i32)) -> Result<Output, String> {
+        if size.0 < 1 || size.1 < 1 {
+            return Err("the size must be at least 1x1".into());
+        }
+        self.buffer = Offscreen::<GlesRenderbuffer>::create_buffer(
+            &mut self.renderer,
+            Fourcc::Abgr8888,
+            Size::from(size),
+        )
+        .map_err(|err| format!("no offscreen buffer: {err}"))?;
+        let mode = Mode {
+            size: size.into(),
+            refresh: REFRESH_MHZ,
+        };
+        if let Some(old) = self.output.current_mode() {
+            self.output.delete_mode(old);
+        }
+        self.output
+            .change_current_state(Some(mode), None, None, None);
+        self.output.set_preferred(mode);
+        self.damage_tracker = OutputDamageTracker::from_output(&self.output);
+        self.rendered = false;
+        Ok(self.output.clone())
+    }
+
     fn render(&mut self, state: &mut Wirbel) {
         let start = state.stats.start();
         self.last_frame = Some(Instant::now());

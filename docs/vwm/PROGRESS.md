@@ -14,7 +14,7 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 1, step 1.1.
+Phase 2, step 2.1.
 
 ## Phases
 
@@ -22,15 +22,15 @@ Phase 1, step 1.1.
 - [x] 0.1 RESEARCH.md, DESIGN.md, PROGRESS.md
 
 ### 1 Shadow core
-- [ ] 1.1 `--shadow NAME [WxH]` start mode: headless, injection on, no config, no binds, no
+- [x] 1.1 `--shadow NAME [WxH]` start mode: headless, injection on, no config, no binds, no
       borders or gaps, named control socket
-- [ ] 1.2 single layout in a shadow: first window fills the output, later ones float centred
-- [ ] 1.3 manager in the main compositor: registry, start, supervision, cleanup at exit
-- [ ] 1.4 requests `vwm open|list|info|close|resize|where` on the control socket
-- [ ] 1.5 command line `wirbel vwm open|list|info|close|resize` and the `invisible` aliases
-- [ ] 1.6 private D-Bus session bus per shadow, `--share-bus`, `--env`
-- [ ] 1.7 program recipes (Firefox, Chromium family) with profiles in the state folder
-- [ ] 1.8 integration tests `tests/vwm.rs`
+- [x] 1.2 single layout in a shadow: first window fills the output, later ones float centred
+- [x] 1.3 manager in the main compositor: registry, start, supervision, cleanup at exit
+- [x] 1.4 requests `vwm open|list|info|close|resize|where` on the control socket
+- [x] 1.5 command line `wirbel vwm open|list|info|close|resize` and the `invisible` aliases
+- [x] 1.6 private D-Bus session bus per shadow, `--share-bus`, `--env`
+- [x] 1.7 program recipes (Firefox, Chromium family) with profiles in the state folder
+- [x] 1.8 integration tests `tests/vwm.rs`
 
 ### 2 Control
 - [ ] 2.1 absolute pointer requests: move, click, drag, scroll
@@ -81,4 +81,14 @@ Phase 1, step 1.1.
 
 ## Notes and known problems
 
-(none yet)
+- Tests of shadows (`tests/vwm.rs`) start the real binary headless and need a GPU render node.
+  The harness compositor plays the desktop; `Manager::binary` and `Manager::state_root` point it
+  at the test binary and a scratch folder.
+- `vwm open` answers once the shadow takes requests, not once the program has a window. Until
+  `vwm wait NAME window` exists (phase 3), scripts sleep or poll `vwm info`.
+- A command that cannot be started still gives a shadow, which ends after its 3 s of grace; the
+  reason is in its `shadow.log`.
+- The browser recipes (own profile for Firefox and the Chromium family) are covered by unit
+  tests only; try a real browser in the smoke script of phase 2.
+- Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
+  the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

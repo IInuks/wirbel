@@ -27,6 +27,7 @@ pub mod state;
 pub mod stats;
 #[cfg(feature = "test-harness")]
 pub mod test_harness;
+pub mod vwm;
 pub mod window_hook;
 pub mod workspace;
 pub mod xwayland;

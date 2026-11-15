@@ -28,6 +28,7 @@ use smithay::reexports::{
 
 const USAGE: &str = "usage: wirbel [--config FILE] [-c COMMAND]... [--timeout SECONDS] [--log FILE]
                      [--headless [WxH]] [--test-input]
+       wirbel vwm open|list|info|resize|close ..., see `wirbel vwm --help`
        wirbel check [CONFIG]
        wirbel pos [(now|MILLISECONDS|loop) [x|y|xy] [DECIMALS|max]] [--once] [--json]
        wirbel distance [SECONDS|loop] [DECIMALS|max]
@@ -152,6 +153,8 @@ struct Options {
     headless: Option<(i32, i32)>,
     /// Whether `wirbel inject` may play input.
     test_input: bool,
+    /// The name of the invisible window this process is the shadow of, see `crate::vwm`.
+    shadow: Option<String>,
 }
 
 fn seconds(value: Option<String>) -> Result<Duration, String> {
@@ -172,6 +175,17 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     args.next();
                 }
                 options.headless = Some(size.unwrap_or(backend::headless::DEFAULT_SIZE));
+            }
+            // Not in the usage: the visible compositor starts shadows, nobody does by hand.
+            "--shadow" => {
+                options.shadow = Some(args.next().ok_or(USAGE)?);
+                let size = args
+                    .peek()
+                    .and_then(|next| backend::headless::parse_size(next));
+                if size.is_some() {
+                    args.next();
+                }
+                options.headless = Some(size.unwrap_or(crate::vwm::DEFAULT_SIZE));
             }
             "-c" | "--command" => options.commands.push(args.next().ok_or(USAGE)?),
             "--config" => options.config_path = Some(args.next().ok_or(USAGE)?.into()),
@@ -263,11 +277,11 @@ fn run(
         backend::Kind::Headless => options.config_path.clone(),
         _ => options.config_path.clone().or_else(Config::default_path),
     };
-    let mut state = Wirbel::new(
-        &mut event_loop,
-        display,
-        load_config(config_path.as_deref()),
-    )?;
+    let config = match options.shadow {
+        Some(_) => crate::vwm::shadow::config(),
+        None => load_config(config_path.as_deref()),
+    };
+    let mut state = Wirbel::new(&mut event_loop, display, config)?;
     state.config_path = config_path;
     for extension in extensions {
         state.add_extension(extension);
@@ -315,12 +329,21 @@ fn run(
 
     state.start_xwayland();
     tracing::info!(socket = ?state.socket_name, "compositor ready");
-    for command in options.commands.iter().chain(&state.config.exec_once) {
-        state.autostart(command);
+    match &options.shadow {
+        Some(name) => {
+            let handle = event_loop.handle();
+            crate::vwm::shadow::start(&mut state, &handle, name, &options.commands);
+        }
+        None => {
+            for command in options.commands.iter().chain(&state.config.exec_once) {
+                state.autostart(command);
+            }
+            state.sync_plugins();
+        }
     }
-    state.sync_plugins();
 
     event_loop.run(None, &mut state, Wirbel::after_dispatch)?;
+    crate::vwm::shadow::end(&mut state);
     safety::end_autostart();
     tracing::info!("stopped");
     Ok(state.restart)
@@ -359,7 +382,7 @@ pub fn main(extensions: Vec<Rc<dyn Extension>>) {
     let mut args = env::args().skip(1).peekable();
     if let Some(
         command @ ("pos" | "distance" | "move" | "click" | "ws" | "mmsg" | "plug" | "restart"
-        | "inject"),
+        | "inject" | "vwm"),
     ) = args.peek().map(String::as_str)
     {
         let command = command.to_string();
@@ -374,6 +397,7 @@ pub fn main(extensions: Vec<Rc<dyn Extension>>) {
             "plug" => crate::plugin::plug(&args),
             "restart" => crate::cli::restart(&args),
             "inject" => crate::cli::inject(&args),
+            "vwm" => crate::vwm::cli::run(&args),
             _ => crate::cli::move_pointer(&args),
         };
         if let Err(err) = result {

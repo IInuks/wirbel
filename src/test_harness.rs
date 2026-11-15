@@ -11,7 +11,7 @@ pub use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     os::{fd::AsFd, unix::net::UnixStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
@@ -771,7 +771,12 @@ pub struct Client {
 
 impl Client {
     pub fn connect(compositor: &Compositor) -> Self {
-        let stream = UnixStream::connect(&compositor.socket).unwrap();
+        Self::connect_path(&compositor.socket)
+    }
+
+    /// A client of the compositor that listens on this Wayland socket.
+    pub fn connect_path(socket: &Path) -> Self {
+        let stream = UnixStream::connect(socket).unwrap();
         let connection = Connection::from_socket(stream).unwrap();
         let (globals, queue) = registry_queue_init::<ClientState>(&connection).unwrap();
         let handle = queue.handle();

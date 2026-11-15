@@ -615,6 +615,13 @@ impl Wirbel {
         while let Some(line) = self.ipc.next_line(id) {
             match Request::parse(&line) {
                 Ok(request) => self.handle_request(id, request),
+                Err(_) if let Some(answer) = crate::vwm::request(self, id, &line) => {
+                    if let Some(answer) = answer {
+                        for line in answer.lines() {
+                            self.ipc.reply(id, line);
+                        }
+                    }
+                }
                 Err(_) if let Some((name, argument)) = crate::extension::parse_request(&line) => {
                     match self.extension_command(name, &argument) {
                         Ok(answer) => self.ipc.reply(id, &answer),
