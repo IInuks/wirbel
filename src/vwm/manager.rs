@@ -242,8 +242,9 @@ pub fn with_recipe(command: &str, dir: &Path) -> String {
 
 /// The card for shadows when the configuration names none: with several cards, one that is not
 /// driven by `nvidia`. That is the integrated one, which is enough for windows nobody looks at
-/// and leaves the other to the screen; and a headless wirbel on the nvidia driver was seen to
-/// crash when a browser connects. `None` leaves the choice to the headless backend.
+/// and leaves the other to the screen. It also keeps shadows off a card whose user space
+/// driver may be missing where they run, which ends in a crash inside Mesa. `None` leaves the
+/// choice to the headless backend.
 pub fn quiet_card(cards: impl Iterator<Item = (String, String)>) -> Option<String> {
     let mut cards: Vec<(String, String)> = cards.collect();
     cards.sort();

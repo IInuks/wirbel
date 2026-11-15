@@ -26,7 +26,6 @@ What is left, in the order of use:
    the test harness) that draws the pictures of `shadow shot` into shm buffers and sends what
    it gets from its seat as `inject at`, `inject button` and a new `inject code EVDEV down|up`.
 4. Step 7.4, input into parked windows, if it is wanted at all.
-5. The crash of a headless wirbel on the nvidia card (see the notes).
 
 ## Phases
 
@@ -135,12 +134,13 @@ What is left, in the order of use:
   picture enlarged first, and whether `--psm 11` (sparse text) reads windows better than the
   default. `WIRBEL_OCR_LANG` or `--lang` picks languages.
 - `vwm text --via clipboard` presses CTRL+a and CTRL+c; terminals do not select all that way.
-- KNOWN PROBLEM: a headless wirbel that renders on a card of the `nvidia` driver crashes
-  (SIGSEGV, no panic message) as soon as Firefox connects; a terminal works there. On the
-  other card everything works. Not found yet where: run
-  `WIRBEL_SHADOW_GPU=cardN wirbel --shadow x 800x600 -c firefox` under a debugger. Until then
-  shadows pick the card that is not nvidia (`manager::quiet_card`), `vwm_gpu` in the config
-  overrides. A machine with only an nvidia card is affected.
+- A headless wirbel that renders on a card of the `nvidia` driver crashed (SIGSEGV) as soon
+  as Firefox connected, but only where the NVIDIA user space libraries are missing: there Mesa
+  takes the card and jumps into code that is gone (seen in a core dump: `libEGL_mesa` and
+  `libgallium` on the nvidia node). With the NVIDIA libraries present the same shadow runs.
+  Shadows still prefer a card that is not nvidia when there are several
+  (`manager::quiet_card`): it is enough for windows nobody looks at, leaves the other card to
+  the screen, and avoids that trap. `vwm_gpu` in the config overrides.
 - Tried with real programs (headless desktop, see below): kitty (type, paste, drag, shot) and
   Firefox with its own profile; `examples/macros/page-title.wm` returned the title of
   example.com.
