@@ -157,6 +157,23 @@ Logs of every plugin are in `~/.local/state/wirbel/plugins/`.
 
 How to write your own: [`docs/PLUGINS.md`](docs/PLUGINS.md).
 
+## Invisible windows and macros
+
+`wirbel vwm` runs programs in windows that never show on the screen and drives them with
+commands; `wirbel macro` runs files of such steps.
+
+```sh
+wirbel vwm open --name page firefox
+wirbel vwm wait page ready
+wirbel vwm key page CTRL+l
+wirbel vwm type page "https://example.com"
+wirbel vwm key page ENTER
+wirbel vwm shot page page.png
+wirbel vwm close page
+```
+
+See [docs/vwm/GUIDE.md](docs/vwm/GUIDE.md) and [docs/vwm/MACROS.md](docs/vwm/MACROS.md).
+
 ## Trying it without logging out
 
 Started from inside another Wayland or X11 session, wirbel opens as a window, which is handy for

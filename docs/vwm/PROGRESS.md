@@ -77,7 +77,7 @@ Phase 6, step 6.1. Before that, if `tesseract` is installed by then: try `wirbel
 
 ### 11 Viewer and finish
 - [ ] 11.1 `vwm show|hide`
-- [ ] 11.2 limits, memory column, README, GUIDE.md
+- [ ] 11.2 limits, memory column (README section and GUIDE.md are written; keep them current)
 
 ## Notes and known problems
 
