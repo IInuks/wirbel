@@ -21,7 +21,7 @@ use crate::{
     ipc::{json_string, socket_path},
 };
 
-pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--share-bus] [--env KEY=VALUE]... [--] COMMAND...
+pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--share-bus] [--sound] [--env KEY=VALUE]... [--] COMMAND...
        wirbel vwm list [--json]
        wirbel vwm info NAME
        wirbel vwm resize NAME WxH
@@ -44,7 +44,8 @@ pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--sh
        wirbel vwm find NAME FILE.png [SIMILARITY]
        wirbel vwm text NAME [--via a11y|ocr|clipboard] [--find GLOB] [--where] [--lang LANGUAGES]
        wirbel vwm click-text NAME GLOB [left|right|middle]
-       wirbel vwm ui NAME tree | press LABEL | set LABEL TEXT...";
+       wirbel vwm ui NAME tree | press LABEL | set LABEL TEXT...
+       wirbel vwm audio NAME listen on|off | level [SECONDS] | record FILE.wav [SECONDS]";
 
 pub const HELP: &str =
     "vwm runs programs in invisible windows: they never show on the screen and never take the
@@ -100,6 +101,11 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
       ui         the controls of the window by the accessibility interface: tree prints them,
                  press does what a click on the one named LABEL does, set replaces the text of
                  the field named LABEL. LABEL is a GLOB on the name or the text
+      audio      the sound of the window. A program started invisibly is silent: it plays into
+                 a sink of its own (open --sound lets it play on the speakers instead).
+                 listen on routes that sink to the speakers and off stops that, level prints
+                 how loud it is right now from 0 to 1, record writes it to a WAV file for
+                 SECONDS or until Ctrl+C. The wait conditions sound and silence [MS] use it
       click-text click the middle of the first line that matches GLOB (ocr)
 Exit status: 0 done, 1 failed, 2 wrong usage, 3 the time of a wait ran out.
 `wirbel vwm invisible create|close|screenshot ...` mean the same as `wirbel vwm open|close|shot ...`.
@@ -317,7 +323,51 @@ pub fn parse_open(args: &[String]) -> Result<Open, String> {
 }
 
 fn open(args: &[String]) -> Result<(), String> {
-    let open = parse_open(args)?;
+    let sound = args
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--sound");
+    let args: Vec<String> = match args.iter().position(|arg| arg == "--sound") {
+        Some(at) if sound => args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != at)
+            .map(|(_, a)| a.clone())
+            .collect(),
+        _ => args.to_vec(),
+    };
+    let mut open = parse_open(&args)?;
+    let taken: Vec<String> = rows()
+        .map(|rows| rows.into_iter().map(|row| row.name).collect())
+        .unwrap_or_default();
+    super::audio::sweep(&taken);
+    // The sink needs the name before the window has one: make it up here as the compositor
+    // would. Without a sound server the program plays as it would anyway.
+    if !sound {
+        let name = open.name.clone().unwrap_or_else(|| {
+            let base: String = super::manager::program_of(&open.command)
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .take(24)
+                .collect();
+            let base = if base.is_empty() {
+                "window".to_string()
+            } else {
+                base
+            };
+            (1..)
+                .map(|n| format!("{base}{n}"))
+                .find(|name| !taken.contains(name))
+                .unwrap_or_default()
+        });
+        if !taken.contains(&name)
+            && let Ok(sink) = super::audio::create_sink(&name)
+        {
+            open.name = Some(name);
+            open.env.push(("PULSE_SINK".into(), sink.clone()));
+            open.env.push(("PIPEWIRE_NODE".into(), sink));
+        }
+    }
     emit(ask_main(&open.to_line())?.to_string());
     Ok(())
 }
@@ -393,6 +443,8 @@ fn close(args: &[String]) -> Result<(), String> {
             false => !left.iter().any(|row| names.contains(&&row.name)),
         };
         if gone {
+            let closed: Vec<String> = left.iter().map(|row| row.name.clone()).collect();
+            super::audio::sweep(&closed);
             return Ok(());
         }
         if start.elapsed() > CLOSE_PATIENCE {
@@ -1037,6 +1089,34 @@ fn ui(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn audio(args: &[String]) -> Result<(), String> {
+    use super::audio::{Listener, listen, record};
+    let seconds = |text: &String| {
+        let time = Duration::try_from_secs_f64(number(text.trim_end_matches('s'))?);
+        time.map_err(|_| "the time cannot be negative".to_string())
+    };
+    match args {
+        [name, word, state] if word == "listen" && (state == "on" || state == "off") => {
+            listen(name, state == "on")
+        }
+        [name, word] if word == "level" => {
+            let level = Listener::of(name)?.level(Duration::from_millis(300))?;
+            emit(format!("{level:.4}"));
+            Ok(())
+        }
+        [name, word, time] if word == "level" => {
+            let level = Listener::of(name)?.level(seconds(time)?)?;
+            emit(format!("{level:.4}"));
+            Ok(())
+        }
+        [name, word, file] if word == "record" => record(name, &absolute(file)?, None),
+        [name, word, file, time] if word == "record" => {
+            record(name, &absolute(file)?, Some(seconds(time)?))
+        }
+        _ => Err(USAGE.into()),
+    }
+}
+
 fn click_text(args: &[String]) -> Result<(), String> {
     let (name, pattern, rest) = match args {
         [name, pattern, rest @ ..] if rest.len() <= 1 => (name, pattern, rest),
@@ -1117,6 +1197,7 @@ pub const COMMANDS: &[&str] = &[
     "text",
     "click-text",
     "ui",
+    "audio",
     "adopt",
     "release",
     "windows",
@@ -1169,6 +1250,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "text" => text(rest),
         "click-text" => click_text(rest),
         "ui" => ui(rest),
+        "audio" => audio(rest),
         "--help" | "-h" | "help" => {
             emit(format!("{USAGE}\n\n{HELP}"));
             Ok(())

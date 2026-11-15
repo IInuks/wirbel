@@ -20,6 +20,8 @@
 //! - `loaded`: the document in the window is no longer loading. The program is asked through
 //!   the accessibility interface; where it has none, the window counts as loaded when its
 //!   picture has rested for 0.8 s and the pointer is no busy one. Answers which of the two.
+//! - `sound`: the window plays something. `silence [MS]`: it has played nothing for MS
+//!   milliseconds, 500 if not given. Both need the sink of its own that `open` gives a window.
 //! - `cursor NAME`: the pointer has that shape, such as `text`, `pointer`, `wait`, `default`.
 //! - `clipboard`: something new was copied.
 //! - `file PATH`: that file exists.
@@ -167,6 +169,10 @@ pub enum Condition {
     Text(String),
     /// The document in the window has loaded.
     Loaded,
+    /// The window plays something.
+    Sound,
+    /// It has played nothing for this long.
+    Silence(Duration),
 }
 
 /// `#RRGGBB`, with or without the `#`.
@@ -222,6 +228,9 @@ impl Condition {
             }
             ["text", pattern @ ..] if !pattern.is_empty() => Self::Text(pattern.join(" ")),
             ["loaded"] => Self::Loaded,
+            ["sound"] => Self::Sound,
+            ["silence"] => Self::Silence(DEFAULT_STABLE),
+            ["silence", ms] => Self::Silence(Duration::from_millis(number(ms)? as u64)),
             ["cursor", name] => Self::Cursor(name.to_string()),
             ["clipboard"] => Self::Clipboard,
             ["file", path @ ..] if !path.is_empty() => Self::File(path.join(" ").into()),
@@ -229,7 +238,7 @@ impl Condition {
                 return Err(
                     "expected a condition: ready, window [GLOB], title GLOB, closed, exited, \
                      stable [MS], changed [X,Y,W,H], pixel X Y #RRGGBB [TOLERANCE], \
-                     image FILE [SIMILARITY], text GLOB, loaded, cursor NAME, clipboard or file PATH"
+                     image FILE [SIMILARITY], text GLOB, loaded, sound, silence [MS], cursor NAME, clipboard or file PATH"
                         .into(),
                 );
             }
@@ -352,13 +361,35 @@ pub struct Watcher {
     /// The lines of text read from the picture, and the damage count they are of.
     lines: Option<(u64, Vec<super::text::Line>)>,
     display: String,
+    /// The name of the window, if it was found by one: its sound goes by the name.
+    name: Option<String>,
+    listener: Option<super::audio::Listener>,
+    /// When the window was last heard, and since when it is listened to.
+    last_sound: Option<Instant>,
+    listening_since: Instant,
     /// The accessibility bus of the window: not tried yet, there, or not to be had.
     tree: Option<Option<super::a11y::Tree>>,
 }
 
 impl Watcher {
     pub fn of(name: &str) -> Result<Self, String> {
-        Self::on(&super::cli::display_of(name)?)
+        let mut watcher = Self::on(&super::cli::display_of(name)?)?;
+        watcher.name = Some(name.to_string());
+        Ok(watcher)
+    }
+
+    /// How loud the window is during the next tenth of a second.
+    pub fn sound_level(&mut self) -> Result<f64, String> {
+        if self.listener.is_none() {
+            let name = self
+                .name
+                .as_deref()
+                .ok_or("sound needs the name of the window")?;
+            self.listener = Some(super::audio::Listener::of(name)?);
+            self.listening_since = Instant::now();
+        }
+        let listener = self.listener.as_mut().expect("just made");
+        listener.level(Duration::from_millis(100))
     }
 
     /// Of the shadow on this Wayland display.
@@ -369,6 +400,10 @@ impl Watcher {
             picture: None,
             lines: None,
             display: display.to_string(),
+            name: None,
+            listener: None,
+            last_sound: None,
+            listening_since: Instant::now(),
             tree: None,
         })
     }
@@ -501,6 +536,25 @@ fn check(
             }
             let busy = ["wait", "progress"].contains(&status.cursor.as_str());
             seen(status.quiet >= LOADED_QUIET && !busy, "picture".into())
+        }
+        Condition::Sound | Condition::Silence(_) => {
+            // Each look listens for a tenth of a second.
+            let level = watcher.sound_level()?;
+            let loud = level >= super::audio::QUIET;
+            if loud {
+                watcher.last_sound = Some(Instant::now());
+            }
+            match condition {
+                Condition::Sound => seen(loud, format!("{level:.4}")),
+                Condition::Silence(time) => {
+                    let quiet = watcher
+                        .last_sound
+                        .unwrap_or(watcher.listening_since)
+                        .elapsed();
+                    seen(!loud && quiet >= *time, String::new())
+                }
+                _ => unreachable!(),
+            }
         }
         Condition::Cursor(name) => seen(status.cursor == *name, status.cursor.clone()),
         Condition::Clipboard => seen(status.clipboard != start.status.clipboard, String::new()),

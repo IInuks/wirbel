@@ -38,6 +38,7 @@ Positions are pixels from the top left corner of the window. The window is 1280x
 | `clip NAME get\|set TEXT` | the window's own clipboard |
 | `text NAME [--via a11y\|ocr\|clipboard] [--find GLOB] [--where]`, `click-text NAME GLOB` | read text, click on text |
 | `ui NAME tree`, `ui NAME press LABEL`, `ui NAME set LABEL TEXT` | controls through the accessibility interface |
+| `audio NAME listen on\|off`, `audio NAME level`, `audio NAME record FILE.wav [S]` | its sound |
 | `wait NAME CONDITION [--timeout S]` | wait for a state |
 
 `wirbel vwm --help` has every option. A wait whose time runs out exits with status 3, so shell
@@ -45,10 +46,12 @@ scripts can tell it from a failure (1).
 
 Wait conditions: `ready`, `window [GLOB]`, `title GLOB`, `closed`, `exited`, `stable [MS]`,
 `changed [X,Y,W,H]`, `pixel X Y #RRGGBB`, `image FILE.png`, `text GLOB`, `loaded`, `cursor NAME`,
-`clipboard`, `file PATH`.
+`clipboard`, `file PATH`, `sound`, `silence [MS]`.
 
 ## Good to know
 
+- An invisible window is silent: its program plays into a sink of its own. `audio NAME listen
+  on` lets you hear it, `open --sound` starts a program that plays on the speakers as usual.
 - Typing uses the keyboard layout of the desktop, including AltGr. Text the layout has no key
   for (other scripts, emoji) goes through `paste`. Terminals paste with
   `paste NAME --key CTRL+SHIFT+v TEXT`.
@@ -94,5 +97,5 @@ wirbel vwm release music
 
 ## Not there yet
 
-Input into parked windows, sound and video recording, the remote control protocol of browsers and a window to look into an
+Input into parked windows, video recording, the remote control protocol of browsers and a window to look into an
 invisible one are planned; [PROGRESS.md](PROGRESS.md) says how far they are.

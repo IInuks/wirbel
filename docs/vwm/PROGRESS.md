@@ -14,7 +14,7 @@ then `DESIGN.md`, and carries on at "Next action".
 
 ## Next action
 
-Phase 8, step 8.1 (audio). Step 7.4 is optional and can wait. If `tesseract` is installed by
+Phase 9, step 9.1 (video). Step 7.4 is optional and can wait. If `tesseract` is installed by
 then, first try `wirbel vwm text NAME --via ocr` on a real window (see the notes).
 
 ## Phases
@@ -70,7 +70,7 @@ then, first try `wirbel vwm text NAME --via ocr` on a real window (see the notes
       until then typing and clicking refuse parked windows with a clear message)
 
 ### 8 Audio
-- [ ] 8.1 null sink per instance, `record`, `listen`, `level`, sound and silence events
+- [x] 8.1 null sink per instance, `record`, `listen`, `level`, sound and silence events
 
 ### 9 Video
 - [ ] 9.1 `record` through `ffmpeg`, frame export
@@ -147,5 +147,12 @@ then, first try `wirbel vwm text NAME --via ocr` on a real window (see the notes
 - `status`, `wait`, `text` and `ui` do not work on parked windows yet: they go to the control
   socket of a shadow. Pictures of parked windows are taken by every backend
   (`vwm::shot::take_parked`), tried on the headless one with a real terminal.
+- Sound (`src/vwm/audio.rs`) is done by the command, not the compositor: `open` makes a null
+  sink `wirbel-vwm-NAME` with `pactl` and starts the program with `PULSE_SINK`; the module
+  number is in the state folder of the window, `close` and the next `open` unload what is left
+  over. A window that ends by itself keeps its sink until then. Windows opened by a macro get
+  one too (macros run the same `open`); windows opened through the socket alone do not.
+- `audio listen on` was not tried by ear. `sound`, `silence`, `level` and `record` were tried
+  with a tone played in an invisible terminal.
 - Try by hand without touching a running desktop: start `wirbel --headless --log FILE`, read
   the socket name from the log, set `WAYLAND_DISPLAY` to it, then `wirbel vwm ...`.

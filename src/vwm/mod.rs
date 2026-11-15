@@ -9,6 +9,7 @@
 //! (`inject`, `windows`, `subscribe`).
 
 pub mod a11y;
+pub mod audio;
 pub mod cli;
 pub mod clip;
 pub mod json;
