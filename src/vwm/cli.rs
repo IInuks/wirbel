@@ -47,6 +47,7 @@ pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--sh
        wirbel vwm ui NAME tree | press LABEL | click LABEL | where LABEL | set LABEL TEXT...
        wirbel vwm audio NAME listen on|off | level [SECONDS] | record FILE.wav [SECONDS]
        wirbel vwm record NAME FILE [--fps N] [--audio] [SECONDS]
+       wirbel vwm show NAME | hide NAME
        wirbel vwm web NAME goto URL | eval SCRIPT... | text [SELECTOR] | html SELECTOR | click SELECTOR
                            | fill SELECTOR TEXT... | exists SELECTOR | count SELECTOR | title | url";
 
@@ -58,7 +59,7 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
                  not given. The program gets a D-Bus session bus of its own, so that it does not
                  hand the start to a visible instance of itself; --share-bus gives it the bus of
                  the desktop. Browsers get a profile of their own in
-                 ~/.local/state/wirbel/vwm/NAME/. Options of the program itself go after `--`
+                 ~/.local/state/wirbel/vwm/DISPLAY/NAME/. Options of the program itself go after `--`
       list       the invisible windows: name, kind (shadow: started invisibly, parked: taken
                  from the desktop), state, id, size, age, the memory of the hidden wirbel and
                  its program together, and the command (the title for a parked window)
@@ -124,6 +125,11 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
                  makes the browser listen on a port of this machine, which lets every program
                  of this machine control that browser
       click-text click the middle of the first line that matches GLOB (ocr)
+      show       open a normal window on the desktop that shows the invisible one live and
+                 passes keys, clicks and the wheel on to it. The invisible window keeps its
+                 size, the picture is scaled to fit. Closing that window or hide hides it
+                 again; the program goes on running invisibly
+      hide       close the window that show opened
 Exit status: 0 done, 1 failed, 2 wrong usage, 3 the time of a wait ran out.
 `wirbel vwm invisible create|close|screenshot ...` mean the same as `wirbel vwm open|close|shot ...`.
 Positions are pixels from the top left corner of the window.";
@@ -1483,6 +1489,99 @@ pub const COMMANDS: &[&str] = &[
     "windows",
 ];
 
+/// Where the process id of the viewer of `name` is kept.
+fn viewer_pid_file(name: &str) -> Result<std::path::PathBuf, String> {
+    super::manager::state_dir(name)
+        .map(|dir| dir.join("viewer.pid"))
+        .ok_or_else(|| "cannot tell where the state folder is".into())
+}
+
+/// The viewer of `name` if one runs: the pid in its file, still alive and still a viewer.
+fn running_viewer(name: &str) -> Option<i32> {
+    let text = std::fs::read_to_string(viewer_pid_file(name).ok()?).ok()?;
+    let pid: i32 = text.trim().parse().ok()?;
+    let command = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let words: Vec<&[u8]> = command.split(|b| *b == 0).collect();
+    let ours = words
+        .windows(2)
+        .any(|pair| pair[0] == b"viewer" && pair[1] == name.as_bytes());
+    ours.then_some(pid)
+}
+
+fn show(args: &[String]) -> Result<(), String> {
+    let [name] = args else {
+        return Err(USAGE.into());
+    };
+    if !cfg!(feature = "vwm-viewer") {
+        return Err("this wirbel was built without the viewer (feature vwm-viewer)".into());
+    }
+    // Fails early and clearly for a name that is no invisible window started with open.
+    display_of(name)?;
+    if running_viewer(name).is_some() {
+        return Err(format!(
+            "`{name}` is shown already, `wirbel vwm hide {name}` hides it"
+        ));
+    }
+    let pid_file = viewer_pid_file(name)?;
+    let log = pid_file.with_file_name("viewer.log");
+    let log = std::fs::File::create(&log).map_err(|err| format!("{}: {err}", log.display()))?;
+    let exe = std::env::current_exe().map_err(|err| format!("cannot find wirbel itself: {err}"))?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(["vwm", "viewer", name])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log);
+    // On its own, so that it outlives the terminal it was started from.
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and touches nothing of the parent.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    let child = command
+        .spawn()
+        .map_err(|err| format!("failed to start the viewer: {err}"))?;
+    std::fs::write(&pid_file, child.id().to_string())
+        .map_err(|err| format!("{}: {err}", pid_file.display()))?;
+    Ok(())
+}
+
+fn hide(args: &[String]) -> Result<(), String> {
+    let [name] = args else {
+        return Err(USAGE.into());
+    };
+    let Some(pid) = running_viewer(name) else {
+        return Err(format!("`{name}` is not shown"));
+    };
+    // SAFETY: a plain signal to a process we just checked is our viewer.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let _ = std::fs::remove_file(viewer_pid_file(name)?);
+    Ok(())
+}
+
+#[cfg(feature = "vwm-viewer")]
+fn viewer(name: &str) -> Result<(), String> {
+    let result = super::viewer::run(name);
+    // The file is ours only while it names this process.
+    if let Ok(file) = viewer_pid_file(name)
+        && std::fs::read_to_string(&file)
+            .is_ok_and(|pid| pid.trim() == std::process::id().to_string())
+    {
+        let _ = std::fs::remove_file(file);
+    }
+    result
+}
+
+#[cfg(not(feature = "vwm-viewer"))]
+fn viewer(_: &str) -> Result<(), String> {
+    Err("this wirbel was built without the viewer (feature vwm-viewer)".into())
+}
+
 /// `wirbel vwm ARGS`.
 pub fn run(args: &[String]) -> Result<(), String> {
     // `invisible` is an optional word, and two commands have a second name.
@@ -1533,6 +1632,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "audio" => audio(rest),
         "record" => record(rest),
         "web" => web(rest),
+        "show" => show(rest),
+        "hide" => hide(rest),
+        // What `show` starts in the background.
+        "viewer" => match rest {
+            [name] => viewer(name),
+            _ => Err(USAGE.into()),
+        },
         "--help" | "-h" | "help" => {
             emit(format!("{USAGE}\n\n{HELP}"));
             Ok(())

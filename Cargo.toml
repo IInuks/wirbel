@@ -13,9 +13,11 @@ name = "wirbel"
 path = "src/main.rs"
 
 [features]
-default = ["vwm-a11y"]
+default = ["vwm-a11y", "vwm-viewer"]
 # Reading text and pressing controls through the accessibility interface (AT-SPI).
 vwm-a11y = ["dep:zbus"]
+# `wirbel vwm show`: a window on the desktop that shows an invisible one (`src/vwm/viewer.rs`).
+vwm-viewer = ["dep:wayland-client", "dep:wayland-protocols"]
 # The headless test harness (`wirbel::test_harness`) for the tests of wirbel and of programs that
 # build on it: a compositor on its own thread, a Wayland test client, rendering with pixman.
 test-harness = [

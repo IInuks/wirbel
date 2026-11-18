@@ -18,6 +18,8 @@ pub mod park;
 pub mod shadow;
 pub mod shot;
 pub mod text;
+#[cfg(feature = "vwm-viewer")]
+pub mod viewer;
 pub mod wait;
 pub mod web;
 

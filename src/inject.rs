@@ -17,8 +17,10 @@
 //! - `inject motion DX DY` moves the mouse by that much, like a relative libinput motion.
 //! - `inject at X Y` puts the pointer at that place of the layout, like a tablet or a touchpad
 //!   in absolute mode would.
-//! - `inject button left|right|middle down|up`.
+//! - `inject button left|right|middle|CODE down|up`, CODE an evdev button code such as 275.
 //! - `inject wheel STEPS` turns the wheel by that many notches, positive is down.
+//! - `inject code EVDEV down|up` presses or releases a key by its evdev code, as the keyboard
+//!   of a viewer reports it; the layout of this wirbel makes a character of it.
 //!
 //! Each answers `ok` or `error MESSAGE`. A key NAME is one character or an xkb keysym name such
 //! as `Return`, `space` or `Escape`.
@@ -53,14 +55,34 @@ const NOTCH: f64 = 15.0;
 /// One injected input event, or a few that belong together.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inject {
-    Key { key: Keysym, down: bool },
+    Key {
+        key: Keysym,
+        down: bool,
+    },
     Tap(Keysym),
-    Chord { modifiers: Modifiers, key: Keysym },
+    Chord {
+        modifiers: Modifiers,
+        key: Keysym,
+    },
     Type(String),
-    Motion { dx: f64, dy: f64 },
-    At { x: f64, y: f64 },
-    Button { button: u32, down: bool },
+    Motion {
+        dx: f64,
+        dy: f64,
+    },
+    At {
+        x: f64,
+        y: f64,
+    },
+    Button {
+        button: u32,
+        down: bool,
+    },
     Wheel(f64),
+    /// A key by its evdev code, whatever the layout makes of it: what a viewer passes on.
+    Code {
+        code: u32,
+        down: bool,
+    },
 }
 
 /// Letters with an accent, by the dead key that makes them: each accented one lines up
@@ -120,17 +142,23 @@ fn parse_button_name(name: &str) -> Result<u32, String> {
         "left" => Ok(BTN_LEFT),
         "right" => Ok(BTN_RIGHT),
         "middle" => Ok(BTN_MIDDLE),
-        _ => Err(format!(
-            "unknown button `{name}`, expected left, right or middle"
-        )),
+        // The other buttons of a mouse by their evdev code, such as 275 and 276 for back and
+        // forward.
+        _ => match name.parse::<u32>() {
+            Ok(code) if (BTN_LEFT..BTN_LEFT + 16).contains(&code) => Ok(code),
+            _ => Err(format!(
+                "unknown button `{name}`, expected left, right, middle or an evdev code"
+            )),
+        },
     }
 }
 
-fn button_name(button: u32) -> &'static str {
+fn button_name(button: u32) -> String {
     match button {
-        BTN_RIGHT => "right",
-        BTN_MIDDLE => "middle",
-        _ => "left",
+        BTN_LEFT => "left".into(),
+        BTN_RIGHT => "right".into(),
+        BTN_MIDDLE => "middle".into(),
+        other => other.to_string(),
     }
 }
 
@@ -225,6 +253,10 @@ impl Inject {
                 format!("inject button {} {direction}", button_name(*button))
             }
             Self::Wheel(steps) => format!("inject wheel {steps:?}"),
+            Self::Code { code, down } => {
+                let direction = if *down { "down" } else { "up" };
+                format!("inject code {code} {direction}")
+            }
         }
     }
 
@@ -270,10 +302,19 @@ impl Inject {
                 down: parse_direction(direction)?,
             },
             ["wheel", steps] => Self::Wheel(parse_number(steps)?),
+            ["code", code, direction] => Self::Code {
+                code: code
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|code| *code < 0x300)
+                    .ok_or_else(|| format!("expected an evdev key code, got `{code}`"))?,
+                down: parse_direction(direction)?,
+            },
             _ => {
                 return Err(
                     "expected inject key NAME down|up, tap NAME, chord MODS+KEY, type TEXT, \
-                     motion DX DY, at X Y, button left|right|middle down|up or wheel STEPS"
+                     motion DX DY, at X Y, button left|right|middle|CODE down|up, wheel STEPS \
+                     or code EVDEV down|up"
                         .into(),
                 );
             }
@@ -361,6 +402,14 @@ impl Wirbel {
                     ButtonState::Released
                 };
                 self.on_pointer_button(button, state, InputTime::now());
+            }
+            Inject::Code { code, down } => {
+                let state = if down {
+                    KeyState::Pressed
+                } else {
+                    KeyState::Released
+                };
+                self.press_evdev(code, state);
             }
             Inject::Wheel(steps) => {
                 let mut scroll = Scroll::new(AxisSource::Wheel, InputTime::now());
@@ -620,6 +669,14 @@ mod tests {
                 down: false,
             },
             Inject::Tap(key("E")),
+            Inject::Code {
+                code: 30,
+                down: true,
+            },
+            Inject::Button {
+                button: BTN_LEFT + 3,
+                down: false,
+            },
             Inject::Tap(key("space")),
             Inject::Tap(key("ß")),
             Inject::Chord {

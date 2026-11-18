@@ -42,6 +42,7 @@ Positions are pixels from the top left corner of the window. The window is 1280x
 | `record NAME FILE [--fps N] [--audio] [S]` | film it with ffmpeg (.mp4, .webm, .gif) |
 | `web NAME goto URL`, `web NAME text [SELECTOR]`, `web NAME click SELECTOR`, `web NAME fill SELECTOR TEXT`, `web NAME eval SCRIPT` | the page of a browser opened with `open --web` |
 | `wait NAME CONDITION [--timeout S]` | wait for a state |
+| `show NAME`, `hide NAME` | look into it live in a normal window, and work in it |
 
 `wirbel vwm --help` has every option. A wait whose time runs out exits with status 3, so shell
 scripts can tell it from a failure (1).
@@ -54,8 +55,9 @@ Wait conditions: `ready`, `window [GLOB]`, `title GLOB`, `closed`, `exited`, `st
 
 - An invisible window is silent: its program plays into a sink of its own. `audio NAME listen
   on` lets you hear it, `open --sound` starts a program that plays on the speakers as usual.
-- Typing uses the keyboard layout of the desktop, including AltGr. Text the layout has no key
-  for (other scripts, emoji) goes through `paste`. Terminals paste with
+- Typing uses the keyboard layout of the desktop, including AltGr. On a layout with dead keys
+  `^`, `` ` ``, `´` and accented letters such as é are typed through the dead key. Text the
+  layout has no key for (other scripts, emoji) goes through `paste`. Terminals paste with
   `paste NAME --key CTRL+SHIFT+v TEXT`.
 - A program gets a D-Bus session bus of its own, so that it starts a new instance instead of
   handing over to a visible one. `--share-bus` gives it the bus of the desktop, for programs
@@ -67,8 +69,16 @@ Wait conditions: `ready`, `window [GLOB]`, `title GLOB`, `closed`, `exited`, `st
 - Invisible windows end with the desktop: logging out or `wirbel restart` closes them.
 - `text --via a11y` and `ui` ask the program itself (GTK, Qt, browsers): exact text, controls
   by name, and `wait NAME loaded` knows when a page has loaded.
-- Reading text from a picture needs the program `tesseract` installed (and a language pack);
-  without it `text --via clipboard` still works where a program has select all and copy.
+- Reading text from a picture needs the program `tesseract` installed (and a language pack;
+  on Void `tesseract-ocr` with `tesseract-ocr-eng` and `tesseract-ocr-deu`); without it
+  `text --via clipboard` still works where a program has select all and copy. The picture is
+  enlarged three times before it is read, and all installed languages are used unless
+  `--lang` or `WIRBEL_OCR_LANG` names some. A program in a terminal needs a locale the system
+  has generated; without one bash takes the bytes of an umlaut for other keys.
+- `show NAME` opens a normal window on the desktop that shows the invisible one live, scaled to
+  fit, and passes keys, clicks and the wheel on. The invisible window keeps its size
+  (`resize` changes it). Closing that window, or `hide NAME`, makes it invisible again; the
+  program goes on running. It shows windows started with `open`, not parked ones.
 - Invisible windows are rendered by `vwm_gpu` of the configuration; without it by `render_gpu`,
   else by a card that is not driven by nvidia if the machine has several.
 - Each invisible window costs about 60 MB besides its program (a hidden wirbel, an X server
@@ -120,6 +130,5 @@ like any window: keys, clicks, `text`, `ui`.
 
 ## Not there yet
 
-Input into parked windows and a window to look into an invisible one live are planned (until
-then `shot` and `record` show what it looks like);
+Input into parked windows is planned;
 [PROGRESS.md](PROGRESS.md) says how far they are.

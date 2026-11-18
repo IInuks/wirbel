@@ -1,7 +1,8 @@
 //! Pictures of what a shadow shows, written as PNG files.
 //!
 //! `shadow shot` TAB PATH TAB X,Y,W,H|- TAB cursor|- asks for one. The answer comes after the
-//! next frame: `ok WxH`, the size of the picture. The picture is drawn once more for this, as
+//! next frame: `ok WxH`, the size of the picture. A PATH that ends in `.rgba` gets the bare
+//! RGBA pixels row by row instead of a PNG, for a viewer that wants many pictures a second. The picture is drawn once more for this, as
 //! screen captures are, without the pointer unless asked for.
 
 use std::{
@@ -120,6 +121,36 @@ pub fn write_png(
         let _ = fs::remove_file(&partial);
         format!("{}: {err}", path.display())
     })
+}
+
+/// Writes the picture as a PNG, or as bare RGBA rows if the path ends in `.rgba`.
+pub fn write_picture(
+    path: &Path,
+    pixels: &[u8],
+    width: i32,
+    part: (i32, i32, i32, i32),
+) -> Result<(), String> {
+    if path.extension().is_none_or(|extension| extension != "rgba") {
+        return write_png(path, pixels, width, part);
+    }
+    let (x, y, w, h) = part;
+    let row = width as usize * 4;
+    let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+    for line in pixels.chunks_exact(row).skip(y as usize).take(h as usize) {
+        rgba.extend_from_slice(&line[x as usize * 4..(x + w) as usize * 4]);
+    }
+    if rgba.len() != w as usize * h as usize * 4 {
+        return Err("too few pixels came back".into());
+    }
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".part");
+    let partial = PathBuf::from(partial);
+    fs::write(&partial, &rgba)
+        .and_then(|()| fs::rename(&partial, path))
+        .map_err(|err| {
+            let _ = fs::remove_file(&partial);
+            format!("{}: {err}", path.display())
+        })
 }
 
 /// Reads a PNG back as rows of RGB pixels with its width and height.
@@ -241,7 +272,7 @@ where
     for (shot, window) in std::mem::take(&mut state.vwm.parked_shots) {
         let answer = window_picture(renderer, &window).and_then(|(pixels, size)| {
             let part = crop(size, shot.region).ok_or("the region is outside the picture")?;
-            write_png(&shot.path, &pixels, size.0, part)?;
+            write_picture(&shot.path, &pixels, size.0, part)?;
             Ok(format!("ok {}x{}", part.2, part.3))
         });
         let answer = answer.unwrap_or_else(|err: String| format!("error {err}"));
@@ -268,7 +299,7 @@ pub fn take(state: &mut Wirbel, renderer: &mut GlesRenderer, output: &Output) {
                 .and_then(|(pixels, size)| {
                     let part =
                         crop(*size, shot.region).ok_or("the region is outside the picture")?;
-                    write_png(&shot.path, pixels, size.0, part)?;
+                    write_picture(&shot.path, pixels, size.0, part)?;
                     Ok(format!("ok {}x{}", part.2, part.3))
                 });
             let answer = answer.unwrap_or_else(|err: String| format!("error {err}"));
@@ -307,6 +338,20 @@ mod tests {
         assert!(shot.region.is_none() && !shot.cursor);
         assert!(Shot::parse(1, "relative.png").is_err());
         assert!(Shot::parse(1, "/x.png\t-\tpointer").is_err());
+    }
+
+    #[test]
+    fn bare_pixels_are_cut_like_a_png() {
+        let path = std::env::temp_dir().join(format!("wirbel-raw-{}.rgba", std::process::id()));
+        let pixels: Vec<u8> = (0..6u8).flat_map(|n| [n, n, n, 255]).collect();
+        write_picture(&path, &pixels, 3, (1, 0, 2, 2)).unwrap();
+        let raw = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let expected: Vec<u8> = [1u8, 2, 4, 5]
+            .into_iter()
+            .flat_map(|n| [n, n, n, 255])
+            .collect();
+        assert_eq!(raw, expected);
     }
 
     #[test]

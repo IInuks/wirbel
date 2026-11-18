@@ -89,7 +89,11 @@ What is left, in the order of use:
 - [x] 10.1 `vwm web`, `loaded` and `text` through it
 
 ### 11 Viewer and finish
-- [ ] 11.1 `vwm show|hide`
+- [x] 11.1 `vwm show|hide`: `src/vwm/viewer.rs`, a Wayland client of the desktop (feature
+      `vwm-viewer`, default on). Pictures as bare RGBA (`shadow shot PATH.rgba`) whenever the
+      damage count moves, drawn bilinear to fit; input as `inject at|button|wheel` and the new
+      `inject code EVDEV down|up`. `show` starts `wirbel vwm viewer NAME` in its own session
+      and keeps its pid in `viewer.pid`; it ends with its window, `hide`, or the shadow.
 - [x] 11.2 limits (32 shadows at once), memory column in `vwm list`, README section, GUIDE.md
 
 ## Notes and known problems
