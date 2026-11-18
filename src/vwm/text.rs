@@ -2,9 +2,9 @@
 //!
 //! - By the clipboard: select all and copy are pressed in the window, and its own clipboard is
 //!   read. Exact, but it changes the selection in the program, and gives the whole text only.
-//! - By text recognition: the helper program `tesseract` reads a picture of the window. It
-//!   works on everything that draws and says where each line is, but it takes a moment and
-//!   may misread. Without `tesseract` installed this way says so and the other still works.
+//! - By text recognition: the helper program `tesseract` reads a picture of the window,
+//!   enlarged three times first. It works on everything that draws and says where each line
+//!   is, but it takes a moment and may misread. Without `tesseract` installed this way says so and the other still works.
 
 use std::{
     path::Path,
@@ -122,11 +122,170 @@ pub fn tesseract_program() -> Option<std::path::PathBuf> {
 /// Reads the text in a picture. `language` is what `tesseract -l` takes, such as `eng+deu`.
 pub fn recognise(picture: &Path, language: Option<&str>) -> Result<Vec<Line>, String> {
     let program = tesseract_program().ok_or(NO_TESSERACT)?;
+    // Screen text is small for the recognition, which wants letters some 30 pixels high: an
+    // enlarged copy reads @, umlauts and thin letters far better (measured on a terminal).
+    let (rgb, width, height) = super::shot::read_png(picture)?;
+    let factor = scale_factor(width, height);
+    let mut enlarged = picture.as_os_str().to_owned();
+    enlarged.push(".big.png");
+    let enlarged = std::path::PathBuf::from(enlarged);
+    let read_from = if factor > 1 {
+        let (big, w, h) = enlarge(&rgb, width as usize, height as usize, factor);
+        write_rgb_png(&enlarged, &big, w as u32, h as u32)?;
+        enlarged.as_path()
+    } else {
+        picture
+    };
+    let lines = run_tesseract(&program, read_from, language);
+    if factor > 1 {
+        let _ = std::fs::remove_file(&enlarged);
+    }
+    let f = factor as i32;
+    Ok(lines?
+        .into_iter()
+        .map(|line| Line {
+            x: line.x / f,
+            y: line.y / f,
+            w: (line.w + f - 1) / f,
+            h: (line.h + f - 1) / f,
+            ..line
+        })
+        .collect())
+}
+
+/// How much a picture of this size is enlarged before it is read: three times, less for big
+/// windows so that the copy stays below about 12 million pixels. `WIRBEL_OCR_SCALE` sets it.
+pub fn scale_factor(width: u32, height: u32) -> usize {
+    if let Some(factor) = std::env::var("WIRBEL_OCR_SCALE")
+        .ok()
+        .and_then(|text| text.parse::<usize>().ok())
+    {
+        return factor.clamp(1, 4);
+    }
+    let pixels = (width as f64 * height as f64).max(1.0);
+    ((12e6 / pixels).sqrt().floor() as usize).clamp(1, 3)
+}
+
+/// The Lanczos kernel with three lobes.
+fn lanczos3(x: f64) -> f64 {
+    if x == 0.0 {
+        return 1.0;
+    }
+    if x.abs() >= 3.0 {
+        return 0.0;
+    }
+    let pi_x = std::f64::consts::PI * x;
+    3.0 * pi_x.sin() * (pi_x / 3.0).sin() / (pi_x * pi_x)
+}
+
+/// For each of the `factor` places an output pixel can have between two input pixels: the
+/// first input pixel it draws on and the weights of the six it draws on.
+fn lanczos_taps(factor: usize) -> Vec<(isize, [f64; 6])> {
+    (0..factor)
+        .map(|phase| {
+            let centre = (phase as f64 + 0.5) / factor as f64 - 0.5;
+            let first = centre.floor() as isize - 2;
+            let mut weights = [0.0; 6];
+            for (k, weight) in weights.iter_mut().enumerate() {
+                *weight = lanczos3(centre - (first + k as isize) as f64);
+            }
+            let sum: f64 = weights.iter().sum();
+            weights.iter_mut().for_each(|weight| *weight /= sum);
+            (first, weights)
+        })
+        .collect()
+}
+
+/// Enlarges rows of RGB pixels by a whole factor, first along the rows, then down the columns.
+pub fn enlarge(rgb: &[u8], width: usize, height: usize, factor: usize) -> (Vec<u8>, usize, usize) {
+    let taps = lanczos_taps(factor);
+    let (wide, high) = (width * factor, height * factor);
+    let mut rows = vec![0f32; wide * height * 3];
+    for y in 0..height {
+        for x in 0..wide {
+            let (first, weights) = &taps[x % factor];
+            let base = (x / factor) as isize + first;
+            for c in 0..3 {
+                let mut sum = 0.0;
+                for (k, weight) in weights.iter().enumerate() {
+                    let sx = (base + k as isize).clamp(0, width as isize - 1) as usize;
+                    sum += weight * rgb[(y * width + sx) * 3 + c] as f64;
+                }
+                rows[(y * wide + x) * 3 + c] = sum as f32;
+            }
+        }
+    }
+    let mut out = vec![0u8; wide * high * 3];
+    for y in 0..high {
+        let (first, weights) = &taps[y % factor];
+        let base = (y / factor) as isize + first;
+        for x in 0..wide {
+            for c in 0..3 {
+                let mut sum = 0.0;
+                for (k, weight) in weights.iter().enumerate() {
+                    let sy = (base + k as isize).clamp(0, height as isize - 1) as usize;
+                    sum += weight * rows[(sy * wide + x) * 3 + c] as f64;
+                }
+                out[(y * wide + x) * 3 + c] = sum.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    (out, wide, high)
+}
+
+fn write_rgb_png(path: &Path, rgb: &[u8], width: u32, height: u32) -> Result<(), String> {
+    let fail = |err: &dyn std::fmt::Display| format!("{}: {err}", path.display());
+    let file = std::fs::File::create(path).map_err(|err| fail(&err))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder.write_header().map_err(|err| fail(&err))?;
+    writer.write_image_data(rgb).map_err(|err| fail(&err))?;
+    writer.finish().map_err(|err| fail(&err))
+}
+
+/// All installed languages, English last: its letters are in most other Latin scripts, and
+/// put first it reads ö as R. Leaves out the ones that are not a language of text.
+fn default_languages(program: &Path) -> Option<String> {
+    let output = Command::new(program)
+        .arg("--list-langs")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let languages = pick_languages(&String::from_utf8_lossy(&output.stdout));
+    (!languages.is_empty()).then_some(languages)
+}
+
+fn pick_languages(listing: &str) -> String {
+    let mut languages: Vec<&str> = listing
+        .lines()
+        .skip_while(|line| !line.starts_with("List of"))
+        .skip(1)
+        .map(str::trim)
+        .filter(|name| {
+            !name.is_empty()
+                && !["osd", "equ", "snum"].contains(name)
+                && !name.ends_with("_frak")
+                && !name.contains('/')
+        })
+        .collect();
+    languages.sort_by_key(|name| *name == "eng");
+    languages.join("+")
+}
+
+fn run_tesseract(
+    program: &Path,
+    picture: &Path,
+    language: Option<&str>,
+) -> Result<Vec<Line>, String> {
     let mut command = Command::new(program);
     command.arg(picture).arg("stdout");
     let language = language
         .map(str::to_string)
-        .or_else(|| std::env::var("WIRBEL_OCR_LANG").ok());
+        .or_else(|| std::env::var("WIRBEL_OCR_LANG").ok())
+        .or_else(|| default_languages(program));
     if let Some(language) = language.filter(|language| !language.is_empty()) {
         command.args(["-l", &language]);
     }
@@ -182,6 +341,45 @@ pub fn by_clipboard(display: &str, keys: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enlarging_keeps_flat_colour_and_the_size() {
+        let rgb = [10u8, 200, 30].repeat(4 * 3);
+        let (big, w, h) = enlarge(&rgb, 4, 3, 3);
+        assert_eq!((w, h), (12, 9));
+        assert_eq!(big.len(), 12 * 9 * 3);
+        assert!(big.chunks_exact(3).all(|p| p == [10, 200, 30]));
+    }
+
+    #[test]
+    fn enlarging_keeps_an_edge_sharp() {
+        // Black left half, white right half: far from the edge it stays black and white.
+        let rgb: Vec<u8> = (0..8 * 2)
+            .flat_map(|i| if i % 8 < 4 { [0; 3] } else { [255; 3] })
+            .collect();
+        let (big, w, _) = enlarge(&rgb, 8, 2, 3);
+        assert_eq!(big[0], 0);
+        assert_eq!(big[(w - 1) * 3], 255);
+    }
+
+    #[test]
+    fn english_comes_last_among_the_installed_languages() {
+        let listing = "List of available languages in \"/usr/share/tessdata/\" (5):\ndeu\ndeu_frak\neng\nequ\nosd\n";
+        assert_eq!(pick_languages(listing), "deu+eng");
+        assert_eq!(
+            pick_languages("List of available languages (1):\neng\n"),
+            "eng"
+        );
+        assert_eq!(pick_languages(""), "");
+    }
+
+    #[test]
+    fn big_windows_are_enlarged_less() {
+        assert_eq!(scale_factor(1280, 800), 3);
+        assert_eq!(scale_factor(2560, 1440), 1);
+        assert_eq!(scale_factor(1920, 1080), 2);
+        assert_eq!(scale_factor(640, 400), 3);
+    }
 
     const TSV: &str = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext
 1\t1\t0\t0\t0\t0\t0\t0\t640\t400\t-1\t
