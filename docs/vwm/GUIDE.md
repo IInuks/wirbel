@@ -98,13 +98,18 @@ wirbel macro run examples/macros/page-title.wm url=https://example.com
 
 A running program cannot move into a hidden wirbel, so `adopt` parks its window instead: it
 leaves its workspace and the taskbar and keeps running out of sight, `release` brings it back.
-A parked window can be photographed (`shot`), listed and closed. It cannot be typed into or
-clicked: on the desktop there is one keyboard and one pointer, and they stay with you. Start a
-program with `open` when it is to be driven.
+A parked window can be photographed (`shot`, `text --via ocr`), listed and closed. Typing and
+clicking into it need `vwm_adopt_input = borrow` in the configuration: the desktop has one
+keyboard and one pointer, so the window borrows them for a moment. The keys go straight to it,
+past your binds; it keeps them while commands follow each other (0.3 s after the last one) and
+gives them back at once when you touch a key or the mouse. It is refused while you hold a key or
+a button and while the screen is locked. A program started with `open` has a keyboard of its
+own and never gets in your way, so prefer that for anything long.
 
 ```sh
 wirbel vwm adopt focused music     # the window with the focus disappears
 wirbel vwm shot music now.png
+wirbel vwm type music ' '          # with vwm_adopt_input = borrow: pause or play
 wirbel vwm release music
 ```
 
@@ -130,5 +135,5 @@ like any window: keys, clicks, `text`, `ui`.
 
 ## Not there yet
 
-Input into parked windows is planned;
+Everything planned is there;
 [PROGRESS.md](PROGRESS.md) says how far they are.

@@ -329,6 +329,12 @@ impl Wirbel {
         if !self.test_input {
             return Err("input injection is off, wirbel needs --test-input (or --headless)".into());
         }
+        self.inject_keys_or_pointer(request)
+    }
+
+    /// `inject` without asking for `--test-input`: for keys that go to a parked window that
+    /// borrows the keyboard, which the configuration allowed.
+    pub(crate) fn inject_keys_or_pointer(&mut self, request: Inject) -> Result<(), String> {
         match request {
             Inject::Key { key, down } => {
                 let (code, _) = self.key_for(key)?;
@@ -337,7 +343,7 @@ impl Wirbel {
                 } else {
                     KeyState::Released
                 };
-                self.on_key(code, state, InputTime::now());
+                self.inject_key(code, state);
             }
             Inject::Tap(key) => {
                 let key = self.key_for(key)?;
@@ -349,8 +355,8 @@ impl Wirbel {
                 for evdev in &held {
                     self.press_evdev(*evdev, KeyState::Pressed);
                 }
-                self.on_key(code, KeyState::Pressed, InputTime::now());
-                self.on_key(code, KeyState::Released, InputTime::now());
+                self.inject_key(code, KeyState::Pressed);
+                self.inject_key(code, KeyState::Released);
                 for evdev in held.iter().rev() {
                     self.press_evdev(*evdev, KeyState::Released);
                 }
@@ -456,7 +462,17 @@ impl Wirbel {
     }
 
     fn press_evdev(&mut self, evdev: u32, state: KeyState) {
-        self.on_key((evdev + XKB_OFFSET).into(), state, InputTime::now());
+        self.inject_key((evdev + XKB_OFFSET).into(), state);
+    }
+
+    /// One key as if from the keyboard. While a parked window borrows the keyboard it goes
+    /// straight to that window, past binds and filters (see `crate::vwm::park`).
+    fn inject_key(&mut self, code: Keycode, state: KeyState) {
+        if self.vwm.borrow.is_some() {
+            self.borrowed_key(code, state);
+            return;
+        }
+        self.on_key(code, state, InputTime::now());
     }
 
     fn type_key(&mut self, (code, level): (Keycode, u32)) {
@@ -471,8 +487,8 @@ impl Wirbel {
         for key in &held {
             self.press_evdev(*key, KeyState::Pressed);
         }
-        self.on_key(code, KeyState::Pressed, InputTime::now());
-        self.on_key(code, KeyState::Released, InputTime::now());
+        self.inject_key(code, KeyState::Pressed);
+        self.inject_key(code, KeyState::Released);
         for key in held.iter().rev() {
             self.press_evdev(*key, KeyState::Released);
         }

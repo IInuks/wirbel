@@ -103,6 +103,8 @@ pub struct Manager {
     pub parked: Vec<super::park::Parked>,
     /// Pictures of parked windows that wait for the next frame.
     pub parked_shots: Vec<(super::shot::Shot, smithay::desktop::Window)>,
+    /// A parked window that has the keyboard and the pointer for a moment, see `super::park`.
+    pub borrow: Option<super::park::Borrow>,
     /// See `Wirbel::reply_sender`.
     pub(crate) replies: Option<Sender<(u64, String)>>,
 }

@@ -196,6 +196,9 @@ pub struct Config {
     pub render_gpu: Option<String>,
     /// The card that renders the invisible windows, see `crate::vwm`. `None` lets wirbel pick.
     pub vwm_gpu: Option<String>,
+    /// Whether typing and clicking may reach parked windows by lending them the keyboard and
+    /// the pointer for a moment, see `crate::vwm::park`. Off by default.
+    pub vwm_adopt_input: bool,
     /// How to run X11 programs.
     pub xwayland: Xwayland,
     pub monitor_rules: Vec<MonitorRule>,
@@ -260,6 +263,7 @@ impl Config {
             cursor_size: None,
             render_gpu: None,
             vwm_gpu: None,
+            vwm_adopt_input: false,
             xwayland: Xwayland::Find,
             monitor_rules: Vec::new(),
             binds: Vec::new(),
@@ -359,6 +363,13 @@ impl Config {
             "cursor_size" => self.cursor_size = Some(parse_size(value)? as u32),
             "render_gpu" => self.render_gpu = Some(value).filter(|v| !v.is_empty()).map(Into::into),
             "vwm_gpu" => self.vwm_gpu = Some(value).filter(|v| !v.is_empty()).map(Into::into),
+            "vwm_adopt_input" => {
+                self.vwm_adopt_input = match value {
+                    "off" => false,
+                    "borrow" => true,
+                    other => return Err(format!("expected off or borrow, got `{other}`")),
+                }
+            }
             "xwayland" => {
                 self.xwayland = match value {
                     "" | "auto" => Xwayland::Find,

@@ -1111,7 +1111,7 @@ impl Wirbel {
     /// Who should have the keyboard: the lock screen rules everything, then nobody while an input
     /// filter holds the input, then a layer surface that claims the keyboard, then one that was
     /// clicked, then the focused window.
-    fn keyboard_target(&self) -> Option<KeyboardFocus> {
+    pub(crate) fn keyboard_target(&self) -> Option<KeyboardFocus> {
         if self.lock.is_active() {
             let surface = self
                 .lock

@@ -169,6 +169,7 @@ wirbel vwm key page CTRL+l
 wirbel vwm type page "https://example.com"
 wirbel vwm key page ENTER
 wirbel vwm shot page page.png
+wirbel vwm show page     # look into it live, and work in it
 wirbel vwm close page
 ```
 

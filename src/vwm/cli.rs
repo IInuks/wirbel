@@ -68,8 +68,9 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
       close      ask the windows to close and end what does not; --kill ends it at once
       adopt      park a window that is open on the desktop: it leaves its workspace and the
                  taskbar and keeps running out of sight. WINDOW is its id from `wirbel vwm
-                 windows`, or `focused`. A parked window takes shot, release and close; typing
-                 and clicking need a window started with open
+                 windows`, or `focused`. A parked window takes shot, text, release and close;
+                 typing and clicking only with `vwm_adopt_input = borrow` in the configuration,
+                 which lends it the keyboard and the pointer for a moment
       release    put a parked window on the current workspace again
       windows    the windows on the desktop with their ids, as JSON
       type       type TEXT on the keyboard of the window, a line end is Return. Only what the
@@ -542,12 +543,25 @@ const CLOSE_PATIENCE: Duration = Duration::from_secs(12);
 /// A connection to the control socket of a shadow, for several requests in a row.
 pub struct Session {
     reader: BufReader<UnixStream>,
+    /// For a parked window: its name. The session then talks to the visible compositor, which
+    /// takes input for it as `vwm input NAME ...` (see `super::park`).
+    parked: Option<String>,
 }
 
 impl Session {
-    /// To the shadow behind this name.
+    /// To the shadow behind this name, or for a parked window to the visible compositor.
     pub fn of(name: &str) -> Result<Self, String> {
-        Self::on(&display_of(name)?)
+        match display_of(name) {
+            Ok(display) => Self::on(&display),
+            Err(err) if err.contains("is a parked window") => {
+                let desktop =
+                    std::env::var("WAYLAND_DISPLAY").map_err(|_| "WAYLAND_DISPLAY is not set")?;
+                let mut session = Self::on(&desktop)?;
+                session.parked = Some(name.to_string());
+                Ok(session)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// To the wirbel of this Wayland display.
@@ -559,11 +573,28 @@ impl Session {
         timeout.map_err(|err| format!("failed to set a timeout: {err}"))?;
         Ok(Self {
             reader: BufReader::new(stream),
+            parked: None,
         })
     }
 
     /// Sends one request and returns its answer without `ok `.
     pub fn ask(&mut self, request: &str) -> Result<String, String> {
+        let rewritten;
+        let request = match &self.parked {
+            None => request,
+            Some(name) => match request.strip_prefix("inject ") {
+                Some(rest) => {
+                    rewritten = format!("vwm input {name} {rest}");
+                    &rewritten
+                }
+                None => {
+                    return Err(format!(
+                        "`{name}` is a parked window: it takes typing, keys and the pointer, \
+                         shot, release and close"
+                    ));
+                }
+            },
+        };
         self.reader
             .get_mut()
             .write_all(format!("{request}\n").as_bytes())
@@ -589,7 +620,8 @@ impl Session {
 
     /// Moves the pointer to a place, in steps over `time` if that is not zero.
     pub fn glide(&mut self, (x, y): (f64, f64), time: Duration) -> Result<(), String> {
-        if !time.is_zero() {
+        // A parked window is not asked where its pointer is: it goes there at once.
+        if !time.is_zero() && self.parked.is_none() {
             let (from_x, from_y) = self.position()?;
             let steps = (time.as_millis() / GLIDE_STEP.as_millis()).max(1) as u32;
             for step in 1..steps {
@@ -1076,6 +1108,13 @@ fn find(args: &[String]) -> Result<(), String> {
 }
 
 /// The lines of text in the window on this display, read from a picture of it.
+/// The lines of text in the window behind `name`, a shadow or a parked window.
+pub fn recognise_named(name: &str, language: Option<&str>) -> Result<Vec<Line>, String> {
+    let scratch = Scratch::new("ocr.png")?;
+    take_shot(name, &scratch.path(), None, false)?;
+    recognise(scratch.file(), language)
+}
+
 pub fn recognise_on(display: &str, language: Option<&str>) -> Result<Vec<Line>, String> {
     let scratch = Scratch::new("ocr.png")?;
     answer_of(&ask_display(
@@ -1104,14 +1143,15 @@ fn text(args: &[String]) -> Result<(), String> {
             _ => return Err(USAGE.into()),
         }
     }
-    let display = display_of(&name.ok_or(USAGE)?)?;
+    let name = name.ok_or(USAGE)?;
+    let display = || display_of(&name);
     let via = via.unwrap_or_else(|| {
         let ocr = tesseract_installed() || place;
         if ocr { "ocr" } else { "clipboard" }.to_string()
     });
     let lines: Vec<String> = match via.as_str() {
         "ocr" => {
-            let lines = recognise_on(&display, language.as_deref())?;
+            let lines = recognise_named(&name, language.as_deref())?;
             let found = matching(&lines, pattern.as_deref());
             let show = |line: &&Line| match place {
                 true => format!("{} {} {}", line.middle().0, line.middle().1, line.text),
@@ -1121,13 +1161,13 @@ fn text(args: &[String]) -> Result<(), String> {
         }
         "a11y" if place => return Err("--where needs --via ocr".into()),
         "a11y" => {
-            let lines = super::a11y::text_of(&super::a11y::Tree::of(&display)?.items()?);
+            let lines = super::a11y::text_of(&super::a11y::Tree::of(&display()?)?.items()?);
             let fits = |line: &String| pattern.as_deref().is_none_or(|p| glob(p, line));
             lines.into_iter().filter(fits).collect()
         }
         "clipboard" if place => return Err("--where needs --via ocr".into()),
         "clipboard" => {
-            let text = by_clipboard(&display, &["CTRL+a", "CTRL+c"])?;
+            let text = by_clipboard(&display()?, &["CTRL+a", "CTRL+c"])?;
             let fits = |line: &&str| pattern.as_deref().is_none_or(|p| glob(p, line));
             text.lines().filter(fits).map(str::to_string).collect()
         }
@@ -1402,12 +1442,11 @@ fn click_text(args: &[String]) -> Result<(), String> {
         _ => return Err(USAGE.into()),
     };
     let button = button(rest.first())?;
-    let display = display_of(name)?;
-    let lines = recognise_on(&display, None)?;
+    let lines = recognise_named(name, None)?;
     let found = matching(&lines, Some(pattern));
     let line = found.first().ok_or("no such text in the window")?;
     let (x, y) = line.middle();
-    let mut session = Session::on(&display)?;
+    let mut session = Session::of(name)?;
     session.glide((f64::from(x), f64::from(y)), Duration::ZERO)?;
     session.press(button)
 }

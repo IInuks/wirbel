@@ -616,8 +616,7 @@ fn text_is_read_through_the_clipboard_and_recognition_says_if_it_cannot() {
     );
 
     // The test window shows no text; without the helper program the wait says what is missing.
-    let installed = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .any(|dir| dir.join("tesseract").is_file());
+    let installed = wirbel::vwm::text::tesseract_program().is_some();
     let waited = wait_on(
         &display,
         &Condition::Text("anything".into()),
@@ -705,4 +704,101 @@ fn an_open_window_is_parked_out_of_sight_and_comes_back() {
     stays.sync();
     assert_eq!(desk.ask("vwm list"), ["ok"]);
     assert_eq!(desk.compositor.frames().len(), 1);
+}
+
+#[test]
+fn a_parked_window_borrows_the_keyboard_and_the_pointer_when_allowed() {
+    use wayland_client::protocol::wl_pointer;
+
+    let desk = Desk::start("borrow");
+    let mut stays = Client::connect(&desk.compositor);
+    let _a = stays.open_window(RED);
+    let mut goes = Client::connect(&desk.compositor);
+    let b = goes.open_window(GREEN);
+    stays.sync();
+    goes.sync();
+    assert_eq!(desk.ask("vwm adopt focused mail"), ["ok mail"]);
+    stays.sync();
+    goes.sync();
+    stays.take_input();
+    goes.take_input();
+    let keys = |input: &[Input]| -> Vec<u32> {
+        input
+            .iter()
+            .filter_map(|input| match input {
+                Input::Key(key, wl_keyboard::KeyState::Pressed) => Some(*key),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Off unless the configuration says so.
+    let refused = desk.ask("vwm input mail tap a");
+    assert!(
+        refused[0].contains("vwm_adopt_input = borrow"),
+        "{refused:?}"
+    );
+    desk.compositor
+        .with(|state| state.config.vwm_adopt_input = true);
+
+    // A key reaches the parked window and nothing else.
+    assert_eq!(desk.ask("vwm input mail tap a"), ["ok"]);
+    goes.sync();
+    stays.sync();
+    let got = goes.take_input();
+    assert_eq!(keys(&got), [30], "{got:?}");
+    assert!(keys(&stays.take_input()).is_empty());
+
+    // The pointer lands on it where asked, with a press and a release.
+    assert_eq!(desk.ask("vwm input mail at 10 20"), ["ok"]);
+    assert_eq!(desk.ask("vwm input mail button left down"), ["ok"]);
+    assert_eq!(desk.ask("vwm input mail button left up"), ["ok"]);
+    goes.sync();
+    let got = goes.take_input();
+    assert!(
+        got.iter()
+            .any(|input| matches!(input, Input::PointerEnter(w, x, y)
+            if *w == b && (*x - 10.0).abs() < 0.01 && (*y - 20.0).abs() < 0.01)),
+        "{got:?}"
+    );
+    let buttons: Vec<bool> = got
+        .iter()
+        .filter_map(|input| match input {
+            Input::Button(0x110, state) => Some(*state == wl_pointer::ButtonState::Pressed),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(buttons, [true, false], "{got:?}");
+
+    // A key of the user takes the keyboard back at once.
+    desk.compositor.tap_key(31);
+    goes.sync();
+    stays.sync();
+    assert_eq!(keys(&stays.take_input()), [31]);
+    assert!(keys(&goes.take_input()).is_empty());
+
+    // Refused while the user holds a key.
+    desk.compositor.key(42, KeyState::Pressed);
+    let refused = desk.ask("vwm input mail tap a");
+    assert!(refused[0].contains("key is held"), "{refused:?}");
+    desk.compositor.key(42, KeyState::Released);
+
+    // Without a user, the keyboard comes back by itself after a moment.
+    assert_eq!(desk.ask("vwm input mail key b down"), ["ok"]);
+    std::thread::sleep(Duration::from_millis(500));
+    desk.compositor
+        .with(|state| assert!(state.vwm.borrow.is_none()));
+    goes.sync();
+    let got = goes.take_input();
+    // The key it still held was let go when it gave the keyboard back.
+    assert!(
+        got.iter()
+            .any(|input| matches!(input, Input::Key(48, wl_keyboard::KeyState::Released))),
+        "{got:?}"
+    );
+    stays.sync();
+    stays.take_input();
+    desk.compositor.tap_key(32);
+    stays.sync();
+    assert_eq!(keys(&stays.take_input()), [32]);
 }

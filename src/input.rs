@@ -122,6 +122,9 @@ impl Wirbel {
     /// screen. The two ways out work regardless, the session stays locked behind them: the
     /// emergency chord and switching the VT.
     pub fn on_key(&mut self, key: Keycode, state: KeyState, time: InputTime) {
+        // The user's own input takes the keyboard and the pointer back from a parked window
+        // first (see `crate::vwm::park`); keys typed into that window do not come this way.
+        self.vwm_end_borrow();
         let evdev = key.raw().saturating_sub(XKB_OFFSET) as u16;
         if self.chord.feed(evdev, state == KeyState::Pressed) {
             (self.emergency)();
@@ -266,6 +269,7 @@ impl Wirbel {
         delta_unaccel: Point<f64, Logical>,
         time: InputTime,
     ) {
+        self.vwm_end_borrow();
         if let Some(filter) = self.input_filter()
             && filter.pointer_delta(self, delta, delta_unaccel) == Verdict::Consume
         {
@@ -315,6 +319,9 @@ impl Wirbel {
     /// constraint holds the pointer, the way from its last position is a relative motion: a game
     /// that locked the pointer gets motion it can use, and the pointer stays put or confined.
     pub fn on_pointer_absolute(&mut self, location: Point<f64, Logical>, time: InputTime) {
+        // The user's own input takes the keyboard and the pointer back from a parked window
+        // first (see `crate::vwm::park`); keys typed into that window do not come this way.
+        self.vwm_end_borrow();
         let last = self.last_absolute.replace(location);
         match last {
             Some(last) if self.active_constraint().is_some() => {
@@ -377,6 +384,9 @@ impl Wirbel {
     /// wants it the keyboard. If a mouse bind applies, it starts a drag instead of reaching the
     /// client. A press that ends a popup grab does all of that too, once the grab is over.
     pub fn on_pointer_button(&mut self, button: u32, state: ButtonState, time: InputTime) {
+        // The user's own input takes the keyboard and the pointer back from a parked window
+        // first (see `crate::vwm::park`); keys typed into that window do not come this way.
+        self.vwm_end_borrow();
         self.note_activity();
         let Some(pointer) = self.seat.get_pointer() else {
             return;
@@ -496,6 +506,9 @@ impl Wirbel {
     }
 
     pub fn on_pointer_axis(&mut self, scroll: Scroll) {
+        // The user's own input takes the keyboard and the pointer back from a parked window
+        // first (see `crate::vwm::park`); keys typed into that window do not come this way.
+        self.vwm_end_borrow();
         self.note_activity();
         if let Some(filter) = self.input_filter()
             && filter.pointer_axis(self, &scroll) == Verdict::Consume

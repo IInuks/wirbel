@@ -76,8 +76,13 @@ What is left, in the order of use:
 - [x] 7.1 parked list, hidden from taskbar, frame callbacks
 - [x] 7.2 offscreen capture
 - [x] 7.3 `adopt`, `release`, `windows`
-- [ ] 7.4 input into parked windows: focus borrowing behind `vwm_adopt_input` (not started;
-      until then typing and clicking refuse parked windows with a clear message)
+- [x] 7.4 input into parked windows: focus borrowing behind `vwm_adopt_input = borrow`
+      (`vwm input NAME REQUEST` on the desktop; keys past binds, pointer events on the window's
+      surface; kept 300 ms after the last request, given back at once on real input; refused
+      while keys or buttons are held, the pointer is grabbed or the session is locked). The CLI
+      sends `type`, `key`, `click`, `scroll` ... for a parked name there; `text --via ocr` and
+      `click-text` work on parked windows too. Pointer events go to the main surface only, not
+      to popups of the window.
 
 ### 8 Audio
 - [x] 8.1 null sink per instance, `record`, `listen`, `level`, sound and silence events
