@@ -229,16 +229,42 @@ pub fn with_recipe(command: &str, dir: &Path) -> String {
             return command.to_string();
         }
         let _ = fs::create_dir_all(&profile);
+        let prefs = profile.join("user.js");
+        if !prefs.exists() {
+            let _ = fs::write(&prefs, FIREFOX_QUIET_START);
+        }
         return format!("{command} --new-instance --profile {quoted}");
     }
     if chromium.iter().any(|name| program.starts_with(name)) {
         if has("--user-data-dir") {
             return command.to_string();
         }
-        return format!("{command} --user-data-dir={quoted}");
+        let mut out = format!("{command} --user-data-dir={quoted}");
+        for flag in ["--no-first-run", "--no-default-browser-check"] {
+            if !has(flag) {
+                out.push(' ');
+                out.push_str(flag);
+            }
+        }
+        return out;
     }
     command.to_string()
 }
+
+/// Settings for a fresh Firefox profile: no welcome page, no privacy notice in a second tab,
+/// no question about the default browser. Without them the first start opens pages of its own
+/// that take the keyboard while a macro already types.
+const FIREFOX_QUIET_START: &str = "\
+user_pref(\"browser.aboutwelcome.enabled\", false);
+user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");
+user_pref(\"startup.homepage_welcome_url\", \"\");
+user_pref(\"startup.homepage_welcome_url.additional\", \"\");
+user_pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);
+user_pref(\"datareporting.policy.firstRunURL\", \"\");
+user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);
+user_pref(\"browser.shell.checkDefaultBrowser\", false);
+user_pref(\"trailhead.firstrun.didSeeAboutWelcome\", true);
+";
 
 /// The card for shadows when the configuration names none: with several cards, one that is not
 /// driven by `nvidia`. That is the integrated one, which is enough for windows nobody looks at
@@ -660,7 +686,8 @@ mod tests {
         assert_eq!(with_recipe("foot", dir), "foot");
         assert_eq!(
             with_recipe("chromium --incognito", dir),
-            "chromium --incognito --user-data-dir=/nonexistent/state/profile"
+            "chromium --incognito --user-data-dir=/nonexistent/state/profile \
+             --no-first-run --no-default-browser-check"
         );
         assert_eq!(
             with_recipe("chromium --user-data-dir=/x", dir),
@@ -670,6 +697,19 @@ mod tests {
             with_recipe("firefox --profile /x", dir),
             "firefox --profile /x"
         );
+    }
+
+    #[test]
+    fn a_fresh_firefox_profile_starts_quietly() {
+        let dir = std::env::temp_dir().join(format!("wirbel-recipe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let command = with_recipe("firefox", &dir);
+        assert!(command.ends_with(
+            &("--new-instance --profile ".to_string() + &dir.join("profile").to_string_lossy())
+        ));
+        let prefs = fs::read_to_string(dir.join("profile/user.js")).unwrap();
+        assert!(prefs.contains("browser.aboutwelcome.enabled\", false"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
