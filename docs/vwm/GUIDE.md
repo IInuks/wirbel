@@ -94,6 +94,11 @@ Several steps with conditions, loops and error handling go in a macro file, see
 wirbel macro run examples/macros/page-title.wm url=https://example.com
 ```
 
+A macro can also be made without writing one: `wirbel vwm create macro` (or `wirbel macro
+create`) asks whether a website or a program is to be opened, opens it in a window on the
+desktop and writes down what is clicked, typed and scrolled there. Enter in the terminal ends
+the recording, `z` takes back the last step. See [MACROS.md](MACROS.md#recording-a-macro).
+
 ## Windows that are already open
 
 A running program cannot move into a hidden wirbel, so `adopt` parks its window instead: it

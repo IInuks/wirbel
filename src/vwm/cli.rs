@@ -22,6 +22,7 @@ use crate::{
 };
 
 pub const USAGE: &str = "usage: wirbel vwm open [--name NAME] [--size WxH] [--share-bus] [--sound] [--web] [--env KEY=VALUE]... [--] COMMAND...
+       wirbel vwm create macro [NAME]
        wirbel vwm list [--json]
        wirbel vwm info NAME
        wirbel vwm resize NAME WxH
@@ -131,6 +132,9 @@ focus, and are driven by commands. See docs/vwm/DESIGN.md.
                  size, the picture is scaled to fit. Closing that window or hide hides it
                  again; the program goes on running invisibly
       hide       close the window that show opened
+      create macro  make a macro without writing it: asks for a website or a program,
+                 opens it in a window on the desktop and writes down what is clicked and
+                 typed there, then saves it in ~/.config/wirbel/macros (asks in German)
 Exit status: 0 done, 1 failed, 2 wrong usage, 3 the time of a wait ran out.
 `wirbel vwm invisible create|close|screenshot ...` mean the same as `wirbel vwm open|close|shot ...`.
 Positions are pixels from the top left corner of the window.";
@@ -1604,8 +1608,8 @@ fn hide(args: &[String]) -> Result<(), String> {
 }
 
 #[cfg(feature = "vwm-viewer")]
-fn viewer(name: &str) -> Result<(), String> {
-    let result = super::viewer::run(name);
+fn viewer(name: &str, record: Option<&str>) -> Result<(), String> {
+    let result = super::viewer::run(name, record.map(std::path::Path::new));
     // The file is ours only while it names this process.
     if let Ok(file) = viewer_pid_file(name)
         && std::fs::read_to_string(&file)
@@ -1617,7 +1621,7 @@ fn viewer(name: &str) -> Result<(), String> {
 }
 
 #[cfg(not(feature = "vwm-viewer"))]
-fn viewer(_: &str) -> Result<(), String> {
+fn viewer(_: &str, _: Option<&str>) -> Result<(), String> {
     Err("this wirbel was built without the viewer (feature vwm-viewer)".into())
 }
 
@@ -1632,6 +1636,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         return Err(USAGE.into());
     };
     match command.as_str() {
+        "create" if rest.first().is_some_and(|word| word == "macro") => {
+            super::create::wizard(&rest[1..])
+        }
         "open" | "create" => open(rest),
         "list" => list(rest),
         "info" => info(rest),
@@ -1675,7 +1682,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "hide" => hide(rest),
         // What `show` starts in the background.
         "viewer" => match rest {
-            [name] => viewer(name),
+            [name] => viewer(name, None),
+            [name, flag, path] if flag == "--record" => viewer(name, Some(path)),
             _ => Err(USAGE.into()),
         },
         "--help" | "-h" | "help" => {

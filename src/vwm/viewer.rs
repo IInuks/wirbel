@@ -14,11 +14,14 @@
 use std::{
     collections::BTreeSet,
     fs::File,
+    io::Write,
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+    path::Path,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     time::Duration,
 };
 
+use smithay::input::keyboard::xkb;
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
@@ -259,6 +262,12 @@ struct Viewer {
     wheel: f64,
     title: String,
     closed: Option<String>,
+    /// `--record`: where what the user does goes, as events for `wirbel vwm create macro`.
+    recorder: Option<File>,
+    /// The last place of the pointer in pixels of the shadow.
+    pointer: (f64, f64),
+    /// The keyboard of the desktop, to name the keys while recording.
+    xkb: Option<xkb::State>,
 }
 
 impl Viewer {
@@ -290,7 +299,28 @@ impl Viewer {
         let picture = (*w, *h);
         let fit = Fit::of(self.size(), picture);
         let (x, y) = fit.to_shadow(place, picture);
+        self.pointer = (x, y);
         self.send(&format!("inject at {x:.1} {y:.1}"));
+    }
+
+    /// One line in the recording, after the time in milliseconds since 1970.
+    fn record(&mut self, event: &str) {
+        let Some(file) = &mut self.recorder else {
+            return;
+        };
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |time| time.as_millis());
+        if writeln!(file, "{ms} {event}").is_err() {
+            self.recorder = None;
+        }
+    }
+
+    fn record_pointer(&mut self, what: &str) {
+        if self.recorder.is_some() {
+            let (x, y) = self.pointer;
+            self.record(&format!("{what} {} {}", x.round(), y.round()));
+        }
     }
 
     fn redraw(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
@@ -346,7 +376,17 @@ impl Viewer {
 
 /// Runs the viewer of the shadow behind `name` on the desktop of `WAYLAND_DISPLAY` until its
 /// window is closed or the shadow ends.
-pub fn run(name: &str) -> Result<(), String> {
+pub fn run(name: &str, record: Option<&Path>) -> Result<(), String> {
+    let recorder = match record {
+        Some(path) => Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|err| format!("{}: {err}", path.display()))?,
+        ),
+        None => None,
+    };
     let display = super::cli::display_of(name)?;
     let input = Session::on(&display)?;
     let connection = Connection::connect_to_env()
@@ -385,6 +425,9 @@ pub fn run(name: &str) -> Result<(), String> {
         wheel: 0.0,
         title: String::new(),
         closed: None,
+        recorder,
+        pointer: (0.0, 0.0),
+        xkb: None,
     };
     let surface = viewer.compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
@@ -704,6 +747,11 @@ impl Dispatch<WlPointer, ()> for Viewer {
                     false => viewer.buttons.remove(&button),
                 };
                 viewer.send(&button_request(button, down));
+                let event = button_request(button, down);
+                let mut words = event.split(' ').skip(2);
+                if let (Some(name), Some(updown)) = (words.next(), words.next()) {
+                    viewer.record_pointer(&format!("{updown} {name}"));
+                }
             }
             wl_pointer::Event::Axis {
                 axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
@@ -716,6 +764,7 @@ impl Dispatch<WlPointer, ()> for Viewer {
                 if viewer.wheel.abs() >= 0.01 {
                     let steps = std::mem::take(&mut viewer.wheel);
                     viewer.send(&format!("inject wheel {steps:.3}"));
+                    viewer.record_pointer(&format!("wheel {steps:.3}"));
                 }
             }
             _ => {}
@@ -745,11 +794,46 @@ impl Dispatch<WlKeyboard, ()> for Viewer {
                 }
                 if down {
                     viewer.keys.insert(key);
+                    if viewer.recorder.is_some()
+                        && let Some(event) = viewer.xkb.as_ref().and_then(|s| describe_key(s, key))
+                    {
+                        viewer.record(&event);
+                    }
                 }
                 viewer.send(&format!(
                     "inject code {key} {}",
                     if down { "down" } else { "up" }
                 ));
+            }
+            wl_keyboard::Event::Keymap { format, fd, size } => {
+                if viewer.recorder.is_none()
+                    || format != WEnum::Value(wl_keyboard::KeymapFormat::XkbV1)
+                {
+                    return;
+                }
+                let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+                // SAFETY: the desktop hands a file of `size` bytes holding a keymap as text.
+                let keymap = unsafe {
+                    xkb::Keymap::new_from_fd(
+                        &context,
+                        fd,
+                        size as usize,
+                        xkb::KEYMAP_FORMAT_TEXT_V1,
+                        xkb::KEYMAP_COMPILE_NO_FLAGS,
+                    )
+                };
+                viewer.xkb = keymap.ok().flatten().map(|keymap| xkb::State::new(&keymap));
+            }
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                if let Some(state) = &mut viewer.xkb {
+                    state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                }
             }
             wl_keyboard::Event::Leave { .. } => {
                 for key in std::mem::take(&mut viewer.keys) {
@@ -759,6 +843,54 @@ impl Dispatch<WlKeyboard, ()> for Viewer {
             _ => {}
         }
     }
+}
+
+/// What a key that went down does, for the recording: `text CHARACTERS` for what it types,
+/// `key COMBINATION` for the rest (`key Return`, `key CTRL+l`). Nothing for modifiers alone and
+/// dead keys.
+fn describe_key(state: &xkb::State, evdev: u32) -> Option<String> {
+    let code = xkb::Keycode::new(evdev + 8);
+    let sym = state.key_get_one_sym(code);
+    if sym.is_modifier_key() || sym.raw() == 0 {
+        return None;
+    }
+    let active = |name: &str| state.mod_name_is_active(name, xkb::STATE_MODS_EFFECTIVE);
+    let (ctrl, alt, logo, shift) = (
+        active(xkb::MOD_NAME_CTRL),
+        active(xkb::MOD_NAME_ALT),
+        active(xkb::MOD_NAME_LOGO),
+        active(xkb::MOD_NAME_SHIFT),
+    );
+    if !ctrl && !alt && !logo {
+        let text = state.key_get_utf8(code);
+        if !text.is_empty() && !text.chars().any(char::is_control) {
+            return Some(format!("text {text}"));
+        }
+    }
+    // The key as it is without Shift: CTRL+SHIFT+t, not CTRL+SHIFT+T.
+    let keymap = state.get_keymap();
+    let layout = state.key_get_layout(code);
+    let base = keymap
+        .key_get_syms_by_level(code, layout, 0)
+        .first()
+        .copied()
+        .unwrap_or(sym);
+    let name = xkb::keysym_get_name(base);
+    if name.starts_with("dead_") || name.is_empty() {
+        return None;
+    }
+    let mut combo = String::new();
+    for (on, word) in [
+        (ctrl, "CTRL+"),
+        (shift, "SHIFT+"),
+        (alt, "ALT+"),
+        (logo, "SUPER+"),
+    ] {
+        if on {
+            combo.push_str(word);
+        }
+    }
+    Some(format!("key {combo}{name}"))
 }
 
 #[cfg(test)]

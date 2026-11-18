@@ -25,6 +25,33 @@ print "logo at $where"
 close page
 ```
 
+## Recording a macro
+
+`wirbel vwm create macro [NAME]`, also `wirbel macro create [NAME]`, makes a macro by doing it
+once. It asks (in German) for a website or a program, starts it invisibly at 1280x800 and shows
+it in a viewer window (`vwm show`). What is done in that window is written down as steps and
+printed in the terminal; Enter ends the recording, `z` and Enter takes back the last step.
+The macro is saved as `~/.config/wirbel/macros/NAME.wm` and can be played back at once with a
+viewer to watch it.
+
+The recording is tidied up on the way:
+
+- letters typed one after another become one `type` step; BackSpace takes back a typed letter
+  instead of becoming a key of its own
+- two clicks in the same place within 0.4 s are a double click, a press and release more than
+  8 pixels apart a `drag`, wheel turns close together one `scroll`
+- after every step but typing the macro waits until the window stops changing (`stable`, at
+  most 10 s), and where the user paused for more than 1.5 s, because something was loading, it
+  waits longer. These waits never fail: a page that moves all the time only makes them last
+  until their limit
+- the window name is the macro name, the link or the program is a `param` (`url=`, `app=`), and
+  `show=yes` and `close=no` show the window while it runs and leave it open at the end
+
+Clicks are recorded as places in the window. Pages that look different the next time, such as
+a cookie notice that only shows the first time, move those places; such steps are better
+written with `click-text` or `ui click` by hand. Moving the pointer without clicking is not
+recorded.
+
 ## Steps for invisible windows
 
 Every command of `wirbel vwm` is a step with the same words: `open`, `close`, `type`, `key`,

@@ -28,7 +28,8 @@ use crate::{
 
 pub const USAGE: &str = "usage: wirbel macro run FILE|NAME [PARAMETER=VALUE]... [--json]
        wirbel macro check FILE|NAME
-       wirbel macro list";
+       wirbel macro list
+       wirbel macro create [NAME]";
 
 pub const HELP: &str =
     "macro runs a macro: a file of steps that drive invisible windows, see docs/vwm/MACROS.md.
@@ -36,7 +37,8 @@ pub const HELP: &str =
                  What the macro returns is printed, as JSON with --json. Exit status: 0 done,
                  1 failed, 3 the time of a wait ran out, or what its `exit` says
       check      read it and say what is wrong with it, without running anything
-      list       the macros in ~/.config/wirbel/macros";
+      list       the macros in ~/.config/wirbel/macros
+      create     record a new macro by doing it, see `wirbel vwm create macro`";
 
 /// The real world.
 struct System;
@@ -204,6 +206,7 @@ pub fn main(args: &[String]) -> i32 {
         Some(("run", rest)) => run(rest),
         Some(("check", rest)) => check(rest),
         Some(("list", [])) => list(),
+        Some(("create", rest)) => crate::vwm::create::wizard(rest).map(|()| 0),
         Some(("--help" | "-h" | "help", _)) => {
             println!("{USAGE}\n\n{HELP}");
             Ok(0)

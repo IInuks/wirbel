@@ -12,6 +12,7 @@ pub mod a11y;
 pub mod audio;
 pub mod cli;
 pub mod clip;
+pub mod create;
 pub mod json;
 pub mod manager;
 pub mod park;
