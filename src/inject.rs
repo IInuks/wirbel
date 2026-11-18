@@ -63,6 +63,36 @@ pub enum Inject {
     Wheel(f64),
 }
 
+/// Letters with an accent, by the dead key that makes them: each accented one lines up
+/// with the plain one at the same place.
+const ACCENTED: [(u32, &str, &str); 5] = [
+    (keysyms::KEY_dead_grave, "àèìòùÀÈÌÒÙ", "aeiouAEIOU"),
+    (keysyms::KEY_dead_acute, "áéíóúýÁÉÍÓÚÝ", "aeiouyAEIOUY"),
+    (keysyms::KEY_dead_circumflex, "âêîôûÂÊÎÔÛ", "aeiouAEIOU"),
+    (keysyms::KEY_dead_tilde, "ãñõÃÑÕ", "anoANO"),
+    (keysyms::KEY_dead_diaeresis, "ëïÿËÏ", "eiyEI"),
+];
+
+/// The dead key and the character after it that make `c` on a layout where `c` has no key:
+/// a space after the dead key gives the accent itself.
+fn dead_key_for(c: char) -> Option<(u32, char)> {
+    let spacing = match c {
+        '^' => Some(keysyms::KEY_dead_circumflex),
+        '`' => Some(keysyms::KEY_dead_grave),
+        '´' => Some(keysyms::KEY_dead_acute),
+        '~' => Some(keysyms::KEY_dead_tilde),
+        '¨' => Some(keysyms::KEY_dead_diaeresis),
+        _ => None,
+    };
+    if let Some(dead) = spacing {
+        return Some((dead, ' '));
+    }
+    ACCENTED.iter().find_map(|(dead, accented, plain)| {
+        let at = accented.chars().position(|a| a == c)?;
+        Some((*dead, plain.chars().nth(at)?))
+    })
+}
+
 /// A key name as the requests take it: one character as it is, case included, or a keysym name.
 pub fn parse_keysym(name: &str) -> Result<Keysym, String> {
     let mut chars = name.chars();
@@ -285,18 +315,28 @@ impl Wirbel {
                 }
             }
             Inject::Type(text) => {
-                let keys = text
-                    .chars()
-                    .map(|c| {
-                        let key = match c {
-                            '\n' => Keysym::Return,
-                            '\t' => Keysym::Tab,
-                            c => xkb::utf32_to_keysym(c as u32),
-                        };
-                        self.key_for(key)
-                            .map_err(|_| format!("cannot type `{c}` with this keymap"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut keys = Vec::new();
+                for c in text.chars() {
+                    let key = match c {
+                        '\n' => Keysym::Return,
+                        '\t' => Keysym::Tab,
+                        c => xkb::utf32_to_keysym(c as u32),
+                    };
+                    if let Ok(key) = self.key_for(key) {
+                        keys.push(key);
+                        continue;
+                    }
+                    // No key of its own: a dead key and what follows it, as a hand types it on
+                    // a layout with dead keys. The program composes the two.
+                    let (dead, then) = dead_key_for(c)
+                        .ok_or_else(|| format!("cannot type `{c}` with this keymap, `paste` can put it in"))?;
+                    let dead = self.key_for(Keysym::from(dead));
+                    let then = self.key_for(xkb::utf32_to_keysym(then as u32));
+                    match (dead, then) {
+                        (Ok(dead), Ok(then)) => keys.extend([dead, then]),
+                        _ => return Err(format!("cannot type `{c}` with this keymap, `paste` can put it in")),
+                    }
+                }
                 for key in keys {
                     self.type_key(key);
                 }
@@ -544,6 +584,18 @@ mod tests {
 
     fn key(name: &str) -> Keysym {
         parse_keysym(name).unwrap()
+    }
+
+    #[test]
+    fn characters_without_a_key_go_through_dead_keys() {
+        assert_eq!(dead_key_for('^'), Some((keysyms::KEY_dead_circumflex, ' ')));
+        assert_eq!(dead_key_for('é'), Some((keysyms::KEY_dead_acute, 'e')));
+        assert_eq!(dead_key_for('Ñ'), Some((keysyms::KEY_dead_tilde, 'N')));
+        assert_eq!(dead_key_for('Û'), Some((keysyms::KEY_dead_circumflex, 'U')));
+        assert_eq!(dead_key_for('x'), None);
+        for (_, accented, plain) in ACCENTED {
+            assert_eq!(accented.chars().count(), plain.chars().count());
+        }
     }
 
     #[test]
