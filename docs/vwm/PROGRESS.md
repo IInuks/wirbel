@@ -205,5 +205,5 @@ After installing the new binary and restarting wirbel:
 - Fixed on the way: fresh browser profiles opened first-run pages that took the keyboard, so
   the example macro returned "Welcome to Firefox" (99ad1da); a headless wirbel shared the state
   folders of the desktop and swept the sink of a desktop window (65f87a2, now `vwm/DISPLAY/NAME`).
-- Still to check after the next `wirbel restart`: no `--shadow` process and no `wirbel-vwm` sink
-  left behind.
+- Checked after `wirbel restart` with the new build (19:20): no `--shadow` process and no `wirbel-vwm` sink
+  left behind; the example macro now returns "Example Domain — Mozilla Firefox".
