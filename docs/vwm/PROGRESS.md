@@ -196,3 +196,14 @@ After installing the new binary and restarting wirbel:
   listen on` makes it heard.
 - Logging out or `wirbel restart` leaves no `wirbel --shadow` process behind
   (`pgrep -af -- --shadow`) and no sink (`pactl list short sinks | grep wirbel-vwm`).
+
+## First try on the real desktop (2026-11-18)
+
+- Passed: invisible kitty (nothing shows, no focus change), typing incl. the German layout and
+  CTRL, shot, adopt focused + shot + release, sound silent in its sink and heard with
+  `audio NAME listen on`, closing leaves no shadow and no sink.
+- Fixed on the way: fresh browser profiles opened first-run pages that took the keyboard, so
+  the example macro returned "Welcome to Firefox" (99ad1da); a headless wirbel shared the state
+  folders of the desktop and swept the sink of a desktop window (65f87a2, now `vwm/DISPLAY/NAME`).
+- Still to check after the next `wirbel restart`: no `--shadow` process and no `wirbel-vwm` sink
+  left behind.
