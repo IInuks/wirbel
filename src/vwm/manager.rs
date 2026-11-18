@@ -251,9 +251,11 @@ pub fn with_recipe(command: &str, dir: &Path) -> String {
             return command.to_string();
         }
         let _ = fs::create_dir_all(&profile);
+        // Kept up to date while it is ours; one the user wrote stays as it is.
         let prefs = profile.join("user.js");
-        if !prefs.exists() {
-            let _ = fs::write(&prefs, FIREFOX_QUIET_START);
+        let ours = fs::read_to_string(&prefs).map_or(true, |text| text.starts_with(USER_JS_MARK));
+        if ours {
+            let _ = fs::write(&prefs, format!("{USER_JS_MARK}\n{FIREFOX_QUIET_START}"));
         }
         return format!("{command} --new-instance --profile {quoted}");
     }
@@ -276,6 +278,8 @@ pub fn with_recipe(command: &str, dir: &Path) -> String {
 /// Settings for a fresh Firefox profile: no welcome page, no privacy notice in a second tab,
 /// no question about the default browser. Without them the first start opens pages of its own
 /// that take the keyboard while a macro already types.
+const USER_JS_MARK: &str = "// Written by wirbel for an invisible window, replaced on each start.";
+
 const FIREFOX_QUIET_START: &str = "\
 user_pref(\"browser.aboutwelcome.enabled\", false);
 user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");
@@ -286,6 +290,8 @@ user_pref(\"datareporting.policy.firstRunURL\", \"\");
 user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);
 user_pref(\"browser.shell.checkDefaultBrowser\", false);
 user_pref(\"trailhead.firstrun.didSeeAboutWelcome\", true);
+user_pref(\"browser.translations.automaticallyPopup\", false);
+user_pref(\"browser.translations.panelShown\", true);
 ";
 
 /// The card for shadows when the configuration names none: with several cards, one that is not
@@ -731,6 +737,11 @@ mod tests {
         ));
         let prefs = fs::read_to_string(dir.join("profile/user.js")).unwrap();
         assert!(prefs.contains("browser.aboutwelcome.enabled\", false"));
+        // One the user wrote is left alone.
+        fs::write(dir.join("profile/user.js"), "user_pref(\"x\", 1);\n").unwrap();
+        with_recipe("firefox", &dir);
+        let prefs = fs::read_to_string(dir.join("profile/user.js")).unwrap();
+        assert_eq!(prefs, "user_pref(\"x\", 1);\n");
         let _ = fs::remove_dir_all(&dir);
     }
 

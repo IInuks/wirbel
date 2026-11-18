@@ -328,13 +328,18 @@ impl Wirbel {
                     }
                     // No key of its own: a dead key and what follows it, as a hand types it on
                     // a layout with dead keys. The program composes the two.
-                    let (dead, then) = dead_key_for(c)
-                        .ok_or_else(|| format!("cannot type `{c}` with this keymap, `paste` can put it in"))?;
+                    let (dead, then) = dead_key_for(c).ok_or_else(|| {
+                        format!("cannot type `{c}` with this keymap, `paste` can put it in")
+                    })?;
                     let dead = self.key_for(Keysym::from(dead));
                     let then = self.key_for(xkb::utf32_to_keysym(then as u32));
                     match (dead, then) {
                         (Ok(dead), Ok(then)) => keys.extend([dead, then]),
-                        _ => return Err(format!("cannot type `{c}` with this keymap, `paste` can put it in")),
+                        _ => {
+                            return Err(format!(
+                                "cannot type `{c}` with this keymap, `paste` can put it in"
+                            ));
+                        }
                     }
                 }
                 for key in keys {

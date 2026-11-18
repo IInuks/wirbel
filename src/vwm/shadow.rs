@@ -103,6 +103,10 @@ pub fn start(
     name: &str,
     commands: &[String],
 ) {
+    // The pointer starts in the bottom right corner: in the top left it rests on the first tab
+    // of a browser, which then shows its tooltip over the page.
+    let corner = (1e6, 1e6).into();
+    state.move_pointer(corner, smithay::backend::input::InputTime::now());
     let mut children = Vec::new();
     for command in commands {
         let mut child = state.client_command(command);

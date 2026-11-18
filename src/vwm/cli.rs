@@ -1433,7 +1433,12 @@ fn emit(line: String) {
         None => false,
     });
     if !kept {
-        println!("{line}");
+        use std::io::Write;
+        // A reader that stopped early (`| head`) is no failure: the rest is simply not wanted.
+        let mut stdout = std::io::stdout().lock();
+        if writeln!(stdout, "{line}").is_err() {
+            std::process::exit(0);
+        }
     }
 }
 
