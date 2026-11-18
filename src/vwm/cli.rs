@@ -1080,8 +1080,7 @@ pub fn recognise_on(display: &str, language: Option<&str>) -> Result<Vec<Line>, 
 }
 
 fn tesseract_installed() -> bool {
-    let paths = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&paths).any(|dir| dir.join("tesseract").is_file())
+    super::text::tesseract_program().is_some()
 }
 
 fn text(args: &[String]) -> Result<(), String> {

@@ -102,11 +102,27 @@ pub fn parse_tsv(tsv: &str) -> Vec<Line> {
 }
 
 pub const NO_TESSERACT: &str = "text recognition needs the program `tesseract`, which is not installed \
-     (the package is called tesseract or tesseract-ocr, plus a language such as tesseract-data-eng)";
+     (the package is called tesseract or tesseract-ocr, plus a language such as tesseract-data-eng \
+     or tesseract-ocr-eng)";
+
+/// The names the recognition program goes by. Void calls it `tesseract-ocr`, because its
+/// `tesseract` is a game; that name comes first so that the game is never started instead.
+const TESSERACT_NAMES: [&str; 2] = ["tesseract-ocr", "tesseract"];
+
+/// The recognition program on `PATH`, if there is one.
+pub fn tesseract_program() -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    TESSERACT_NAMES.iter().find_map(|name| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|file| file.is_file())
+    })
+}
 
 /// Reads the text in a picture. `language` is what `tesseract -l` takes, such as `eng+deu`.
 pub fn recognise(picture: &Path, language: Option<&str>) -> Result<Vec<Line>, String> {
-    let mut command = Command::new("tesseract");
+    let program = tesseract_program().ok_or(NO_TESSERACT)?;
+    let mut command = Command::new(program);
     command.arg(picture).arg("stdout");
     let language = language
         .map(str::to_string)
