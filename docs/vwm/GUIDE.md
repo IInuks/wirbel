@@ -60,10 +60,10 @@ Wait conditions: `ready`, `window [GLOB]`, `title GLOB`, `closed`, `exited`, `st
 - A program gets a D-Bus session bus of its own, so that it starts a new instance instead of
   handing over to a visible one. `--share-bus` gives it the bus of the desktop, for programs
   that need its services (keyring, notifications).
-- Browsers get a fresh profile in `~/.local/state/wirbel/vwm/NAME/profile`. It stays there, so
+- Browsers get a fresh profile in `~/.local/state/wirbel/vwm/DISPLAY/NAME/profile` (DISPLAY is the socket of the desktop, e.g. `wayland-1`). It stays there, so
   the same name finds its logins again. To use another profile pass the browser's own option:
   `wirbel vwm open -- firefox --profile DIR`.
-- What the hidden wirbel and the program print is in `~/.local/state/wirbel/vwm/NAME/shadow.log`.
+- What the hidden wirbel and the program print is in `~/.local/state/wirbel/vwm/DISPLAY/NAME/shadow.log`.
 - Invisible windows end with the desktop: logging out or `wirbel restart` closes them.
 - `text --via a11y` and `ui` ask the program itself (GTK, Qt, browsers): exact text, controls
   by name, and `wait NAME loaded` knows when a page has loaded.

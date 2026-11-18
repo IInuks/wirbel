@@ -182,10 +182,32 @@ pub fn program_of(command: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
-/// Where the files of an invisible window live: its log, the profiles of its programs.
+static OWN_DISPLAY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Called by the compositor once its socket is up: from then on the state folders of this
+/// process are those of its own windows, not those of the compositor it may run inside.
+pub fn set_own_display(socket: &str) {
+    let _ = OWN_DISPLAY.set(socket.to_string());
+}
+
+/// The compositor the state folders belong to: its own socket inside the compositor, else
+/// `WAYLAND_DISPLAY`, which is the one the command talks to.
+fn display_key() -> String {
+    let display = OWN_DISPLAY
+        .get()
+        .cloned()
+        .or_else(|| std::env::var("WAYLAND_DISPLAY").ok())
+        .unwrap_or_else(|| "none".into());
+    // An absolute socket path is a word of its own too.
+    display.rsplit('/').next().unwrap_or(&display).to_string()
+}
+
+/// Where the files of an invisible window live: its log, the profiles of its programs, the
+/// sound modules. One folder per compositor, so that a nested or headless wirbel never
+/// takes the sink of a window of the desktop for one of its own that is gone.
 pub fn state_dir(name: &str) -> Option<PathBuf> {
     let log = safety::default_log_path()?;
-    Some(log.parent()?.join("vwm").join(name))
+    Some(log.parent()?.join("vwm").join(display_key()).join(name))
 }
 
 impl Manager {

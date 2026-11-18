@@ -334,6 +334,7 @@ impl Wirbel {
         seat.add_pointer();
 
         let socket_name = Self::listen(display, event_loop)?;
+        crate::vwm::manager::set_own_display(&socket_name.to_string_lossy());
         let ipc = Ipc::new(event_loop.handle(), &socket_name);
         let clock = Clock::<Monotonic>::new();
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
