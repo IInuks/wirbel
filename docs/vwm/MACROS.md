@@ -48,7 +48,8 @@ The recording is tidied up on the way:
   `show=yes` and `close=no` show the window while it runs and leave it open at the end
 
 Clicks are recorded as places in the window. Pages that look different the next time, such as
-a cookie notice that only shows the first time, move those places; such steps are better
+a cookie notice that only shows the first time, move those places (Firefox's offer to restore
+the last tabs is turned off for this reason); such steps are better
 written with `click-text` or `ui click` by hand. Moving the pointer without clicking is not
 recorded.
 

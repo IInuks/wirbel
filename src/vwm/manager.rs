@@ -278,7 +278,8 @@ pub fn with_recipe(command: &str, dir: &Path) -> String {
 }
 
 /// Settings for a fresh Firefox profile: no welcome page, no privacy notice in a second tab,
-/// no question about the default browser. Without them the first start opens pages of its own
+/// no question about the default browser, no offer to restore the tabs of the last start (a bar
+/// that pushes the page down, so that recorded clicks miss). Without them the first start opens pages of its own
 /// that take the keyboard while a macro already types.
 const USER_JS_MARK: &str = "// Written by wirbel for an invisible window, replaced on each start.";
 
@@ -294,6 +295,8 @@ user_pref(\"browser.shell.checkDefaultBrowser\", false);
 user_pref(\"trailhead.firstrun.didSeeAboutWelcome\", true);
 user_pref(\"browser.translations.automaticallyPopup\", false);
 user_pref(\"browser.translations.panelShown\", true);
+user_pref(\"browser.startup.couldRestoreSession.count\", 2);
+user_pref(\"browser.sessionstore.resume_from_crash\", false);
 ";
 
 /// The card for shadows when the configuration names none: with several cards, one that is not
